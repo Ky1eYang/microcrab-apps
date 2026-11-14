@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/server",
+    "crates/host/local-bridge",
+]
+
+[workspace.package]
+version = "0.1.16"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Ky1eYang/microcrab-client"
+
+[workspace.dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
+serde_yaml_ng = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net"] }
+tokio-util = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+jsonschema = { version = "0.33", default-features = false }
+libc = "0.2"
+windows-sys = "0.61"
+wasmtime = { version = "47.0.3", default-features = false, features = ["std", "runtime", "cranelift", "component-model"] }
+microcrab-protocol = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main" }
+microcrab-permission = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main" }
+microcrab-auditor = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main" }
+microcrab-transport = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main" }
+microcrab-host-api = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main" }
+microcrab-host-local = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main" }
+
+microcrab-agent-types = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main" }
+tera = { version = "2.4.0", default-features = false, features = ["preserve_order"] }
+
+microcrab-session = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main" }
+
+microcrab-storage = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main", default-features = false }
+
+microcrab-creator = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main", default-features = false }
+
+microcrab-host-protocol = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main" }
+
+microcrab-host-remote = { git = "https://github.com/Ky1eYang/microcrab-core", branch = "main" }

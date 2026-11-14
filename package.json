@@ -1,0 +1,13 @@
+{
+  "name": "microcrab-client-test-tools",
+  "private": true,
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Ky1eYang/microcrab-client.git" },
+  "type": "module",
+  "scripts": {
+    "test:poll": "node --test dev/tests/poll.test.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1"
+  }
+}
