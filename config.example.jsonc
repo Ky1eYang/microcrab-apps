@@ -1,0 +1,166 @@
+{
+  // microcrab-client startup configuration (JSON with comments/trailing commas).
+  // Copy this file to .microcrab/config.jsonc in the SERVER STARTUP DIRECTORY.
+  // Run: cargo run --locked --offline -p microcrab-server
+  // Or select an explicit file with: --config /path/to/config.jsonc
+  // All relative paths below resolve from the startup directory, NOT this file.
+  // Replace example domains, model IDs and secret placeholders before deployment.
+  // This file configures the current Server, not future desktop/TUI applications.
+
+  // Bind locally behind a reverse proxy. Expose the public HTTPS origin below.
+  "listen": "127.0.0.1:4096",
+  // Private persistent data; never serve this directory as static content.
+  "data_dir": ".microcrab",
+  // "sqlite" is enabled by the default build. "file" requires storage-file.
+  // Changing the backend does not migrate existing data; use a fresh namespace
+  // or a separately verified migration. Keep the existing backend for old data.
+  "storage": "sqlite",
+  // Copy microcrab-frontend/frontend/dist CONTENTS here after preparing its
+  // plugin and browser Host assets. Must not overlap private data/config paths.
+  "frontend_dir": "public",
+  // Concurrent active Sessions, 1..4096. This is not the stored-session count.
+  "max_active_sessions": 64,
+
+  "auth": {
+    // External OpenID Connect is the normal deployment mode (no dev feature).
+    // Local testing only: enable dev_oidc, compile with --features dev, use issuer
+    // http://127.0.0.1:4096/api/dev/oidc, loopback callback/origins, cookie_secure
+    // false and allow_http_loopback true. Do not use that profile in production.
+    "dev_oidc": false,
+    // Exact issuer from your IdP; discovery fetches its well-known configuration.
+    "issuer": "https://auth.example.com",
+    "discovery": true,
+    // Optional explicit endpoints override discovery. With discovery=false,
+    // authorization_endpoint, token_endpoint and jwks_uri are all required.
+    // "authorization_endpoint": "https://auth.example.com/authorize",
+    // "token_endpoint": "https://auth.example.com/token",
+    // "jwks_uri": "https://auth.example.com/.well-known/jwks.json",
+    // "end_session_endpoint": "https://auth.example.com/logout",
+
+    // client_id is literal text; env: expansion is NOT supported for this field.
+    "client_id": "REPLACE_WITH_REGISTERED_OIDC_CLIENT_ID",
+    // Omit client_secret for a public client. For a confidential client use a
+    // private literal or "env:MICROCRAB_OIDC_CLIENT_SECRET" (variable must exist).
+    // "client_secret": "env:MICROCRAB_OIDC_CLIENT_SECRET",
+    "token_endpoint_auth_method": "client_secret_post", // or client_secret_basic
+    "scopes": ["openid", "profile"], // openid is required
+    // Register these exact public URLs at your IdP; do not change callback paths.
+    "redirect_uri": "https://crab.example.com/api/auth/callback",
+    "post_login_redirect": "/", // same-origin relative application path
+    "post_logout_redirect_uri": "https://crab.example.com/login",
+    "rp_logout": true, // use the IdP logout endpoint when available
+    // null follows discovered callback-iss support. Any supplied iss is verified.
+    "require_callback_iss": null,
+    "clock_skew_seconds": 60, // 0..300
+    "max_id_token_lifetime_seconds": 604800, // 60..2592000, independent of app TTL
+    "jwks_max_keys": 16, // 1..64
+
+    // Exact browser origins: scheme + host + optional port, no path/trailing slash.
+    "allowed_origins": ["https://crab.example.com"],
+    // Replace with a random private signing secret of at least 32 bytes.
+    // Alternatively use "env:MICROCRAB_SESSION_SECRET". This is NOT the IdP key.
+    "jwt_secret": "REPLACE_WITH_A_RANDOM_PRIVATE_SIGNING_SECRET_AT_LEAST_32_BYTES",
+    "jwt_issuer": "microcrab", // must differ from the external OIDC issuer
+    "jwt_audience": "microcrab-web", // must differ from the OIDC client_id
+    "cookie_secure": true,
+    "session_ttl_seconds": 43200, // 1..604800; fixed application-session lifetime
+    "allow_http_loopback": false, // HTTPS required except explicit loopback dev
+  },
+
+  // Inline provider: a complete wire endpoint, not a gateway base URL.
+  // Protocols: openai-compatible (Chat Completions), openai (Responses),
+  // anthropic (Messages), google (Gemini REST). Select protocol explicitly.
+  // Examples: https://api.openai.com/v1/responses,
+  // https://api.anthropic.com/v1/messages,
+  // https://generativelanguage.googleapis.com/v1beta
+  "provider": {
+    "protocol": "openai-compatible",
+    // native: Bearer for Chat/Responses, x-api-key for Messages, x-goog-api-key
+    // for Google. bearer explicitly selects Bearer for compatible gateways.
+    "auth": "native",
+    "endpoint": "https://api.openai.com/v1/chat/completions",
+    "model": "REPLACE_WITH_PROVIDER_MODEL_ID",
+    // Private literal or "env:MICROCRAB_PROVIDER_API_KEY"; omit for a local
+    // compatible service that needs no key. Missing env references are errors.
+    "api_key": "REPLACE_WITH_PRIVATE_PROVIDER_API_KEY",
+    // Network inactivity window renewed by received chunks, NOT a turn deadline.
+    "timeout_ms": 60000,
+    // Response safety ceiling in bytes, NOT a generation/token budget (1 GiB).
+    "max_response_bytes": 1073741824,
+  },
+  // Advanced existing alternative: replace the ENTIRE provider object with
+  // {"config_file":"/private/providers.toml","name":"provider_id"}.
+  // That optional catalog is TOML; the Server startup configuration stays JSONC.
+  // A single catalog entry can omit name. Do not mix reference and inline fields.
+
+  // Optional display/capacity metadata for the inline model. provider_id must be
+  // "configured" and id must match provider.model. This does not add model routes.
+  // Only set a positive context_window_tokens value from verified model metadata.
+  "available_models": [],
+  // Example entry: {"id":"MODEL_ID","name":"Display name",
+  // "provider_id":"configured","context_window_tokens":131072}
+
+  // Build Agent components in microcrab-core and deploy separately. The mode/name
+  // must be declared by the actual component; no WASM bytes ship with this repo.
+  "agent": {
+    "path": ".microcrab/agents/coding.wasm",
+    "name": "coding",
+    "mode": "plan",
+    "restore_only": false, // true retains bytes only for reopening pinned Sessions
+  },
+  // Additional backend-owned components with the same fields as agent above.
+  // Backend selection pins exact component bytes; replacing a path is not migration.
+  "agents": [],
+
+  "auto_rename": true,
+  "auto_compaction": {
+    "enabled": true,
+    // Pressure thresholds, not raw byte/token counts: 0 < turn < round < 1.
+    "turn_threshold": 0.8,
+    "round_threshold": 0.95,
+    "headroom_tokens": 0,
+  },
+  // Public model metadata refresh is cached privately and does not gate startup.
+  "model_metadata": {
+    "enabled": true,
+    "refresh_interval_secs": 21600, // 60..604800
+    "request_timeout_ms": 20000, // 100..120000
+    "max_response_bytes": 33554432, // 1024..67108864
+  },
+
+  // Ordinary defaults for NEW Sessions; saved owner/project/session choices may
+  // override them within administrator ceilings. This does not rewrite history.
+  "session_defaults": {
+    "initialization": "allow", // allow | ask | deny; separate from tool permission
+    "review": true, // internal action review; mode tabs do not grant permission
+    "review_model": null, // use the current model for review
+    "limits": {}, // omit per-field overrides to inherit the Server defaults
+    // Optional: model_selection, agent, mode, permissions, auto_compaction,
+    // auto_naming. Leave absent to inherit rather than fabricating component IDs.
+  },
+  // Optional administrator maximums: omit to retain the Server's hard ceilings.
+  // This object is a full Limits structure: include every required Limits field
+  // if supplying it. Use session_defaults.limits for a partial defaults override.
+  // max_processes and max_execution_buffers are independent capacities.
+  // max_rounds is a renewable round block, not a whole-turn wall-clock deadline.
+  // "limit_ceilings": {
+  //   "max_rounds": 4096,
+  //   "max_tool_calls_per_round": 1024,
+  //   "max_context_bytes": 1073741824,
+  //   "max_tool_output_bytes": 16777216,
+  //   "max_output_tokens": 1048576,
+  //   "interaction_timeout_ms": 3600000,
+  //   "max_pending_executions": 1024,
+  //   "max_retained_executions": 4096,
+  //   "lifecycle_timeout_ms": 300000,
+  //   "max_processes": 1024,
+  //   "max_execution_buffers": 1024,
+  //   "max_retained_processes": 4096,
+  //   "output_buffer_bytes": 67108864,
+  //   "sleep_max_ms": 3600000,
+  // },
+
+  // Projects/Host pairing are managed through authenticated APIs, not a projects
+  // array here. Unknown fields are rejected. No shell-style ${VAR} expansion:
+  // env: references apply only to jwt_secret, client_secret and provider api_key.
+}

@@ -36,18 +36,25 @@ frontend build output into `public/` or set `frontend_dir` in the server config.
 
 ## Run
 
-Copy the [server configuration example](crates/server/config.example.jsonc) to
-`.microcrab/config.jsonc` and replace credential placeholders privately. The
-example uses the development OIDC issuer and requires the `dev` feature:
+Copy the annotated [startup template](config.example.jsonc) to
+`.microcrab/config.jsonc`. Set your actual public origin, external OIDC client,
+provider model/credentials and prepared Agent paths before starting:
 
 ```sh
-cargo run --locked --offline -p microcrab-server --features dev
+cargo run --locked --offline -p microcrab-server
 cargo run --locked --offline -p microcrab-local-bridge -- --help
 ```
 
-For a deployed server, configure your own OIDC provider and disable `dev_oidc`.
-Relative configuration paths resolve from the server's startup working directory.
-Each native Project requires authenticated Host attachment.
+The template uses external OIDC and does not require the `dev` feature. For local
+loopback development only, the separate [development example](crates/server/config.example.jsonc)
+uses the built-in issuer and requires `--features dev`.
+
+All relative paths resolve from the server's startup working directory, not from
+the configuration file's directory. `--config PATH` selects an explicit JSONC
+file. Legacy `.microcrab/config.json` is considered only when the default JSONC
+file is absent. The optional external TOML provider catalog is a distinct advanced
+input; it is not the Server startup configuration. Each native Project requires
+authenticated Host attachment.
 
 Optional acceptance tooling uses `npm install` and
 `python -m pip install -r dev/requirements.txt`. Its browser fixtures require

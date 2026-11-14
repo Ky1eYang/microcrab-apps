@@ -447,9 +447,11 @@ auth='bearer'
 }
 
 #[test]
-fn public_provider_template_uses_supported_catalog_schema_without_network() {
-    let catalog: Catalog =
-        toml::from_str(include_str!("../../../../../config.example.toml")).unwrap();
+fn provider_catalog_fixture_uses_supported_schema_without_network() {
+    let catalog: Catalog = toml::from_str(include_str!(
+        "../../../tests/fixtures/provider-catalog.toml"
+    ))
+    .unwrap();
     assert_eq!(catalog.provider.len(), 4);
     for raw in catalog.provider.into_values() {
         let entry: Entry = raw.try_into().unwrap();

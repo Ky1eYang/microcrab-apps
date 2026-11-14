@@ -296,6 +296,11 @@ fn explicit_paths_do_not_fall_back_and_legacy_json_remains_readable() {
     // with the full fixture and synthetic secrets without mutating environment.
     for (name, text, auth_fragment) in [
         (
+            "startup-template.jsonc",
+            include_str!("../../../../config.example.jsonc"),
+            false,
+        ),
+        (
             "public-example.jsonc",
             include_str!("../../config.example.jsonc"),
             false,
