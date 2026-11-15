@@ -45,7 +45,7 @@ async fn run(
         match arg.as_str() {
             "--help" | "-h" => {
                 println!(
-                    "microcrab-local-bridge --root PATH --origin ORIGIN [--allow-root PATH]... [--listen 127.0.0.1:8788] [--grpc-listen 127.0.0.1:8789] [--no-token] [--require-token] [--token TOKEN] [--ready-file .microcrab/ready.json]\n\
+                    "microcrab-local-bridge --root PATH --origin ORIGIN [--allow-root PATH]... [--unrestricted-fs] [--listen 127.0.0.1:8788] [--grpc-listen 127.0.0.1:8789] [--no-token] [--require-token] [--token TOKEN] [--ready-file .microcrab/ready.json]\n\
                      Device Host service with isolated workspaces inside configured allowed roots.\n\
                      WebSocket /host stays loopback for the client relay. gRPC is the direct carrier the server dials.\n\
                      A non-loopback gRPC bind requires --require-token. Default mode: no-token.\n\
@@ -53,10 +53,12 @@ async fn run(
                      Restrictions: --read-only disables typed writes/cache points and all new shell/process starts.\n\
                      --no-shell and --no-process independently disable those launch capabilities.\n\
                      Repeat --allow-root for workspace-selection grants; an explicit drive/filesystem root grants broad selection.\n\
-                     Each selected workspace still has its own typed filesystem root. Shell/process execution is NOT an OS filesystem sandbox."
+                     Typed filesystem paths are workspace-confined by default. --unrestricted-fs permits absolute outside paths and relative parent traversal.\n\
+                     Private paths, device/ADS and link/reparse safety checks remain enforced. Shell/process authorization is independent; execution is NOT an OS filesystem sandbox."
                 );
                 return Ok(());
             }
+            "--unrestricted-fs" => policy.unrestricted_fs = true,
             "--read-only" => policy.read_only = true,
             "--no-shell" => policy.no_shell = true,
             "--no-process" => policy.no_process = true,
@@ -88,7 +90,7 @@ async fn run(
             }
             _ => {
                 return Err(
-                    "usage: microcrab-local-bridge --root PATH --allowed-origin ORIGIN [--allow-root PATH]... [--listen 127.0.0.1:8788] [--grpc-listen 127.0.0.1:8789] [--no-token] [--require-token] [--token TOKEN]"
+                    "usage: microcrab-local-bridge --root PATH --allowed-origin ORIGIN [--allow-root PATH]... [--unrestricted-fs] [--listen 127.0.0.1:8788] [--grpc-listen 127.0.0.1:8789] [--no-token] [--require-token] [--token TOKEN]"
                         .into(),
                 )
             }
@@ -193,6 +195,7 @@ async fn run(
         allowed_origin = %origin,
         protocol_version = bridge.default.descriptor.protocol_version,
         require_token = require_token,
+        unrestricted_fs = policy.unrestricted_fs,
         read_only = policy.read_only,
         no_shell = policy.no_shell,
         no_process = policy.no_process,

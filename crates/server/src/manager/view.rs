@@ -85,7 +85,21 @@ pub(super) fn retain_context_failures(operations: &mut Vec<OperationRecord>, mes
     });
 }
 
-pub(super) fn session(record: &SessionRecord, legacy_model: &str, status: &str) -> Value {
+pub(super) fn session(
+    manager: &super::Manager,
+    record: &SessionRecord,
+    legacy_model: &str,
+    status: &str,
+) -> Value {
+    let mut value = base_session(record, legacy_model, status);
+    if record.project_id.is_none() {
+        if let Some(flavor) = manager.conversation_flavors.get(&record.owner, &record.id) {
+            value["host_flavor"] = json!(flavor);
+        }
+    }
+    value
+}
+fn base_session(record: &SessionRecord, legacy_model: &str, status: &str) -> Value {
     let model = record
         .model_selection
         .as_ref()
@@ -427,7 +441,10 @@ pub(super) async fn snapshot(
         &superseded_failure_operation_ids,
         retry_operation.as_deref(),
     );
-    let mut projection = session(record, model, status);
+    let mut projection = base_session(record, model, status);
+    if let Some(flavor) = managed.host_flavor {
+        projection["host_flavor"] = json!(flavor);
+    }
     super::model::project_route(managed, record, &mut projection);
     projection["component"] = json!(managed.component);
     projection["kind"] = json!(managed.session.kind());

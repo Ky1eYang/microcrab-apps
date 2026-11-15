@@ -105,7 +105,7 @@ impl Manager {
             .await;
         Ok(page)
     }
-    async fn inspect_message_source(
+    pub(super) async fn inspect_message_source(
         &self,
         record: &SessionRecord,
     ) -> Result<(view::DisplayMessages, String, u64, Option<String>), WireError> {
@@ -461,6 +461,7 @@ impl Manager {
         let mut messages = display.messages;
         self.annotate_detached_display(record, &mut messages).await;
         let mut session = view::session(
+            self,
             record,
             &self.config.provider.model,
             if record.archived { "closed" } else { "idle" },

@@ -139,6 +139,24 @@ impl Manager {
         Ok((result, sources))
     }
 }
+fn model_selection(
+    manager: &Manager,
+    settings: &SettingsOverrides,
+) -> microcrab_storage::ModelSelection {
+    settings
+        .model_selection
+        .clone()
+        .unwrap_or_else(|| super::model::default_selection(&manager.config))
+}
+fn resolve_mode(settings: &mut SettingsOverrides, managed: &Managed) -> Result<(), WireError> {
+    if settings.mode.is_none() {
+        settings.mode = managed
+            .default_mode
+            .clone()
+            .map_err(|reason| WireError::new("configuration_default_unavailable", reason))?;
+    }
+    Ok(())
+}
 fn values(manager: &Manager, settings: &SettingsOverrides) -> Result<Value, WireError> {
     let mut value =
         serde_json::to_value(settings).map_err(|_| invalid("Cannot encode settings"))?;
@@ -147,9 +165,7 @@ fn values(manager: &Manager, settings: &SettingsOverrides) -> Result<Value, Wire
     value["review_model"] = json!(settings.review_model.clone().flatten());
     value["limits"] =
         json!(limits(&settings.limits, &manager.config.limit_ceilings).map_err(invalid)?);
-    if settings.model_selection.is_none() {
-        value["model_selection"] = json!(super::model::default_selection(&manager.config));
-    }
+    value["model_selection"] = json!(model_selection(manager, settings));
     if settings.review.is_none() {
         value["review"] = json!(true);
     }
@@ -388,7 +404,6 @@ pub(super) async fn command(
             manager.config.session_defaults.clone()
         };
         candidate.overlay(&next);
-        let effective = values(manager, &candidate)?;
         if let Some(selection) = &candidate.model_selection {
             super::providers::resolve(manager, owner, selection).await?;
         }
@@ -400,10 +415,12 @@ pub(super) async fn command(
         let _application_gate = if let Some(managed) = applying.as_ref() {
             let gate = managed.commands.lock().await;
             ensure_mutable(managed)?;
+            resolve_mode(&mut candidate, managed)?;
             Some(gate)
         } else {
             None
         };
+        let effective = values(manager, &candidate)?;
         let stored = manager
             .configuration
             .compare_exchange(owner, kind, target, expected, Some(json!(next)))
@@ -475,7 +492,12 @@ pub(super) async fn command(
             .await
             .map_err(configuration_error)?
     };
-    let (effective, sources) = manager.effective_settings(owner, project, id).await?;
+    let (mut effective, sources) = manager.effective_settings(owner, project, id).await?;
+    if let Some(id) = id {
+        if let Some(managed) = active(manager, id).await {
+            resolve_mode(&mut effective, &managed)?;
+        }
+    }
     let desired = values(manager, &effective)?;
     let mut actual = if let Some(id) = id {
         let saved = manager
@@ -678,11 +700,15 @@ async fn apply_after_limits(
         .await
         .map_err(configuration_error)?;
     drop(cached);
-    let mut record = managed.record.lock().await.clone();
-    if let Some(selection) = &settings.model_selection {
-        super::model::select(manager, managed, record.revision, selection.clone()).await?;
-        record = managed.record.lock().await.clone();
-    }
+    let record = managed.record.lock().await.clone();
+    super::model::select(
+        manager,
+        managed,
+        record.revision,
+        model_selection(manager, settings),
+    )
+    .await?;
+    let record = managed.record.lock().await.clone();
     let command = Command {
         v: 1,
         kind: microcrab_protocol::application::CommandKind::Command,

@@ -2,6 +2,7 @@
 //! native restore. Parent owns execution with the coherent workspace gate.
 mod attach_latency;
 mod auto_naming_queue;
+mod citations;
 mod chronology;
 mod compacted_display;
 mod compaction;

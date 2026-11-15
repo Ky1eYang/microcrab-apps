@@ -1,6 +1,7 @@
 //! Browser Conversations have no Project registry membership. Immutable owner,
 //! browser and workspace pins constrain every reconnect; socket generations own
 //! transient leases. Route replacement interrupts admission and never replays effects.
+use super::conversation_flavors::HostFlavor;
 use super::{Manager, bindings::Route, safe, unavailable};
 use crate::auth::Principal;
 use microcrab_host_api::Host;
@@ -8,7 +9,7 @@ use microcrab_host_protocol::{BindingScope, HostDescriptor, HostFrame};
 use microcrab_host_remote::RemoteHost;
 use microcrab_protocol::application::WireError;
 use microcrab_storage::execution::{ConversationBinding, ConversationGrant};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::Ordering};
 use tokio::sync::mpsc;
@@ -19,6 +20,14 @@ pub(crate) struct Binding {
     pub conversation_id: String,
     pub browser_id: String,
     pub workspace_id: String,
+    #[serde(default)]
+    pub host_flavor: Option<HostFlavor>,
+}
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub(super) struct ConversationScope {
+    #[serde(flatten)]
+    scope: BindingScope,
+    host_flavor: HostFlavor,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -26,13 +35,23 @@ pub(crate) struct Attach {
     pub conversation_id: String,
     pub descriptor: HostDescriptor,
     pub lease_generation: String,
+    #[serde(default)]
+    pub host_flavor: Option<HostFlavor>,
+}
+fn chat_only_descriptor(descriptor: &HostDescriptor) -> bool {
+    descriptor.platform == "browser"
+        && descriptor.workspace_root == "/chat"
+        && descriptor.info.capabilities.is_empty()
+        && descriptor.info.virtual_shell.is_none()
+        && descriptor.tool_capabilities.is_empty()
+        && descriptor.supported_primitives.is_empty()
 }
 impl Manager {
     pub(super) async fn conversation_scope(
         &self,
         owner: &str,
         params: Binding,
-    ) -> Result<BindingScope, WireError> {
+    ) -> Result<ConversationScope, WireError> {
         if self.embedded || self.closed.load(Ordering::Acquire) {
             return Err(unavailable());
         }
@@ -51,25 +70,24 @@ impl Manager {
         let _identity = self.identity_gate.lock().await;
         // A different owner cannot acquire an existing Conversation ID, even
         // before its first Session record is created.
-        let grant = match self
+        let existing = self
             .pins
             .conversation_grant(&params.conversation_id)
             .await
-            .map_err(safe)?
+            .map_err(safe)?;
+        let grant = match existing
+            .clone()
+            .or_else(|| self.conversation_flavors.grant(&params.conversation_id))
         {
             Some(grant) => grant,
-            None => self
-                .pins
-                .pin_conversation_grant(ConversationGrant {
-                    conversation_id: params.conversation_id.clone(),
-                    browser_id: params.browser_id.clone(),
-                    workspace_id: params.workspace_id.clone(),
-                    owner: owner.into(),
-                    backend_id: self.pins.backend_id().await.map_err(safe)?,
-                    binding_id: uuid::Uuid::new_v4().to_string(),
-                })
-                .await
-                .map_err(safe)?,
+            None => ConversationGrant {
+                conversation_id: params.conversation_id.clone(),
+                browser_id: params.browser_id.clone(),
+                workspace_id: params.workspace_id.clone(),
+                owner: owner.into(),
+                backend_id: self.pins.backend_id().await.map_err(safe)?,
+                binding_id: uuid::Uuid::new_v4().to_string(),
+            },
         };
         if grant.owner != owner
             || grant.browser_id != params.browser_id
@@ -77,11 +95,46 @@ impl Manager {
         {
             return Err(unavailable());
         }
-        Ok(BindingScope::conversation(
-            grant.backend_id,
-            grant.binding_id,
-            grant.conversation_id,
-        ))
+        let pinned = self
+            .conversation_flavors
+            .get(owner, &params.conversation_id)
+            .or_else(|| existing.as_ref().map(|_| HostFlavor::BrowserSandbox));
+        let flavor = params
+            .host_flavor
+            .or(pinned)
+            .unwrap_or(HostFlavor::BrowserSandbox);
+        if pinned.is_some_and(|old| old != flavor) {
+            return Err(WireError::new(
+                "binding_mismatch",
+                "Conversation execution flavor is immutable",
+            ));
+        }
+        // Flavor is committed before the Core grant or any runtime preparation.
+        // A crash in between is resumed with the sidecar's exact binding identity.
+        let flavors = self.conversation_flavors.clone();
+        let flavor_grant = grant.clone();
+        tokio::task::spawn_blocking(move || flavors.pin(flavor_grant, flavor))
+            .await
+            .map_err(|_| {
+                WireError::new(
+                    "storage_error",
+                    "Conversation flavor publication worker failed",
+                )
+            })?
+            .map_err(safe)?;
+        let grant = self
+            .pins
+            .pin_conversation_grant(grant)
+            .await
+            .map_err(safe)?;
+        Ok(ConversationScope {
+            scope: BindingScope::conversation(
+                grant.backend_id,
+                grant.binding_id,
+                grant.conversation_id,
+            ),
+            host_flavor: flavor,
+        })
     }
     pub(crate) async fn allows_conversation(&self, principal: &Principal, id: &str) -> bool {
         !self.closed.load(Ordering::Acquire)
@@ -135,6 +188,27 @@ impl Manager {
             return Err(WireError::new(
                 "binding_mismatch",
                 "Browser or workspace differs from the Conversation grant",
+            ));
+        }
+        let flavors = self.conversation_flavors.clone();
+        let flavor_grant = grant.clone();
+        let flavor = tokio::task::spawn_blocking(move || flavors.resolve(&flavor_grant))
+            .await
+            .map_err(|_| WireError::new("storage_error", "Conversation flavor read worker failed"))?
+            .map_err(safe)?;
+        if params
+            .host_flavor
+            .is_some_and(|requested| requested != flavor)
+        {
+            return Err(WireError::new(
+                "binding_mismatch",
+                "Conversation execution flavor is immutable",
+            ));
+        }
+        if flavor == HostFlavor::ChatOnly && !chat_only_descriptor(&params.descriptor) {
+            return Err(WireError::new(
+                "binding_mismatch",
+                "Chat Only cannot advertise execution capabilities",
             ));
         }
         let scope =
@@ -242,10 +316,11 @@ impl Manager {
             .get_mut(&params.conversation_id)
             .filter(|route| route.socket == socket && route.generation == generation)
             .ok_or_else(|| WireError::new("route_replaced", "Browser attachment replaced"))?;
-        let readiness = remote.readiness();
+        let mut readiness = remote.readiness();
+        readiness["host_flavor"] = json!(flavor);
         route.ready = readiness["ready"] == true;
         Ok(
-            json!({"conversation_id":params.conversation_id,"connection_generation":generation.to_string(),"connected":readiness["connected"],"ready":route.ready,"reconciling":readiness["reconciling"],"scope":scope,"reconciliation_error":readiness["cause"],"readiness":readiness}),
+            json!({"conversation_id":params.conversation_id,"host_flavor":flavor,"connection_generation":generation.to_string(),"connected":readiness["connected"],"ready":route.ready,"reconciling":readiness["reconciling"],"scope":scope,"reconciliation_error":readiness["cause"],"readiness":readiness}),
         )
     }
     pub(crate) async fn receive_conversation_host(

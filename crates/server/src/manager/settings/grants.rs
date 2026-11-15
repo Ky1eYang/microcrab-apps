@@ -95,6 +95,7 @@ impl FutureGrantPersistence for Grants {
                         *cached = record.clone();
                     }
                     let mut session = super::super::view::session(
+                        &manager,
                         &cached,
                         &manager.config.provider.model,
                         if managed.session.inbox_snapshot().active {

@@ -129,8 +129,18 @@ impl Bridge {
             receipts::create_durable(&identity_path, &serde_json::to_vec(&identity)?)?;
             identity
         };
-        let host = LocalHost::new(&root, ShellLimits::default())
-            .or_else(|_| LocalHost::new_filesystem(&root, ShellLimits::default()))?;
+        let host = LocalHost::new_with_filesystem_scope(
+            &root,
+            ShellLimits::default(),
+            policy.unrestricted_fs,
+        )
+        .or_else(|_| {
+            LocalHost::new_filesystem_with_scope(
+                &root,
+                ShellLimits::default(),
+                policy.unrestricted_fs,
+            )
+        })?;
         host.protect_workspace_path(root.join(".microcrab"))?;
         let retired_private = root.join(".micro-crab");
         if retired_private.exists() {

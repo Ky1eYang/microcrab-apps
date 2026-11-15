@@ -46,6 +46,10 @@ pub(super) fn router() -> Router<Arc<Application>> {
         )
         .route("/api/v1/health", get(health))
         .route(
+            "/api/v1/sessions/{session_id}/files/{message_id}",
+            get(super::citations::read),
+        )
+        .route(
             "/api/v1/sessions/{session_id}/images/{message_id}/{part_index}",
             get(super::images::read),
         );

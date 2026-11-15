@@ -1,4 +1,6 @@
 //! No hidden Project, owner/scope fences, and socket-generation reconnect safety.
+#[path = "chat_flavors.rs"]
+mod chat_flavors;
 use super::super::conversations::{Attach, Binding};
 use super::*;
 use microcrab_host_protocol::{HostDescriptor, HostFrame, HostRequest};
@@ -12,6 +14,7 @@ fn binding(id: &str, browser: &str, workspace: &str) -> Binding {
         conversation_id: id.into(),
         browser_id: browser.into(),
         workspace_id: workspace.into(),
+        host_flavor: None,
     }
 }
 fn browser_descriptor(browser: &str, workspace: &str) -> HostDescriptor {
@@ -72,6 +75,7 @@ async fn attach(
             owner,
             socket,
             Attach {
+                host_flavor: None,
                 conversation_id: id.into(),
                 descriptor,
                 lease_generation: format!("lease-{generation}"),
@@ -227,6 +231,7 @@ async fn projectless_owner_pins_and_generation_survive_disconnect_and_restart() 
                 &owner,
                 "old",
                 Attach {
+                    host_flavor: None,
                     conversation_id: id.clone(),
                     descriptor: descriptor.clone(),
                     lease_generation: "stale".into()
@@ -249,6 +254,7 @@ async fn projectless_owner_pins_and_generation_survive_disconnect_and_restart() 
                 &owner,
                 "wrong",
                 Attach {
+                    host_flavor: None,
                     conversation_id: id.clone(),
                     descriptor: changed,
                     lease_generation: "new".into()
@@ -327,6 +333,7 @@ async fn conversation_workspace_cannot_be_leased_by_another_scope_or_missing_bin
                 &owner,
                 "second",
                 Attach {
+                    host_flavor: None,
                     conversation_id: second,
                     descriptor,
                     lease_generation: "lease".into()

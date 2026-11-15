@@ -1,4 +1,209 @@
 use super::*;
+
+#[tokio::test]
+async fn unrestricted_scope_changes_immutable_pin_without_changing_tool_linkage() {
+    let fixture = tempfile::tempdir().unwrap();
+    // System Temp can be reached through a Windows profile junction. Use the
+    // same directory's canonical identity for the admitted ordinary-path case.
+    let base = fixture.path().canonicalize().unwrap();
+    let root = base.join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let outside = base.join("outside.txt");
+    std::fs::write(&outside, "outside").unwrap();
+    let (confined, _) = Bridge::open_with_options(&root, false, None).unwrap();
+    let previous = confined.descriptor.clone();
+    assert!(
+        confined
+            .host
+            .read_file(outside.clone(), 1024, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    drop(confined);
+    let policy = BridgePolicy {
+        unrestricted_fs: true,
+        read_only: true,
+        ..BridgePolicy::default()
+    };
+    let (bridge, _) = Bridge::open_with_policy(&root, false, None, policy).unwrap();
+    assert_eq!(
+        bridge
+            .host
+            .read_file(outside.clone(), 1024, CancellationToken::new())
+            .await
+            .unwrap(),
+        b"outside"
+    );
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let has_reparse_ancestor = fixture
+            .path()
+            .ancestors()
+            .any(|path| std::fs::symlink_metadata(path).unwrap().file_attributes() & 0x400 != 0);
+        if has_reparse_ancestor {
+            // Canonical access above succeeds, while the actual linked alias
+            // remains rejected even with unrestricted filesystem scope.
+            let error = bridge
+                .host
+                .read_file(
+                    fixture.path().join("outside.txt"),
+                    1024,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.public_reason(),
+                Some("target path contains a disallowed symlink or reparse point")
+            );
+        }
+    }
+    assert!(
+        bridge
+            .descriptor
+            .info
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("unrestricted")
+    );
+    assert!(!descriptor_matches_pin(&bridge.descriptor, &previous.descriptor_digest).unwrap());
+    assert!(
+        descriptor_matches_pin(&bridge.descriptor, &bridge.descriptor.descriptor_digest).unwrap()
+    );
+    // Scope does not create a tool/import, and read-only/launch gates still win.
+    assert!(
+        !bridge
+            .descriptor
+            .tool_capabilities
+            .iter()
+            .any(|name| name.contains("unrestricted"))
+    );
+    assert!(!bridge.policy.capability("write"));
+    assert!(!bridge.policy.capability("process.spawn"));
+    assert!(!bridge.policy.capability("shell.launch"));
+    let private = root.join(".microcrab/host-bridge/identity.json");
+    assert!(
+        bridge
+            .host
+            .read_file(private, 4096, CancellationToken::new())
+            .await
+            .is_err()
+    );
+    drop(bridge);
+    let (bridge, _) = Bridge::open_with_policy(
+        &root,
+        false,
+        None,
+        BridgePolicy {
+            unrestricted_fs: true,
+            ..BridgePolicy::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        bridge.descriptor.tool_capabilities,
+        previous.tool_capabilities
+    );
+    assert_eq!(
+        bridge.descriptor.supported_primitives,
+        previous.supported_primitives
+    );
+    assert!(!descriptor_matches_pin(&bridge.descriptor, &previous.descriptor_digest).unwrap());
+    let pin = bridge.descriptor.descriptor_digest.clone();
+    drop(bridge);
+    let (restarted, _) = Bridge::open_with_policy(
+        &root,
+        false,
+        None,
+        BridgePolicy {
+            unrestricted_fs: true,
+            ..BridgePolicy::default()
+        },
+    )
+    .unwrap();
+    assert!(descriptor_matches_pin(&restarted.descriptor, &pin).unwrap());
+}
+
+#[tokio::test]
+async fn service_selected_workspace_inherits_unrestricted_scope_and_external_private_guards() {
+    let fixture = tempfile::tempdir().unwrap();
+    let base = fixture.path().canonicalize().unwrap();
+    let root = base.join("first");
+    let second = base.join("second");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    std::fs::write(root.join("public.txt"), "public").unwrap();
+    let (service, _) = BridgeService::open_with_policy(
+        &root,
+        std::slice::from_ref(&second),
+        false,
+        None,
+        BridgePolicy {
+            unrestricted_fs: true,
+            ..BridgePolicy::default()
+        },
+    )
+    .unwrap();
+    let (selected, _) = service
+        .authenticate(WireFrame::Pair {
+            directory: Some(second.to_string_lossy().into()),
+            expected_host_id: None,
+            expected_workspace_id: None,
+            token: String::new(),
+            scope: scope(),
+        })
+        .await
+        .unwrap();
+    assert!(selected.policy.unrestricted_fs);
+    assert_eq!(
+        selected
+            .host
+            .read_file(root.join("public.txt"), 1024, CancellationToken::new())
+            .await
+            .unwrap(),
+        b"public"
+    );
+    assert!(
+        selected
+            .host
+            .read_file(
+                root.join(".microcrab/host-bridge/identity.json"),
+                4096,
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .default
+            .host
+            .read_file(
+                second.join(".microcrab/host-bridge/identity.json"),
+                4096,
+                CancellationToken::new()
+            )
+            .await
+            .is_err()
+    );
+    let third = base.join("unselected");
+    std::fs::create_dir(&third).unwrap();
+    assert!(
+        service
+            .authenticate(WireFrame::Pair {
+                directory: Some(third.to_string_lossy().into()),
+                expected_host_id: None,
+                expected_workspace_id: None,
+                token: String::new(),
+                scope: scope()
+            })
+            .await
+            .is_err()
+    );
+}
+
 use microcrab_host_api::{ErrorCategory, HostError, ShellRequest, ToolError};
 
 #[tokio::test]

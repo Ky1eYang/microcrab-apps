@@ -3,6 +3,9 @@ use microcrab_host_protocol::{ErrorCode, HostRequest, WireError};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BridgePolicy {
+    /// Typed ordinary filesystem paths may leave the selected workspace.
+    /// Private paths and link/device/ADS checks remain enforced by LocalHost.
+    pub unrestricted_fs: bool,
     pub read_only: bool,
     pub no_shell: bool,
     pub no_process: bool,

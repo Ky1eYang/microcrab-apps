@@ -1,10 +1,12 @@
 //! Real loopback provider requests verify routing independently of UI labels.
 #![cfg(feature = "storage-file")]
+mod chat_only_catalog;
 mod context_budget;
 mod display;
 mod gateway;
 mod retry;
 mod review;
+mod settings;
 use super::*;
 use axum::{Json, Router, extract::State as HttpState, http::HeaderMap, routing::post};
 use microcrab_protocol::application::Command;

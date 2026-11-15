@@ -555,7 +555,8 @@ pub(super) async fn select(
     } else {
         "idle"
     };
-    let mut session = super::view::session(&record, &manager.config.provider.model, status);
+    let mut session =
+        super::view::session(manager, &record, &manager.config.provider.model, status);
     project_route(managed, &record, &mut session);
     snapshot["session"] = session.clone();
     managed.hub.session(session);

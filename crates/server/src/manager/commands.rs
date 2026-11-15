@@ -655,6 +655,7 @@ pub(super) async fn list_item(
     });
     let mut item = current.unwrap_or_else(|| {
         view::session(
+            manager,
             &record,
             &manager.config.provider.model,
             if record.archived { "closed" } else { "idle" },
@@ -1330,6 +1331,7 @@ pub(super) async fn execute(
             return Ok(closed);
         } else {
             return Ok(view::session(
+                manager,
                 &record,
                 &manager.config.provider.model,
                 "closed",
@@ -1577,6 +1579,7 @@ pub(super) async fn execute(
                 .await
                 .map_err(safe)?;
             let result = view::session(
+                manager,
                 &record,
                 &manager.config.provider.model,
                 if managed.hub.operation().is_some() {
@@ -1737,7 +1740,8 @@ pub(super) async fn execute(
                 } else {
                     "idle"
                 };
-            let mut session = view::session(&record, &manager.config.provider.model, status);
+            let mut session =
+                view::session(manager, &record, &manager.config.provider.model, status);
             super::model::project_route(&managed, &record, &mut session);
             snapshot["session"] = session.clone();
             managed.hub.session(session);
@@ -1850,7 +1854,8 @@ async fn finish_session(
                 .replace(owner, revision, next)
                 .await
                 .map_err(safe)?;
-            let session = view::session(&current, &manager.config.provider.model, "closed");
+            let session =
+                view::session(manager, &current, &manager.config.provider.model, "closed");
             managed.hub.session(session.clone());
             Ok(session)
         } else {
@@ -2279,7 +2284,8 @@ pub(super) async fn create(
     match manager.active(record, restore).await {
         Ok(managed) => {
             let record = managed.record.lock().await;
-            let mut result = view::session(&record, &manager.config.provider.model, "idle");
+            let mut result =
+                view::session(manager, &record, &manager.config.provider.model, "idle");
             result["component"] = json!(component_digest);
             result["agent_initialization_deferred"] = json!(super::agent_init::deferred(&managed));
             result["agent_init_pending"] = json!(
@@ -2907,6 +2913,7 @@ async fn rename_dormant(
         .await
         .map_err(safe)?;
     Ok(Some(view::session(
+        manager,
         &saved,
         &manager.config.provider.model,
         "idle",

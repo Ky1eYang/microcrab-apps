@@ -285,7 +285,7 @@ pub(super) async fn execute(
             )
             .await?;
         let record = managed.record.lock().await.clone();
-        let mut value = view::session(&record, &manager.config.provider.model, "idle");
+        let mut value = view::session(manager, &record, &manager.config.provider.model, "idle");
         value["component"] = json!(managed.component);
         if let Some(error) = display_error {
             managed.hub.display_failed(error.message.clone());

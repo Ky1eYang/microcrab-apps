@@ -24,6 +24,7 @@ pub(super) async fn archive_session(
     // returns the settled view, never an error and never another revision.
     if record.archived {
         return Ok(view::session(
+            manager,
             &record,
             &manager.config.provider.model,
             "closed",
@@ -61,6 +62,7 @@ pub(super) async fn archive_session(
         .await
         .map_err(safe)?;
     Ok(view::session(
+        manager,
         &saved,
         &manager.config.provider.model,
         "closed",

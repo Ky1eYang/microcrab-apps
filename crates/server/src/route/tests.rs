@@ -1,6 +1,7 @@
 //! Transport regression checks: owner isolation, browser mutation admission,
 //! durable create reconciliation and logical deletion remain Manager contracts.
 mod attachments;
+mod citations;
 mod children;
 mod host_connection;
 mod images;

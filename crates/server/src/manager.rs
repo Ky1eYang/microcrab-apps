@@ -8,9 +8,11 @@ mod auto_compaction;
 pub(crate) mod bindings;
 mod cancellation;
 mod child_inspection;
+pub(crate) mod citations;
 pub(crate) mod client_tools;
 pub(crate) mod commands;
 mod compaction;
+mod conversation_flavors;
 pub(crate) mod conversations;
 mod deletion;
 mod detached;
@@ -70,6 +72,7 @@ pub struct Manager {
     host: Arc<dyn Host>,
     embedded: bool,
     pins: microcrab_storage::execution::ExecutionPins,
+    conversation_flavors: Arc<conversation_flavors::Flavors>,
     routes: AsyncMutex<HashMap<String, bindings::Route>>,
     direct_hosts: direct::Hosts,
     conversation_routes: AsyncMutex<HashMap<String, bindings::Route>>,
@@ -94,6 +97,7 @@ pub struct Manager {
     instance: String,
     self_ref: std::sync::Weak<Manager>,
     client_override: Option<Arc<dyn microcrab_session::Client>>,
+    citation_admission: Arc<Semaphore>,
     admission: Arc<Semaphore>,
     control_admission: Arc<Semaphore>,
     tasks: Mutex<JoinSet<()>>,
@@ -138,6 +142,7 @@ impl Slot {
     }
 }
 struct Managed {
+    host_flavor: Option<conversation_flavors::HostFlavor>,
     session: Session,
     slot: std::sync::Weak<Slot>,
     routing: model::Routing,
@@ -166,6 +171,8 @@ struct Managed {
     faulted: AtomicBool,
     suspended: AtomicBool,
     component: Option<String>,
+    /// Resolved only from this assembly's exact component and fixed Agent.
+    default_mode: Result<Option<String>, String>,
     cleanup: AsyncMutex<Option<ManagedCleanup>>,
 }
 #[derive(Clone)]
@@ -475,6 +482,7 @@ impl Manager {
         }
         let pins =
             microcrab_storage::execution::ExecutionPins::new(config.data_dir.join("execution"));
+        let conversation_flavors = Arc::new(conversation_flavors::Flavors::open(&config.data_dir)?);
         let projects = crate::project::ProjectRegistry::new(&config.data_dir)?;
         let model_metadata = model_metadata::ModelMetadata::open(&config).await?;
         let session_watch = session_watch::SessionWatch::new();
@@ -489,6 +497,7 @@ impl Manager {
             host,
             embedded,
             pins,
+            conversation_flavors,
             routes: AsyncMutex::new(HashMap::new()),
             direct_hosts: direct::Hosts::default(),
             conversation_routes: AsyncMutex::new(HashMap::new()),
@@ -507,6 +516,7 @@ impl Manager {
             instance: uuid::Uuid::new_v4().to_string(),
             self_ref: weak.clone(),
             client_override,
+            citation_admission: Arc::new(Semaphore::new(4)),
             admission: Arc::new(Semaphore::new(128)),
             control_admission: Arc::new(Semaphore::new(16)),
             tasks: Mutex::new(JoinSet::new()),
@@ -1040,6 +1050,7 @@ impl Manager {
         *cleanup = Some(result);
         let record = managed.record.lock().await;
         managed.hub.session(view::session(
+            self,
             &record,
             &self.config.provider.model,
             "closed",

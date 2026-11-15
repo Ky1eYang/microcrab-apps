@@ -1,4 +1,6 @@
 //! Actual Session insertion lanes, receipt replay and autonomous failure projection.
+#[cfg(feature = "storage-file")]
+mod plugin_inventory;
 use super::*;
 use serde_json::json;
 

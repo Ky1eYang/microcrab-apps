@@ -101,6 +101,44 @@ fn load(config: &crate::config::Agent, host: Arc<dyn Host>) -> Result<(WasmAgent
     let digest = format!("{:x}", Sha256::digest(&bytes));
     Ok((WasmAgent::load(&bytes, limits, host)?, digest))
 }
+fn default_mode(
+    component: Option<&ComponentCatalog>,
+    record: &SessionRecord,
+    session: &Session,
+) -> Result<Option<String>, String> {
+    let Some(component) = component else {
+        return if record.agent.is_none() {
+            Ok(None)
+        } else {
+            Err("Pinned Agent has no pinned component for its default mode".into())
+        };
+    };
+    let name = record
+        .agent
+        .as_ref()
+        .ok_or("Pinned component has no fixed Session Agent for its default mode")?;
+    let agent = component
+        .agents
+        .iter()
+        .find(|agent| &agent.name == name)
+        .ok_or("Fixed Session Agent is unavailable in the pinned component")?;
+    if let Some(mode) = &component.config.mode {
+        session.validate_mode(mode).map_err(|error| {
+            format!(
+                "Pinned component default mode is unavailable for the fixed Session Agent: {}",
+                error.diagnostic_reason()
+            )
+        })?;
+        return Ok(Some(mode.clone()));
+    }
+    agent
+        .modes
+        .iter()
+        .find(|mode| session.validate_mode(&mode.name).is_ok())
+        .map(|mode| Some(mode.name.clone()))
+        .ok_or_else(|| "Fixed Session Agent has no valid default mode for this Session kind".into())
+}
+
 pub(super) async fn create(
     manager: &Manager,
     record: SessionRecord,
@@ -686,7 +724,13 @@ pub(super) async fn create_from(
     {
         slot.initialization_deferred.store(true, Ordering::Release);
     }
+    let default_mode = default_mode(component, &record, &session);
     let managed = Arc::new(Managed {
+        host_flavor: record
+            .project_id
+            .is_none()
+            .then(|| manager.conversation_flavors.get(&record.owner, &record.id))
+            .flatten(),
         session,
         slot: slot.as_ref().map(Arc::downgrade).unwrap_or_default(),
         routing,
@@ -725,6 +769,7 @@ pub(super) async fn create_from(
         faulted: AtomicBool::new(false),
         suspended: AtomicBool::new(false),
         component: component_digest,
+        default_mode,
         cleanup: Mutex::new(None),
     });
     naming_admission.install(&managed);
