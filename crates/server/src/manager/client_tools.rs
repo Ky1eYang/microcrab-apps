@@ -8,8 +8,8 @@ mod tests;
 
 pub(crate) use bridge::ClientTools;
 pub(crate) use model::{
-    BindRequest, ClientToolDefinition, ClientToolPhase, OutputRequest, PrepareRequest,
+    BindRequest, CallRecord, ClientToolDefinition, ClientToolPhase, OutputRequest, PrepareRequest,
     ResultRequest,
 };
 #[cfg(test)]
-use model::{BindSnapshot, CallRecord, CallStatus, ClientRole};
+use model::{BindSnapshot, CallStatus, ClientRole};

@@ -200,6 +200,15 @@ pub(super) async fn create_from(
             ));
         }
     }
+    let prompt_config = record.prompt_config.clone().unwrap_or_default();
+    prompt_config.validate()?;
+    if !restore && fork_source.is_none() {
+        let selected_agent = record.agent.as_ref().and_then(|name| {
+            component
+                .and_then(|component| component.agents.iter().find(|agent| &agent.name == name))
+        });
+        prompt_config.render_system(selected_agent)?;
+    }
     let config = component.map(|component| component.config.clone());
     let expected_digest = component.map(|component| component.digest.clone());
     let component_digest = expected_digest.clone();
@@ -302,6 +311,15 @@ pub(super) async fn create_from(
             }
         }
     };
+    // Runtime history witnesses a legacy Session's first resolved configuration.
+    // Child factories must use the same snapshot as restore/fork, even when the
+    // older creator record has no field yet.
+    let prompt_config = super::prompt_defaults::retained(
+        prompt_config,
+        recover.as_ref(),
+        fork_source.map(|(source, _)| source.prompt_config()),
+    );
+    prompt_config.validate()?;
     let client_tools = manager.client_tools(&record.id).await?;
     if let Some(recover) = recover.as_ref() {
         client_tools
@@ -589,6 +607,7 @@ pub(super) async fn create_from(
                     database: manager.config.data_dir.join("storage.sqlite"),
                 })),
             })
+            .prompt_config(prompt_config.clone())
             .with_child_configuration(Arc::new(super::settings::grants::Grants {
                 owner: record.owner.clone(),
                 storage: manager.configuration.clone(),
@@ -613,6 +632,7 @@ pub(super) async fn create_from(
     let main_client = routing.client(true);
     let naming_admission = super::naming::Admission::new(manager, main_client);
     let builder = Session::builder_arc(naming_admission.clone(), runtime)
+        .prompt_config(prompt_config)
         .turn_routing(route_admission)
         .auto_compaction(
             record
@@ -673,7 +693,8 @@ pub(super) async fn create_from(
         }?;
         // Install the requested initial permission mode before the first guest effect.
         // Restored policy remains the exact saved mode installed by Session::restore.
-        if let Some(mode) = record.mode.clone()
+        if select_initial_mode
+            && let Some(mode) = record.mode.clone()
             && let Err(error) = session.select_mode(mode).await
         {
             let _ = session.close().await;

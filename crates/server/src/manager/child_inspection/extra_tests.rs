@@ -224,10 +224,11 @@ async fn typed_delegate_binding_preserves_status_and_ledger_usage_without_receip
         child_executions("another-parent", &checkpoint, &checkpoint.state.executions).is_empty()
     );
     assert!(receipts(&checkpoint).is_empty());
+    let selected = checkpoint.clone();
     let parent_journal = journal(&directory, "parent", checkpoint).await;
     let before = files(&directory);
     let result = manager
-        .inspect_child("owner", detail("parent", &id))
+        .inspect_selected_child("owner", detail("parent", &id))
         .await
         .unwrap();
     assert_eq!(result["status"], "succeeded");
@@ -249,6 +250,22 @@ async fn typed_delegate_binding_preserves_status_and_ledger_usage_without_receip
             .await
             .is_err()
     );
+    let mut unselected = selected;
+    let ContentItem::Tool { content, .. } = unselected.context.items.last_mut().unwrap() else {
+        panic!("fixture ends with the selected delegate result");
+    };
+    *content = "unlinked legacy result".into();
+    parent_journal.commit(unselected).await.unwrap();
+    assert_eq!(
+        manager
+            .inspect_selected_child("owner", detail("parent", &id))
+            .await
+            .unwrap_err()
+            .code,
+        "permission_denied",
+        "retained execution rows cannot authorize an unselected child"
+    );
+    assert!(manager.registry.lock().unwrap().is_empty());
     parent_journal.close().await.unwrap();
     manager.close().await.unwrap();
 }

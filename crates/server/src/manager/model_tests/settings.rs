@@ -280,6 +280,75 @@ async fn create_mode(manager: &Arc<Manager>) -> Arc<Managed> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mode_restore_retains_selected_history_over_mutable_creator_settings() {
+    use microcrab_session::Journal;
+    let root = tempfile::tempdir().unwrap();
+    let a = provider(10).await;
+    let b = provider(10).await;
+    let original = mode_manager(root.path(), &a, &b, None).await;
+    let managed = create_mode(&original).await;
+    let id = managed.record.lock().await.id.clone();
+    let selected = managed.session.checkpoint().await.unwrap();
+    assert_eq!(selected.state.selected_mode.as_deref(), Some("b"));
+    save(&original, &id, 0, json!({"mode":"a"})).await.unwrap();
+    assert_eq!(managed.session.state().selected_mode.as_deref(), Some("a"));
+    let config = original.config.clone();
+    let host = original.host.clone();
+    original.close().await.unwrap();
+    // Select an exact earlier history owner while retaining the later creator
+    // metadata, as history travel may legitimately do. Do not rewrite snapshots.
+    let (journal, _) = match config.storage {
+        crate::config::Storage::File => {
+            let directory = config.data_dir.join("sessions").join(&id);
+            microcrab_storage::CreatorJournal::open(
+                directory.to_str().unwrap(),
+                id.clone(),
+                true,
+                true,
+            )
+            .await
+            .unwrap()
+        }
+        crate::config::Storage::Sqlite => {
+            #[cfg(feature = "storage-sqlite")]
+            {
+                microcrab_storage::CreatorJournal::open_sqlite(
+                    config.data_dir.join("storage.sqlite"),
+                    id.clone(),
+                    true,
+                )
+                .await
+                .unwrap()
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            panic!("SQLite fixture requires the compiled backend")
+        }
+    };
+    journal.commit(selected.clone()).await.unwrap();
+    journal.close().await.unwrap();
+    let restored = Manager::with_host(config, host).await.unwrap();
+    let record = restored.record("owner", &id).await.unwrap();
+    assert_eq!(record.mode.as_deref(), Some("a"));
+    let managed = restored.active(record, true).await.unwrap();
+    assert_eq!(managed.session.state().selected_mode.as_deref(), Some("b"));
+    assert_eq!(
+        serde_json::to_value(managed.session.context_snapshot().unwrap()).unwrap(),
+        serde_json::to_value(selected.context).unwrap(),
+        "restoration must retain frozen model-facing history"
+    );
+    let observed = super::super::settings::command(
+        &restored,
+        "owner",
+        &command("session.settings.get", Some(&id), json!({})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(observed["effective"]["mode"], "b");
+    assert_eq!(observed["desired_effective"]["mode"], "a");
+    restored.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn settings_mode_reset_uses_fixed_agent_component_default_and_ancestor_precedence() {
     for default in [None, Some("b")] {
         let root = tempfile::tempdir().unwrap();

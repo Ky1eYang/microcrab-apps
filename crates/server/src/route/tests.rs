@@ -8,6 +8,7 @@ mod images;
 mod model_metadata;
 mod permission_ask;
 mod provenance;
+mod question_images;
 mod v018;
 mod validation;
 mod variables;

@@ -39,6 +39,7 @@ async fn parent(manager: &Manager, id: &str) -> PathBuf {
             mode: None,
             model_selection: None,
             auto_compaction: None,
+            prompt_config: None,
             permissions: vec![],
             initialization: microcrab_permission::Action::Ask,
             review: false,
@@ -69,6 +70,7 @@ fn recover(text: &str) -> Recover {
         continuation: None,
         workspace: None,
         cache_report: None,
+        prompt_config: None,
         agent: None,
     }
 }
@@ -159,6 +161,15 @@ async fn closed_and_active_writer_child_reads_preserve_history_and_parent_author
     assert_eq!(result["id"], id);
     assert_eq!(result["receipt"], Value::Null);
     assert_eq!(result["usage"], Value::Null);
+    assert_eq!(
+        manager
+            .inspect_selected_child("owner", detail("parent", &id))
+            .await
+            .unwrap_err()
+            .code,
+        "permission_denied",
+        "a directory from an unselected branch does not authorize resource reads"
+    );
     assert!(!result.to_string().contains("private-system-marker"));
     writer_remains_exclusive(&child).await;
     assert_eq!(files(&directory), before);
@@ -303,7 +314,7 @@ async fn completed_receipt_requires_canonical_delegate_tool_link_not_user_json()
     let parent_journal = journal(&directory, "parent", checkpoint).await;
     parent_journal.close().await.unwrap();
     let result = manager
-        .inspect_child("owner", detail("parent", &id))
+        .inspect_selected_child("owner", detail("parent", &id))
         .await
         .unwrap();
     assert_eq!(result["status"], "completed");

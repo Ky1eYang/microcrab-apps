@@ -46,6 +46,7 @@ async fn sqlite_detached_queries_archive_and_scoped_hard_delete_need_no_host() {
         mode: None,
         model_selection: None,
         auto_compaction: None,
+        prompt_config: None,
         permissions: vec![],
         initialization: microcrab_permission::Action::Ask,
         review: false,

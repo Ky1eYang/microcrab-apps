@@ -12,6 +12,7 @@ fn checkpoint(context: &Context) -> Recover {
         continuation: None,
         workspace: None,
         cache_report: None,
+        prompt_config: None,
         agent: None,
     }
 }

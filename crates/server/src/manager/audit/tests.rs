@@ -53,6 +53,7 @@ async fn closed_audit_is_owner_isolated_without_host_activation_or_metadata_migr
         mode: None,
         model_selection: None,
         auto_compaction: None,
+        prompt_config: None,
         permissions: vec![],
         initialization: microcrab_permission::Action::Ask,
         review: false,
@@ -160,6 +161,7 @@ async fn internal_helpers_follow_verified_intermediate_checkpoints_and_selected_
                 continuation: None,
                 workspace: None,
                 cache_report: None,
+                prompt_config: None,
                 agent: None,
             },
         }
@@ -207,6 +209,7 @@ async fn internal_helpers_follow_verified_intermediate_checkpoints_and_selected_
             mode: None,
             model_selection: None,
             auto_compaction: None,
+            prompt_config: None,
             permissions: vec![],
             initialization: microcrab_permission::Action::Ask,
             review: false,

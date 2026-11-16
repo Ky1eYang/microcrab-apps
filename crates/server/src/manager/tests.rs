@@ -17,6 +17,8 @@ mod inbox;
 mod inbox_mutations;
 mod live_attach;
 mod permission_review;
+mod prompt_templates;
+mod question_images;
 mod retry;
 mod retry_buffered;
 mod retry_lifecycle;

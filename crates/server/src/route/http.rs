@@ -50,6 +50,10 @@ pub(super) fn router() -> Router<Arc<Application>> {
             get(super::citations::read),
         )
         .route(
+            "/api/v1/sessions/{session_id}/questions/{invocation_id}/image",
+            get(super::question_images::read),
+        )
+        .route(
             "/api/v1/sessions/{session_id}/images/{message_id}/{part_index}",
             get(super::images::read),
         );

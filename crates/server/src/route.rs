@@ -10,6 +10,7 @@ mod http;
 mod images;
 pub(crate) mod project;
 mod provenance;
+mod question_images;
 pub(crate) mod session;
 mod settings;
 mod socket;

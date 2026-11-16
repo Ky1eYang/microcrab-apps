@@ -5,7 +5,7 @@ use pulldown_cmark::{Event, Options, Parser, Tag};
 pub(super) const MAX_MARKDOWN_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_HREF_BYTES: usize = 4096;
 
-pub(super) fn path(href: &str) -> Option<String> {
+pub(in crate::manager) fn path(href: &str) -> Option<String> {
     if href.is_empty() || href.len() > MAX_HREF_BYTES || href.starts_with('#') {
         return None;
     }
@@ -76,6 +76,14 @@ pub(super) fn path(href: &str) -> Option<String> {
 }
 
 pub(super) fn eligible(markdown: &str, href: &str) -> Option<String> {
+    eligible_destination(markdown, href, false)
+}
+
+pub(in crate::manager) fn eligible_image(markdown: &str, href: &str) -> Option<String> {
+    eligible_destination(markdown, href, true)
+}
+
+fn eligible_destination(markdown: &str, href: &str, image_only: bool) -> Option<String> {
     if markdown.len() > MAX_MARKDOWN_BYTES {
         return None;
     }
@@ -84,10 +92,12 @@ pub(super) fn eligible(markdown: &str, href: &str) -> Option<String> {
         markdown,
         Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
     )
-    .any(|event| {
-        matches!(event,
-            Event::Start(Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. })
-            if path(&dest_url).as_ref() == Some(&requested))
+    .any(|event| match event {
+        Event::Start(Tag::Image { dest_url, .. }) => path(&dest_url).as_ref() == Some(&requested),
+        Event::Start(Tag::Link { dest_url, .. }) if !image_only => {
+            path(&dest_url).as_ref() == Some(&requested)
+        }
+        _ => false,
     })
     .then_some(requested)
 }

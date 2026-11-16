@@ -37,6 +37,10 @@ pub(super) async fn read(
         .await;
     check_completion_auth(&state.auth, &principal, false)?;
     let content = result.map_err(|error| Error::from(error).into_response())?;
+    response(content)
+}
+
+pub(super) fn response(content: crate::manager::citations::Content) -> Result<Response, Response> {
     let filename: String =
         url::form_urlencoded::byte_serialize(content.filename.as_bytes()).collect();
     let disposition = format!(

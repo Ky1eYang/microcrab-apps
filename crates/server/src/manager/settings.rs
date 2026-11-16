@@ -91,6 +91,12 @@ impl Manager {
             "review_model",
             "auto_compaction",
             "auto_naming",
+            "system_template",
+            "compact_template",
+            "auto_compact_template",
+            "rename_template",
+            "action_review_template",
+            "client_prompt",
         ] {
             sources.insert(key.into(), "admin".into());
         }
@@ -133,12 +139,63 @@ impl Manager {
             }
             result.overlay(&value);
         }
+        if let Some(session) = session {
+            let record = session_record(self, owner, session).await?;
+            freeze_prompts(self, &mut result, &record).await?;
+            for key in PROMPT_KEYS {
+                sources.insert((*key).into(), "session".into());
+            }
+        }
         result
             .validate(&self.config.limit_ceilings)
             .map_err(invalid)?;
         Ok((result, sources))
     }
 }
+const PROMPT_KEYS: &[&str] = &[
+    "system_template",
+    "compact_template",
+    "auto_compact_template",
+    "rename_template",
+    "action_review_template",
+    "client_prompt",
+];
+
+async fn freeze_prompts(
+    manager: &Manager,
+    settings: &mut SettingsOverrides,
+    record: &microcrab_storage::SessionRecord,
+) -> Result<(), WireError> {
+    let _open = manager.journal_open_gate(&record.id).lock_owned().await;
+    let frozen = if let Some(managed) = active(manager, &record.id).await {
+        managed.session.prompt_config().clone()
+    } else {
+        let directory = manager.config.data_dir.join("sessions").join(&record.id);
+        let selected = manager.child_checkpoint(&directory, &record.id).await?;
+        super::prompt_defaults::retained(
+            record.prompt_config.clone().unwrap_or_default(),
+            selected.as_ref().map(|point| &point.checkpoint.recover),
+            None,
+        )
+    };
+    settings.system_template = Some(frozen.system_template);
+    settings.compact_template = Some(frozen.compact_template);
+    settings.auto_compact_template = Some(frozen.auto_compact_template);
+    settings.rename_template = Some(frozen.rename_template);
+    settings.action_review_template = Some(frozen.action_review_template);
+    settings.client_prompt = Some(frozen.client_prompt);
+    Ok(())
+}
+
+fn has_prompt_overrides(settings: &SettingsOverrides) -> bool {
+    settings.system_template.is_some()
+        || settings.compact_template.is_some()
+        || settings.auto_compact_template.is_some()
+        || settings.rename_template.is_some()
+        || settings.action_review_template.is_some()
+        || settings.client_prompt.is_some()
+}
+
 fn model_selection(
     manager: &Manager,
     settings: &SettingsOverrides,
@@ -160,6 +217,11 @@ fn resolve_mode(settings: &mut SettingsOverrides, managed: &Managed) -> Result<(
 fn values(manager: &Manager, settings: &SettingsOverrides) -> Result<Value, WireError> {
     let mut value =
         serde_json::to_value(settings).map_err(|_| invalid("Cannot encode settings"))?;
+    let prompts = serde_json::to_value(super::prompt_defaults::resolve(settings))
+        .map_err(|_| invalid("Cannot encode effective prompt settings"))?;
+    for key in PROMPT_KEYS {
+        value[*key] = prompts[*key].clone();
+    }
     value["agent"] = json!(settings.agent);
     value["mode"] = json!(settings.mode);
     value["review_model"] = json!(settings.review_model.clone().flatten());
@@ -393,7 +455,35 @@ pub(super) async fn command(
     }
     let mut application = "defaults_saved";
     let mut reason = None;
-    let stored = if let Some((expected, next)) = write {
+    let stored = if let Some((expected, mut next)) = write {
+        if is_session && has_prompt_overrides(&next) {
+            return Err(WireError::new(
+                "configuration_rebuild_required",
+                "Session prompt configuration is frozen; configure defaults and create a new Session to change it",
+            ));
+        }
+        if is_session {
+            let current = manager
+                .configuration
+                .get(owner, kind, target)
+                .await
+                .map_err(configuration_error)?;
+            if current.as_ref().map_or(0, |value| value.revision) != expected {
+                return Err(WireError::new(
+                    "revision_conflict",
+                    "configuration revision conflict; reload before saving",
+                ));
+            }
+            // Public Session edits cannot change these keys. Retain the original
+            // sparse creation overrides even though the rest of this save replaces them.
+            let previous = overrides(current.as_ref())?;
+            next.system_template = previous.system_template;
+            next.compact_template = previous.compact_template;
+            next.auto_compact_template = previous.auto_compact_template;
+            next.rename_template = previous.rename_template;
+            next.action_review_template = previous.action_review_template;
+            next.client_prompt = previous.client_prompt;
+        }
         next.validate(&manager.config.limit_ceilings)
             .map_err(invalid)?;
         let mut candidate = if is_project {
@@ -404,6 +494,12 @@ pub(super) async fn command(
             manager.config.session_defaults.clone()
         };
         candidate.overlay(&next);
+        if let Some(record) = record.as_ref() {
+            freeze_prompts(manager, &mut candidate, record).await?;
+        }
+        candidate
+            .validate(&manager.config.limit_ceilings)
+            .map_err(invalid)?;
         if let Some(selection) = &candidate.model_selection {
             super::providers::resolve(manager, owner, selection).await?;
         }
@@ -510,6 +606,13 @@ pub(super) async fn command(
         desired.clone()
     };
     if let Some(record) = record.as_ref() {
+        let mut frozen = SettingsOverrides::default();
+        freeze_prompts(manager, &mut frozen, record).await?;
+        let frozen = serde_json::to_value(&frozen)
+            .map_err(|_| invalid("Cannot encode frozen prompt settings"))?;
+        for key in PROMPT_KEYS {
+            actual[*key] = frozen[*key].clone();
+        }
         actual["agent"] = json!(record.agent);
         actual["mode"] = json!(record.mode);
         actual["permissions"] = json!(record.permissions);

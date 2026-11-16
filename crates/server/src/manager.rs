@@ -33,6 +33,8 @@ mod naming;
 mod observation;
 mod permission_ask;
 mod providers;
+mod prompt_defaults;
+pub(crate) mod question_images;
 mod round_limit;
 pub(crate) mod session_watch;
 pub(crate) mod settings;

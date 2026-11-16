@@ -273,6 +273,11 @@ fn child_usage(path: &Path) -> Result<Option<Value>, WireError> {
     Ok(Some(serde_json::to_value(total).map_err(|_| read_error())?))
 }
 
+enum ChildScope {
+    Directory,
+    SelectedHistory,
+}
+
 impl Manager {
     async fn parent_child_executions(
         &self,
@@ -475,6 +480,25 @@ impl Manager {
         owner: &str,
         request: DetailRequest,
     ) -> Result<Value, WireError> {
+        self.child_detail(owner, request, ChildScope::Directory)
+            .await
+    }
+    /// Resource eligibility requires a canonical child link in the selected parent
+    /// history; a child directory alone permits inspection, never Host reads.
+    pub(super) async fn inspect_selected_child(
+        &self,
+        owner: &str,
+        request: DetailRequest,
+    ) -> Result<Value, WireError> {
+        self.child_detail(owner, request, ChildScope::SelectedHistory)
+            .await
+    }
+    async fn child_detail(
+        &self,
+        owner: &str,
+        request: DetailRequest,
+        scope: ChildScope,
+    ) -> Result<Value, WireError> {
         let page_limit = limit(request.limit)?;
         if !valid_child(&request.child_id) {
             return Err(WireError::new(
@@ -493,11 +517,11 @@ impl Manager {
         })
         .await
         .map_err(|_| read_error())??;
-        let parent_point = self
-            .child_checkpoint(&parent, &record.id)
-            .await
-            .ok()
-            .flatten();
+        let parent_point = match self.child_checkpoint(&parent, &record.id).await {
+            Ok(point) => point,
+            Err(error) if matches!(scope, ChildScope::SelectedHistory) => return Err(error),
+            Err(_) => None,
+        };
         let mut receipt = parent_point
             .as_ref()
             .and_then(|point| receipts(&point.checkpoint.recover).remove(&request.child_id));
@@ -505,6 +529,12 @@ impl Manager {
             .parent_child_executions(&record.id, parent_point.as_ref())
             .await
             .remove(&request.child_id);
+        if matches!(scope, ChildScope::SelectedHistory) && receipt.is_none() && binding.is_none() {
+            return Err(WireError::new(
+                "permission_denied",
+                "Child is not linked from the selected parent history",
+            ));
+        }
         let point = self.child_checkpoint(&child, &request.child_id).await;
         let (availability, selected) = match point {
             Ok(Some(point)) => ("persisted", Some(point)),

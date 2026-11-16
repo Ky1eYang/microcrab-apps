@@ -1,6 +1,6 @@
 //! Citations grant eligibility, never filesystem authority. Each click reselects
 //! durable canonical assistant Markdown and resolves the exact existing Host pin.
-mod path;
+pub(super) mod path;
 #[cfg(test)]
 mod tests;
 use super::{Manager, now, safe, unavailable};
@@ -33,7 +33,7 @@ fn denied() -> WireError {
         "No eligible file reference in the selected assistant message",
     )
 }
-fn host_error(error: microcrab_host_api::ToolError) -> WireError {
+pub(super) fn host_error(error: microcrab_host_api::ToolError) -> WireError {
     use microcrab_host_api::{ErrorCategory, ToolError};
     if matches!(error, ToolError::FileLimit | ToolError::OutputLimit) {
         return WireError::new("request_too_large", "Cited file exceeds the 8 MiB limit");
@@ -66,7 +66,7 @@ fn select(messages: &[Value], id: &str, href: &str) -> Result<String, WireError>
         .ok_or_else(denied)?;
     path::eligible(message["text"].as_str().unwrap_or(""), href).ok_or_else(denied)
 }
-fn media_type(data: &[u8]) -> &'static str {
+pub(super) fn media_type(data: &[u8]) -> &'static str {
     // Byte signature plus canonical metadata admission, never file extension.
     for mime in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
         if let Ok(metadata) = microcrab_session::admission::image::validate_image(mime, data)
@@ -120,19 +120,14 @@ impl Manager {
         let message = message.to_owned();
         self.track(async move {
             let (_permit, _file_permit) = (permit, file_permit);
-            let timeout_cancel = cancel.clone();
-            let result = tokio::time::timeout(
+            let operation = cancel.child_token();
+            let _cancel = operation.clone().drop_guard();
+            tokio::time::timeout(
                 READ_TIMEOUT,
-                manager.citation_owned(&owner, &id, &message, &request, cancel),
+                manager.citation_owned(&owner, &id, &message, &request, operation),
             )
-            .await;
-            match result {
-                Ok(result) => result,
-                Err(_) => {
-                    timeout_cancel.cancel();
-                    Err(WireError::new("timed_out", "File read timed out"))
-                }
-            }
+            .await
+            .map_err(|_| WireError::new("timed_out", "File read timed out"))?
         })?
         .await
         .map_err(|_| WireError::new("operation_failed", "File reader failed"))?
@@ -152,7 +147,7 @@ impl Manager {
             let mut before = None;
             for _ in 0..64 {
                 let page = self
-                    .inspect_child(
+                    .inspect_selected_child(
                         owner,
                         super::child_inspection::DetailRequest {
                             session_id: id.into(),

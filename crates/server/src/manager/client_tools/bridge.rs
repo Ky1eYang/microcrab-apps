@@ -61,6 +61,7 @@ pub(crate) struct ClientTools {
     )]
     observer: Mutex<Option<Arc<dyn Fn(ClientToolEvent) + Send + Sync>>>,
     executor_changes: tokio::sync::watch::Sender<Option<(String, String)>>,
+    invocation_changes: tokio::sync::watch::Sender<Option<ClientToolEvent>>,
 }
 impl ClientTools {
     pub async fn open(data_dir: &Path, parent_session_id: &str) -> Result<Arc<Self>, Error> {
@@ -115,6 +116,7 @@ impl ClientTools {
             }),
             observer: Mutex::new(None),
             executor_changes: tokio::sync::watch::channel(None).0,
+            invocation_changes: tokio::sync::watch::channel(None).0,
         }))
     }
     /// The callback is synchronous and must not reenter ClientTools. Holding the
@@ -136,6 +138,36 @@ impl ClientTools {
     ) -> tokio::sync::watch::Receiver<Option<(String, String)>> {
         self.executor_changes.subscribe()
     }
+    pub(crate) fn invocation_changes(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<ClientToolEvent>> {
+        self.invocation_changes.subscribe()
+    }
+    /// Read authority is selected atomically with the executor lease. This never
+    /// prepares, resumes or replays a browser invocation.
+    pub(crate) async fn leased_pending_call(
+        &self,
+        invocation: &str,
+        lease_id: &str,
+    ) -> Option<CallRecord> {
+        let state = self.state.lock().await;
+        if state.lease.as_ref()?.id != lease_id {
+            return None;
+        }
+        let call = state
+            .durable
+            .calls
+            .iter()
+            .find(|call| call.invocation_id == invocation && call.status.unsettled())?;
+        if state
+            .contexts
+            .get(invocation)
+            .is_some_and(|context| context.cancellation.is_cancelled())
+        {
+            return None;
+        }
+        Some(call.clone())
+    }
     pub fn set_observer(&self, observer: Arc<dyn Fn(ClientToolEvent) + Send + Sync>) {
         *self
             .observer
@@ -143,6 +175,10 @@ impl ClientTools {
             .unwrap_or_else(|error| error.into_inner()) = Some(observer);
     }
     fn emit(&self, phase: ClientToolPhase, call: CallRecord) {
+        self.invocation_changes.send_replace(Some(ClientToolEvent {
+            phase,
+            call: call.clone(),
+        }));
         let observer = self
             .observer
             .lock()
@@ -904,12 +940,7 @@ impl ClientTools {
                         } else {
                             ToolFailureKind::Failed
                         },
-                        code: if call.status == CallStatus::Interrupted {
-                            "external_interrupted"
-                        } else {
-                            "external_failed"
-                        }
-                        .into(),
+                        code: "external_failed".into(),
                         message: call
                             .error
                             .clone()
@@ -1435,12 +1466,7 @@ impl ClientTools {
                         } else {
                             ToolFailureKind::Failed
                         },
-                        code: if settled.status == CallStatus::Interrupted {
-                            "external_interrupted"
-                        } else {
-                            "external_failed"
-                        }
-                        .into(),
+                        code: "external_failed".into(),
                         message: settled
                             .error
                             .unwrap_or_else(|| "Client tool invocation interrupted".into()),

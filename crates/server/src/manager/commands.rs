@@ -456,6 +456,18 @@ pub(crate) struct Create {
     pub(crate) model_selection: Option<ModelSelection>,
     #[serde(default)]
     pub(crate) client_tools: Vec<super::client_tools::ClientToolDefinition>,
+    #[serde(default)]
+    pub(crate) system_template: Option<String>,
+    #[serde(default)]
+    pub(crate) compact_template: Option<String>,
+    #[serde(default)]
+    pub(crate) auto_compact_template: Option<String>,
+    #[serde(default)]
+    pub(crate) rename_template: Option<String>,
+    #[serde(default)]
+    pub(crate) action_review_template: Option<String>,
+    #[serde(default)]
+    pub(crate) client_prompt: Option<String>,
     pub(crate) operation_id: String,
 }
 #[derive(Deserialize)]
@@ -1943,6 +1955,48 @@ pub(super) async fn create(
         .effective_settings(owner, params.project_id.as_deref(), None)
         .await?
         .0;
+    let prompt_overrides = crate::config::settings::SettingsOverrides {
+        system_template: params.system_template.clone(),
+        compact_template: params.compact_template.clone(),
+        auto_compact_template: params.auto_compact_template.clone(),
+        rename_template: params.rename_template.clone(),
+        action_review_template: params.action_review_template.clone(),
+        client_prompt: params.client_prompt.clone(),
+        ..Default::default()
+    };
+    let mut prompt_settings = defaults.clone();
+    prompt_settings.overlay(&prompt_overrides);
+    // Deterministic identity also locates an interrupted creation's frozen inputs.
+    let id = if let Some(id) = params.conversation_id.clone() {
+        id
+    } else {
+        microcrab_storage::history::content_hash(&json!([owner, params.operation_id]))
+            .map_err(safe)?[..32]
+            .to_owned()
+    };
+    let prior_record = manager.directory.get(owner, &id).await.map_err(safe)?;
+    let prompt_config = if let Some(record) = &prior_record {
+        record.prompt_config.clone().unwrap_or_default()
+    } else if let Some(snapshot) = manager
+        .configuration
+        .get(owner, "session_effective", &id)
+        .await
+        .map_err(safe)?
+        .and_then(|record| record.value)
+    {
+        let snapshot: crate::config::settings::SettingsOverrides = serde_json::from_value(snapshot)
+            .map_err(|error| {
+                WireError::new(
+                    "invalid_params",
+                    microcrab_protocol::diagnostic::json_reason(&error),
+                )
+            })?;
+        super::prompt_defaults::resolve(&snapshot)
+    } else {
+        super::prompt_defaults::resolve(&prompt_settings)
+    };
+    // Validate every slot before pins, settings snapshots, records, tools or receipts.
+    prompt_config.validate().map_err(safe)?;
     let model_selection = super::model::normalize(
         params
             .model_selection
@@ -2073,6 +2127,9 @@ pub(super) async fn create(
             "Selected main agent mode is unavailable",
         ));
     }
+    if prior_record.is_none() {
+        prompt_config.render_system(selected_agent).map_err(safe)?;
+    }
     let component_digest = selected.map(|component| component.digest.clone());
     let discovery_digest = microcrab_storage::history::content_hash(&catalog).map_err(safe)?;
     let title = params.title.unwrap_or_else(|| "New session".into());
@@ -2082,15 +2139,7 @@ pub(super) async fn create(
         "Session title exceeds 4096 bytes",
         4096,
     )?;
-    // Deterministic owner+operation identity prevents duplicate session allocation if
-    // the process dies between directory creation and receipt publication.
-    let id = if let Some(id) = params.conversation_id.clone() {
-        id
-    } else {
-        microcrab_storage::history::content_hash(&json!([owner, params.operation_id]))
-            .map_err(safe)?[..32]
-            .to_owned()
-    };
+    // Pins follow complete template validation and selected-Agent rendering.
     let project_root = if manager.embedded {
         manager
             .pins
@@ -2181,6 +2230,12 @@ pub(super) async fn create(
             .map_err(safe)?;
         if snapshot.is_none() {
             let mut frozen = defaults.clone();
+            frozen.system_template = Some(prompt_config.system_template.clone());
+            frozen.compact_template = Some(prompt_config.compact_template.clone());
+            frozen.auto_compact_template = Some(prompt_config.auto_compact_template.clone());
+            frozen.rename_template = Some(prompt_config.rename_template.clone());
+            frozen.action_review_template = Some(prompt_config.action_review_template.clone());
+            frozen.client_prompt = Some(prompt_config.client_prompt.clone());
             frozen.model_selection = Some(model_selection.clone());
             frozen.agent = agent.clone();
             frozen.mode = mode.clone();
@@ -2221,6 +2276,32 @@ pub(super) async fn create(
                 .await
                 .map_err(safe)?;
         }
+        let has_prompt_overrides = prompt_overrides.system_template.is_some()
+            || prompt_overrides.compact_template.is_some()
+            || prompt_overrides.auto_compact_template.is_some()
+            || prompt_overrides.rename_template.is_some()
+            || prompt_overrides.action_review_template.is_some()
+            || prompt_overrides.client_prompt.is_some();
+        if has_prompt_overrides
+            && manager
+                .configuration
+                .get(owner, "session_settings", &id)
+                .await
+                .map_err(safe)?
+                .is_none()
+        {
+            manager
+                .configuration
+                .compare_exchange(
+                    owner,
+                    "session_settings",
+                    &id,
+                    0,
+                    Some(json!(prompt_overrides)),
+                )
+                .await
+                .map_err(safe)?;
+        }
         manager
             .directory
             .create(SessionRecord {
@@ -2239,6 +2320,7 @@ pub(super) async fn create(
                         .clone()
                         .unwrap_or_else(|| manager.config.auto_compaction.clone()),
                 ),
+                prompt_config: Some(prompt_config.clone()),
                 permissions: defaults.permissions.clone().unwrap_or_default(),
                 initialization: defaults
                     .initialization
