@@ -1,10 +1,6 @@
 //! Settings inheritance must configure the next admitted provider route.
 use super::*;
-#[path = "../../../tests/support/host_shell_fixture.rs"]
-mod host_shell_fixture;
-#[allow(dead_code)]
-#[path = "../../../tests/support/typed_agent_fixture.rs"]
-mod typed_agent_fixture;
+use crate::manager::{host_shell_fixture, typed_agent_fixture};
 
 async fn save(
     manager: &Manager,

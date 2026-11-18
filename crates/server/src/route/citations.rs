@@ -40,6 +40,10 @@ pub(super) async fn read(
     response(content)
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Axum handlers propagate completed Response values directly without changing the response contract"
+)]
 pub(super) fn response(content: crate::manager::citations::Content) -> Result<Response, Response> {
     let filename: String =
         url::form_urlencoded::byte_serialize(content.filename.as_bytes()).collect();

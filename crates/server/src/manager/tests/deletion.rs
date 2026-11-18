@@ -972,6 +972,22 @@ async fn archive_and_delete_are_idempotent_and_owner_scoped() {
             .await
             .unwrap();
     assert_eq!(first, again);
+    assert!(
+        first["agent_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("agt_"))
+    );
+    assert_eq!(first["depth"], 0);
+    assert_eq!(first["interaction"], "persistent");
+    assert!(first["current_role"].is_null());
+    assert_eq!(first["accepts_user_input"], false);
+    assert!(!manager.registry.lock().unwrap().contains_key(&ids[0]));
+    assert!(
+        super::super::deletion::archive_session(&manager, "foreign", &ids[0], None)
+            .await
+            .is_err()
+    );
+    assert!(!manager.registry.lock().unwrap().contains_key(&ids[0]));
     assert_eq!(first["archived"], true);
     assert_eq!(
         manager

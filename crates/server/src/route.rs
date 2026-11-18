@@ -5,6 +5,8 @@ mod citations;
 mod children;
 mod endpoint;
 pub(crate) mod error;
+mod external_inbox;
+mod external_speakers;
 mod host;
 mod http;
 mod images;

@@ -206,6 +206,20 @@ async fn attach_relay_fixture(
         sender: reply.clone(),
     })));
     let task = tokio::spawn(async move {
+        let HostFrame::Inspect { request } = decode_frame(&frames.recv().await.unwrap()).unwrap()
+        else {
+            panic!("Inspect required")
+        };
+        reply
+            .send(
+                encode_frame(&HostFrame::Inspected {
+                    request_id: request.request_id,
+                    result: Ok(native_descriptor()),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
         let first = decode_frame(&frames.recv().await.unwrap()).unwrap();
         assert!(matches!(
             first,
@@ -375,9 +389,29 @@ async fn cancelled_relay_publication_keeps_exact_cleanup_witness() {
     })));
     let (reconciling, observed) = oneshot::channel();
     let bridge = tokio::spawn(async move {
-        let _handshake = frames.recv().await.unwrap();
+        let first = decode_frame(&frames.recv().await.unwrap()).unwrap();
+        let HostFrame::Inspect { request } = first else {
+            panic!("Inspect required before Pair");
+        };
+        assert!(!request.request_id.is_empty());
         let mut authenticated = native_descriptor();
         authenticated.bridge_instance_id = "private-instance-body".into();
+        reply
+            .send(
+                encode_frame(&HostFrame::Inspected {
+                    request_id: request.request_id,
+                    result: Ok(authenticated.clone()),
+                })
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let handshake = decode_frame(&frames.recv().await.unwrap()).unwrap();
+        assert!(matches!(
+            handshake,
+            HostFrame::Pair { expected_descriptor_digest: Some(ref digest), expected_workspace_root: Some(ref root), .. }
+                if digest == &authenticated.descriptor_digest && root == &authenticated.workspace_root
+        ));
         reply
             .send(
                 encode_frame(&HostFrame::Hello {
@@ -512,6 +546,34 @@ async fn direct_host_survives_ui_disconnect_transfers_and_resumes_after_restart(
     impl HostBridge for Mock {
         type ControlStream = ReceiverStream<Result<microcrab_host_protocol::pb::HostFrame, Status>>;
         type ExecuteStream = ReceiverStream<Result<microcrab_host_protocol::pb::HostFrame, Status>>;
+        async fn inspect(
+            &self,
+            request: Request<microcrab_host_protocol::pb::HostFrame>,
+        ) -> Result<Response<microcrab_host_protocol::pb::HostFrame>, Status> {
+            assert_eq!(
+                request
+                    .metadata()
+                    .get("origin")
+                    .and_then(|value| value.to_str().ok()),
+                Some("http://127.0.0.1:4096")
+            );
+            let HostFrame::Inspect { request } = frame_from_proto(request.into_inner()).unwrap()
+            else {
+                panic!("Inspect required")
+            };
+            assert!(matches!(
+                request.authentication,
+                microcrab_host_protocol::InspectAuthentication::Pair { .. }
+                    | microcrab_host_protocol::InspectAuthentication::Resume { .. }
+            ));
+            Ok(Response::new(
+                frame_to_proto(&HostFrame::Inspected {
+                    request_id: request.request_id,
+                    result: Ok(native_descriptor()),
+                })
+                .unwrap(),
+            ))
+        }
         async fn control(
             &self,
             request: Request<tonic::Streaming<microcrab_host_protocol::pb::HostFrame>>,

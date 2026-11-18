@@ -240,6 +240,7 @@ async fn default_override_selection_helpers_and_restart_use_effective_model_rout
         subagent: Some("child".into()),
         system: "Synthetic helper".into(),
         items: vec![microcrab_transport::ContentItem::User {
+            envelope: None,
             source: None,
             parts: vec![microcrab_protocol::InputPart::Text {
                 text: "begin".into(),

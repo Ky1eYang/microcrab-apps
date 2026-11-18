@@ -75,6 +75,29 @@ async fn socket(
     let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
     (socket, server)
 }
+async fn inspect_before_pair(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) {
+    let Message::Binary(bytes) = socket.next().await.unwrap().unwrap() else {
+        panic!("Inspect required")
+    };
+    let HostFrame::Inspect { request } = decode_frame(&bytes).unwrap() else {
+        panic!("Inspect required")
+    };
+    socket
+        .send(Message::Binary(
+            encode_frame(&HostFrame::Inspected {
+                request_id: request.request_id,
+                result: Ok(descriptor("native-host")),
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+}
 #[tokio::test]
 async fn attempts_are_owner_project_scoped_single_use_and_cancelled_before_pair() {
     let root = tempfile::tempdir().unwrap();
@@ -158,6 +181,7 @@ async fn cancellation_after_pair_does_not_wait_for_the_project_authentication_ga
         .await
         .unwrap();
     let (mut socket, server) = socket(manager.clone(), &start).await;
+    inspect_before_pair(&mut socket).await;
     let Message::Binary(bytes) = socket.next().await.unwrap().unwrap() else {
         panic!("Pair required")
     };
@@ -214,6 +238,7 @@ async fn lost_hello_requires_fresh_pairing_and_never_publishes_a_route() {
         .await
         .unwrap();
     let (mut socket, server) = socket(manager.clone(), &start).await;
+    inspect_before_pair(&mut socket).await;
     let Message::Binary(bytes) = socket.next().await.unwrap().unwrap() else {
         panic!("Pair required")
     };
@@ -245,6 +270,7 @@ async fn authenticated_native_route_survives_observation_and_stale_attempt_cance
         .await
         .unwrap();
     let (mut socket, server) = socket(manager.clone(), &start).await;
+    inspect_before_pair(&mut socket).await;
     let Message::Binary(first) = socket.next().await.unwrap().unwrap() else {
         panic!("handshake required")
     };
@@ -349,4 +375,39 @@ async fn authenticated_native_route_survives_observation_and_stale_attempt_cance
     manager.close().await.unwrap();
     native.abort();
     server.abort();
+}
+
+#[tokio::test]
+async fn legacy_outbound_peer_closing_unknown_inspect_never_receives_pair() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = Manager::new(config(root.path())).await.unwrap();
+    let owner = Principal::for_test("owner");
+    let start = manager
+        .start_outbound_host(&owner, connect())
+        .await
+        .unwrap();
+    let (mut socket, server) = socket(manager.clone(), &start).await;
+    let Message::Binary(bytes) = socket.next().await.unwrap().unwrap() else {
+        panic!("Inspect required")
+    };
+    assert!(matches!(
+        decode_frame(&bytes).unwrap(),
+        HostFrame::Inspect { .. }
+    ));
+    // Historical Bridges reject the unknown frame before any Pair/Resume.
+    socket.close(None).await.unwrap();
+    let error = manager
+        .finish_outbound_host(&owner, params(&start))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "host_outbound_unavailable");
+    assert_eq!(
+        error.details.as_ref().unwrap()["pairing_token_consumed"],
+        false
+    );
+    assert!(manager.routes.lock().await.get("a").is_none());
+    assert!(manager.pins.project("a").await.unwrap().is_none());
+    manager.close().await.unwrap();
+    server.abort();
+    let _ = server.await;
 }

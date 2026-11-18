@@ -91,6 +91,31 @@ impl BridgeService {
         &self,
         frame: WireFrame,
     ) -> Result<(Arc<Bridge>, WireFrame), WireError> {
+        self.authenticate_mode(frame, None).await
+    }
+    /// May initialize identity/receipt bookkeeping for an authorized new workspace;
+    /// never consumes pairing authority or creates a controller/lease.
+    pub(crate) async fn inspect(&self, request: InspectRequest) -> WireFrame {
+        let request_id = request.request_id.clone();
+        let result = async {
+            request.validate()?;
+            self.authenticate_mode(request.handshake(), Some(request_id.clone()))
+                .await
+        }
+        .await;
+        match result {
+            Ok((_, inspected)) => inspected,
+            Err(error) => WireFrame::Inspected {
+                request_id,
+                result: Err(error),
+            },
+        }
+    }
+    async fn authenticate_mode(
+        &self,
+        frame: WireFrame,
+        inspection: Option<String>,
+    ) -> Result<(Arc<Bridge>, WireFrame), WireError> {
         let (directory, expected_workspace, expected_host) = match &frame {
             WireFrame::Pair {
                 directory,
@@ -134,6 +159,12 @@ impl BridgeService {
                 return Err(WireError::new(ErrorCode::Timeout, "pairing expired"));
             }
         }
+        if inspection.is_some()
+            && self.pairing.is_none()
+            && matches!(&frame, WireFrame::Pair { .. })
+        {
+            self.default.check_authorization(&frame).await?;
+        }
         let root = match directory {
             None => PathBuf::from(&self.default.descriptor.workspace_root),
             Some(value) if value.is_empty() || value.len() > 32768 => {
@@ -151,6 +182,9 @@ impl BridgeService {
                     PathBuf::from(&self.default.descriptor.workspace_root).join(path)
                 };
                 std::fs::canonicalize(path).map_err(|error| {
+                    if inspection.is_some() && matches!(&frame, WireFrame::Resume { .. }) {
+                        return WireError::new(ErrorCode::PairingDenied, "resume rejected");
+                    }
                     WireError::new(
                         ErrorCode::WorkspaceDenied,
                         format!(
@@ -174,6 +208,18 @@ impl BridgeService {
                 ErrorCode::WorkspaceDenied,
                 "workspace denied",
             ));
+        }
+        // Resume may inspect only an already-open workspace and must prove its
+        // exact credential/scope before identity mismatch can disclose metadata.
+        if matches!(&frame, WireFrame::Resume { .. }) {
+            let workspace = self
+                .workspaces
+                .lock()
+                .await
+                .get(&root)
+                .cloned()
+                .ok_or_else(|| WireError::new(ErrorCode::PairingDenied, "resume rejected"))?;
+            workspace.check_authorization(&frame).await?;
         }
         if let Some(expected) = expected_host {
             let device = device_id().map_err(|error| {
@@ -271,7 +317,7 @@ impl BridgeService {
         };
         drop(workspaces);
         let pairing_request = matches!(&frame, WireFrame::Pair { .. });
-        let hello = workspace.authenticate(frame).await?;
+        let hello = workspace.authenticate_mode(frame, inspection).await?;
         if pairing_request
             && matches!(&hello, WireFrame::Hello { .. })
             && let Some(capability) = capability.as_mut()
@@ -363,6 +409,10 @@ pub(crate) fn device_id() -> Result<String, Box<dyn std::error::Error + Send + S
 }
 
 #[cfg(test)]
+#[path = "service/inspection_tests.rs"]
+mod inspection_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn pair(token: &str, directory: Option<String>) -> WireFrame {
@@ -372,6 +422,8 @@ mod tests {
             directory,
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
         }
     }
     #[tokio::test]

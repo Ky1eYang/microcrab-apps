@@ -17,6 +17,27 @@ pub(super) fn retained(
         .resolved()
 }
 
+pub(super) fn resolve(settings: &SettingsOverrides) -> PromptConfig {
+    let mut config = PromptConfig {
+        client_prompt: DEFAULT_CLIENT_PROMPT.into(),
+        ..Default::default()
+    };
+    macro_rules! apply {
+        ($($field:ident),*) => {$(if let Some(value) = &settings.$field {
+            config.$field = value.clone();
+        })*};
+    }
+    apply!(
+        system_template,
+        compact_template,
+        auto_compact_template,
+        rename_template,
+        action_review_template,
+        client_prompt
+    );
+    config.resolved()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,25 +131,4 @@ mod tests {
         assert_eq!(retained(record.clone(), Some(&legacy), Some(&fork)), fork);
         assert_eq!(retained(record, None, Some(&fork)), fork);
     }
-}
-
-pub(super) fn resolve(settings: &SettingsOverrides) -> PromptConfig {
-    let mut config = PromptConfig {
-        client_prompt: DEFAULT_CLIENT_PROMPT.into(),
-        ..Default::default()
-    };
-    macro_rules! apply {
-        ($($field:ident),*) => {$(if let Some(value) = &settings.$field {
-            config.$field = value.clone();
-        })*};
-    }
-    apply!(
-        system_template,
-        compact_template,
-        auto_compact_template,
-        rename_template,
-        action_review_template,
-        client_prompt
-    );
-    config.resolved()
 }

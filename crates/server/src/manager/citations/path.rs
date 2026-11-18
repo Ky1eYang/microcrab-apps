@@ -31,12 +31,11 @@ pub(in crate::manager) fn path(href: &str) -> Option<String> {
     }
     let mut value = decoded.replace('\\', "/");
     // A trailing :123 is a line locator, never an alternate stream.
-    if let Some((base, line)) = value.rsplit_once(':') {
-        if line.starts_with(|c: char| ('1'..='9').contains(&c))
-            && line.bytes().all(|c| c.is_ascii_digit())
-        {
-            value = base.to_owned();
-        }
+    if let Some((base, line)) = value.rsplit_once(':')
+        && line.starts_with(|c: char| ('1'..='9').contains(&c))
+        && line.bytes().all(|c| c.is_ascii_digit())
+    {
+        value = base.to_owned();
     }
     let drive = value.as_bytes().get(1) == Some(&b':')
         && value

@@ -32,6 +32,7 @@ async fn open_recorder(source: DisplaySource) -> Arc<DisplayRecorder> {
 }
 fn user() -> ContentItem {
     ContentItem::User {
+        envelope: None,
         parts: vec![InputPart::Text {
             text: "user".into(),
         }],
@@ -56,12 +57,14 @@ async fn input_certificates_bind_exact_occurrences_and_survive_archive_reopen_wi
         user(),
         user(),
         ContentItem::User {
+            envelope: None,
             parts: vec![InputPart::Text {
                 text: "plugin transformed".into(),
             }],
             source: None,
         },
         ContentItem::User {
+            envelope: None,
             parts: vec![InputPart::Image {
                 source: microcrab_protocol::ImageSource::Url {
                     url: "https://example.test/image.png".into(),
@@ -199,6 +202,7 @@ async fn tool_only_admission_binds_exact_producer_and_result_gets_its_own_row() 
         .await
         .unwrap();
     items.push(ContentItem::Tool {
+        parts: vec![],
         call_id: "tool-exact".into(),
         content: "result".into(),
     });

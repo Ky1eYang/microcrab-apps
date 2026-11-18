@@ -14,6 +14,8 @@ async fn pair(bridge: &Bridge, token: String) -> (String, String) {
             directory: None,
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
             token,
             scope: scope(),
         })
@@ -57,6 +59,8 @@ async fn one_controller_and_project_scope_are_fenced() {
                 directory: None,
                 expected_host_id: None,
                 expected_workspace_id: None,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
                 token,
                 scope: scope()
             })
@@ -68,6 +72,8 @@ async fn one_controller_and_project_scope_are_fenced() {
             directory: None,
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
             credential: credential.clone(),
             scope: scope(),
         })
@@ -82,6 +88,8 @@ async fn one_controller_and_project_scope_are_fenced() {
                 directory: None,
                 expected_host_id: None,
                 expected_workspace_id: None,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
                 credential,
                 scope: other
             })
@@ -156,6 +164,8 @@ async fn expired_capabilities_and_restarted_binding_remain_scoped() {
                 directory: None,
                 expected_host_id: None,
                 expected_workspace_id: None,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
                 credential,
                 scope: scope()
             })
@@ -180,6 +190,8 @@ async fn expired_capabilities_and_restarted_binding_remain_scoped() {
             directory: None,
             expected_host_id: Some(identity.host_id),
             expected_workspace_id: Some(identity.workspace_id),
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
             token,
             scope: other.clone(),
         })
@@ -208,6 +220,8 @@ async fn expired_pairing_has_explicit_timeout_without_accepting_wrong_tokens() {
             directory: None,
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
             token,
             scope: scope(),
         })
@@ -219,6 +233,8 @@ async fn expired_pairing_has_explicit_timeout_without_accepting_wrong_tokens() {
             directory: None,
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
             token: "incorrect".into(),
             scope: scope(),
         })
@@ -420,6 +436,8 @@ fn selected_pair(directory: Option<String>, project: &str) -> WireFrame {
         directory,
         expected_host_id: None,
         expected_workspace_id: None,
+        expected_descriptor_digest: None,
+        expected_workspace_root: None,
     }
 }
 
@@ -545,6 +563,8 @@ async fn directory_escape_and_wrong_workspace_pin_create_no_private_state() {
             directory,
             expected_host_id: None,
             expected_workspace_id: Some("foreign".into()),
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
         })
         .await;
     assert!(matches!(
@@ -598,6 +618,8 @@ async fn legacy_uuid_pin_is_readable_without_rewriting_identity() {
             directory: None,
             expected_host_id: Some(old.host_id.clone()),
             expected_workspace_id: Some(old.workspace_id.clone()),
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
         })
         .await
         .unwrap();
@@ -626,6 +648,8 @@ async fn authorized_new_project_pair_replaces_lease_but_never_transfers_old_cred
             directory: None,
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
         })
         .await
         .unwrap_err();
@@ -642,6 +666,8 @@ async fn authorized_new_project_pair_replaces_lease_but_never_transfers_old_cred
                 directory: None,
                 expected_host_id: host,
                 expected_workspace_id: workspace,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
             })
             .await
             .unwrap_err();
@@ -656,6 +682,8 @@ async fn authorized_new_project_pair_replaces_lease_but_never_transfers_old_cred
                 directory: None,
                 expected_host_id: None,
                 expected_workspace_id: None,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
             })
             .await
             .is_err()
@@ -667,6 +695,8 @@ async fn authorized_new_project_pair_replaces_lease_but_never_transfers_old_cred
             directory: None,
             expected_host_id: Some(bridge.descriptor.host_id.clone()),
             expected_workspace_id: Some(bridge.descriptor.workspace_id.clone()),
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
         })
         .await
         .unwrap();
@@ -689,6 +719,8 @@ async fn authorized_new_project_pair_replaces_lease_but_never_transfers_old_cred
                 directory: None,
                 expected_host_id: None,
                 expected_workspace_id: None,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
             })
             .await
             .is_err()
@@ -1041,6 +1073,8 @@ async fn legacy_project_binding_is_ignored_and_explicit_identity_pins_survive() 
                 directory: None,
                 expected_host_id: None,
                 expected_workspace_id: None,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
             })
             .await
             .is_err()
@@ -1054,6 +1088,8 @@ async fn legacy_project_binding_is_ignored_and_explicit_identity_pins_survive() 
             directory: None,
             expected_host_id: Some(old.host_id.clone()),
             expected_workspace_id: Some(old.workspace_id.clone()),
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
         })
         .await
         .unwrap();
@@ -1073,6 +1109,8 @@ async fn legacy_project_binding_is_ignored_and_explicit_identity_pins_survive() 
             directory: None,
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
         })
         .await
         .unwrap();
@@ -1104,6 +1142,8 @@ async fn initial_tokenless_resume_uses_only_in_memory_binding_scope() {
             directory: None,
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
         })
         .await
         .unwrap();

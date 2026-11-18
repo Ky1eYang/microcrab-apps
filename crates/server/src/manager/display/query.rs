@@ -619,13 +619,13 @@ pub(in crate::manager) async fn query_cached(
             ));
         }
     }
-    if let Some(selection) = &child_selection {
-        if !selection.current().await {
-            return Err(WireError::new(
-                "stale_lineage",
-                "Child display selection changed while resolving source records",
-            ));
-        }
+    if let Some(selection) = &child_selection
+        && !selection.current().await
+    {
+        return Err(WireError::new(
+            "stale_lineage",
+            "Child display selection changed while resolving source records",
+        ));
     }
     let result = if let Some((records, high, next, complete)) = result {
         let mut resolved = Vec::with_capacity(records.len());
@@ -664,13 +664,13 @@ pub(in crate::manager) async fn query_cached(
             ));
         }
     }
-    if let Some(selection) = &child_selection {
-        if !selection.current().await {
-            return Err(WireError::new(
-                "stale_lineage",
-                "Child display selection changed while resolving source records",
-            ));
-        }
+    if let Some(selection) = &child_selection
+        && !selection.current().await
+    {
+        return Err(WireError::new(
+            "stale_lineage",
+            "Child display selection changed while resolving source records",
+        ));
     }
     let mut response = match result {
         Some((records, high, next, complete)) => {

@@ -36,6 +36,61 @@ impl ChildSelection {
 }
 
 impl Manager {
+    pub(super) async fn verified_child_path(
+        &self,
+        owner: &str,
+        parent: &str,
+        child: &str,
+    ) -> Result<PathBuf, WireError> {
+        if !valid_child(child) {
+            return Err(WireError::new(
+                "invalid_params",
+                "Invalid child Session identity",
+            ));
+        }
+        self.child_parent(owner, parent).await?;
+        let sessions = self.config.data_dir.join("sessions");
+        let parent = parent.to_owned();
+        let child = child.to_owned();
+        tokio::task::spawn_blocking(move || child_path(&parent_path(&sessions, &parent)?, &child))
+            .await
+            .map_err(|_| read_error())?
+    }
+    async fn child_communication_metadata(
+        &self,
+        value: &mut Value,
+        parent: &str,
+        child: &str,
+        target: &str,
+        point: Option<&RestorePoint>,
+    ) -> Result<(), WireError> {
+        view::communication_identity(
+            value,
+            point
+                .and_then(|point| point.checkpoint.recover.state.communication.as_ref())
+                .map(|communication| &communication.identity),
+        );
+        value["parent_session_id"] = json!(parent);
+        let slot = self
+            .registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(parent)
+            .cloned();
+        if let Some(slot) = slot {
+            let active = slot.active.lock().await.clone();
+            if let Some(parent) = active
+                && let Ok(child_session) = parent.session.inspect_child(child, target)
+            {
+                let accepts = parent
+                    .session
+                    .child_accepts_user_input(child)
+                    .map_err(safe)?;
+                view::communication_session(value, &child_session, Some(accepts)).map_err(safe)?;
+            }
+        }
+        Ok(())
+    }
     pub(super) async fn child_selection(
         &self,
         owner: &str,
@@ -223,7 +278,10 @@ fn child_executions(
         .items
         .iter()
         .filter_map(|item| {
-            let ContentItem::Tool { call_id, content } = item else {
+            let ContentItem::Tool {
+                call_id, content, ..
+            } = item
+            else {
                 return None;
             };
             if !calls.contains(call_id.as_str()) || content.len() > 65536 {
@@ -452,7 +510,9 @@ impl Manager {
                 .or_else(|| binding.map(|binding| binding.target.as_str()))
                 .or_else(|| receipt.and_then(|r| r["subagent"].as_str()))
                 .unwrap_or(&id);
-            let summary = json!({"id":id,"name":short_name(name),"status":binding.map(|binding| binding.status.as_str()).unwrap_or(if receipt.is_some(){"completed"}else{"unknown"}),"availability":availability});
+            let mut summary = json!({"id":id,"name":short_name(name),"status":binding.map(|binding| binding.status.as_str()).unwrap_or(if receipt.is_some(){"completed"}else{"unknown"}),"availability":availability});
+            self.child_communication_metadata(&mut summary, &record.id, &id, name, point.as_ref())
+                .await?;
             let bytes = serde_json::to_vec(&summary)
                 .map_err(|_| read_error())?
                 .len();
@@ -625,12 +685,11 @@ impl Manager {
                 )
             })
             .unwrap_or_default();
-        if !full_messages.is_empty() {
-            if let Err(cause) =
+        if !full_messages.is_empty()
+            && let Err(cause) =
                 super::display::anchors::annotate_messages(display_source, &mut full_messages).await
-            {
-                tracing::debug!(error = %cause, "child canonical display identity unavailable");
-            }
+        {
+            tracing::debug!(error = %cause, "child canonical display identity unavailable");
         }
         let (messages, next, truncated) = if selected.is_some() {
             message_page(full_messages.clone(), request.before_cursor, page_limit)?
@@ -660,17 +719,30 @@ impl Manager {
             .as_ref()
             .map_or(0, |point| point.checkpoint.recover.state.epoch_id);
         let history_view = view::history_view(&full_messages, &child_page, &lineage, epoch, None);
-        if let Some(selection) = &child_selection {
-            if !selection.current().await {
-                return Err(WireError::new(
-                    "stale_lineage",
-                    "Child selection changed while projecting history",
-                ));
-            }
+        if let Some(selection) = &child_selection
+            && !selection.current().await
+        {
+            return Err(WireError::new(
+                "stale_lineage",
+                "Child selection changed while projecting history",
+            ));
         }
-        Ok(
-            json!({"display":display,"history_view":history_view,"parent_session_id":record.id,"id":request.child_id,"name":short_name(&name),"status":binding.as_ref().map(|binding| binding.status.as_str()).unwrap_or(if receipt.is_some(){"completed"}else{"unknown"}),"availability":availability,"messages":messages,"next_cursor":next,"messages_truncated":truncated,"receipt":receipt,"usage":usage,"executions":tasks,"executions_truncated":tasks_truncated,"history":selected.map(|point|point.cursor)}),
+        let mut communication = json!({});
+        self.child_communication_metadata(
+            &mut communication,
+            &record.id,
+            &request.child_id,
+            &name,
+            selected.as_ref(),
         )
+        .await?;
+        let mut result = json!({"display":display,"history_view":history_view,"parent_session_id":record.id,"id":request.child_id,"name":short_name(&name),"status":binding.as_ref().map(|binding| binding.status.as_str()).unwrap_or(if receipt.is_some(){"completed"}else{"unknown"}),"availability":availability,"messages":messages,"next_cursor":next,"messages_truncated":truncated,"receipt":receipt,"usage":usage,"executions":tasks,"executions_truncated":tasks_truncated,"history":selected.map(|point|point.cursor)});
+        if let (Some(result), Some(communication)) =
+            (result.as_object_mut(), communication.as_object())
+        {
+            result.extend(communication.clone());
+        }
+        Ok(result)
     }
 }
 
@@ -707,7 +779,9 @@ fn receipts(recover: &Recover) -> BTreeMap<String, Value> {
                     }
                 }
             }
-            ContentItem::Tool { call_id, content } if calls.contains(call_id) => {
+            ContentItem::Tool {
+                call_id, content, ..
+            } if calls.contains(call_id) => {
                 accept(content);
                 if content.len() <= 65536
                     && let Ok(value) = serde_json::from_str::<Value>(content)

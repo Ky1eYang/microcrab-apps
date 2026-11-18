@@ -85,28 +85,28 @@ impl FutureGrantPersistence for Grants {
                 .replace(&self.owner, revision, record)
                 .await
                 .map_err(write_failure)?;
-            if let Some(manager) = self.manager.upgrade() {
-                if let Some(managed) = super::active(&manager, owning_session_id).await {
-                    let mut cached = managed.record.lock().await;
-                    if cached.owner != self.owner || cached.id != owning_session_id {
-                        return Err(PermissionError::PersistenceUncertain("Grant directory publication committed, but the active cache owner or Session witness differs; reconcile the owning Session without updating that cache".into()));
-                    }
-                    if cached.revision <= record.revision {
-                        *cached = record.clone();
-                    }
-                    let mut session = super::super::view::session(
-                        &manager,
-                        &cached,
-                        &manager.config.provider.model,
-                        if managed.session.inbox_snapshot().active {
-                            "running"
-                        } else {
-                            "idle"
-                        },
-                    );
-                    super::super::model::project_route(&managed, &cached, &mut session);
-                    managed.hub.session(session);
+            if let Some(manager) = self.manager.upgrade()
+                && let Some(managed) = super::active(&manager, owning_session_id).await
+            {
+                let mut cached = managed.record.lock().await;
+                if cached.owner != self.owner || cached.id != owning_session_id {
+                    return Err(PermissionError::PersistenceUncertain("Grant directory publication committed, but the active cache owner or Session witness differs; reconcile the owning Session without updating that cache".into()));
                 }
+                if cached.revision <= record.revision {
+                    *cached = record.clone();
+                }
+                let mut session = super::super::view::session(
+                    &manager,
+                    &cached,
+                    &manager.config.provider.model,
+                    if managed.session.inbox_snapshot().active {
+                        "running"
+                    } else {
+                        "idle"
+                    },
+                );
+                super::super::model::project_route(&managed, &cached, &mut session);
+                managed.hub.session(session);
             }
             return Ok(());
         }

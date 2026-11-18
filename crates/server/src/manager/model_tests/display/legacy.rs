@@ -28,8 +28,8 @@ async fn mixed_legacy(storage: Storage) {
     drop(manager);
     // These are append-only historical-format fixtures, never rewritten current bytes.
     let mut writer = source.open().unwrap();
-    let mut sequence = writer.revision().unwrap();
-    for (attempt, event) in [
+    let start = writer.revision().unwrap();
+    for (sequence, (attempt, event)) in (start..).zip([
         (
             "legacy-selected",
             json!({"phase":"started","request_identity":"legacy-request"}),
@@ -58,14 +58,13 @@ async fn mixed_legacy(storage: Storage) {
             "legacy-abandoned",
             json!({"phase":"invalidated","reason":"cancelled","reasoning_bytes":"excluded historical sibling".len(),"text_bytes":0,"archive_complete":true}),
         ),
-    ] {
+    ]) {
         let record = ArchiveRecord {
             sequence: sequence + 1,
             attempt_id: attempt.into(),
             event,
         };
         writer.append(sequence, &record).unwrap();
-        sequence += 1;
     }
     writer.flush().unwrap();
     drop(writer);

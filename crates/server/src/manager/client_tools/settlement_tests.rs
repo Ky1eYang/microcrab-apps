@@ -81,6 +81,7 @@ impl Fixture {
                     interaction: Some(ClientInteraction {
                         mode_pointer: "/mode".into(),
                         wait_timeout_ms: 300_000,
+                        secret_writes: None,
                     }),
                 }],
                 0,

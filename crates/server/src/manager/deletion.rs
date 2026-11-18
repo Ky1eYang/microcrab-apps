@@ -5,6 +5,23 @@ use super::{Manager, commands, now, safe, unavailable, view};
 use microcrab_protocol::application::WireError;
 use serde_json::{Value, json};
 
+pub(super) async fn archived_view(
+    manager: &Manager,
+    record: &microcrab_storage::SessionRecord,
+) -> Result<Value, WireError> {
+    let mut value = view::session(manager, record, &manager.config.provider.model, "closed");
+    let path = manager.config.data_dir.join("sessions").join(&record.id);
+    let point = manager.child_checkpoint(&path, &record.id).await?;
+    view::communication_identity(
+        &mut value,
+        point
+            .as_ref()
+            .and_then(|point| point.checkpoint.recover.state.communication.as_ref())
+            .map(|communication| &communication.identity),
+    );
+    Ok(value)
+}
+
 pub(super) async fn archive_session(
     manager: &Manager,
     owner: &str,
@@ -23,12 +40,7 @@ pub(super) async fn archive_session(
     // Archive is idempotent on its target state: a retried or duplicated request
     // returns the settled view, never an error and never another revision.
     if record.archived {
-        return Ok(view::session(
-            manager,
-            &record,
-            &manager.config.provider.model,
-            "closed",
-        ));
+        return archived_view(manager, &record).await;
     }
     if expected_revision.is_some_and(|expected| record.revision != expected) {
         return Err(WireError::new(
@@ -61,12 +73,7 @@ pub(super) async fn archive_session(
         .replace(owner, revision, next)
         .await
         .map_err(safe)?;
-    Ok(view::session(
-        manager,
-        &saved,
-        &manager.config.provider.model,
-        "closed",
-    ))
+    archived_view(manager, &saved).await
 }
 
 /// Irreversible removal with an idempotent, fast acknowledgement.

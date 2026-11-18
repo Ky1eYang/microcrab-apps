@@ -86,6 +86,16 @@ pub(crate) enum SessionMethod {
     ClientToolsPrepare,
     #[serde(rename = "client_tools.output")]
     ClientToolsOutput,
+    #[serde(rename = "client_tools.takeover")]
+    ClientToolsTakeover,
+    #[serde(rename = "client_tools.arguments")]
+    ClientToolsArguments,
+    #[serde(rename = "client_tools.secret")]
+    ClientToolsSecret,
+    #[serde(rename = "client_tools.secret_operation")]
+    ClientToolsSecretOperation,
+    #[serde(rename = "client_tools.decision")]
+    ClientToolsDecision,
     #[serde(rename = "executions.read")]
     ExecutionsRead,
     #[serde(rename = "executions.cancel")]

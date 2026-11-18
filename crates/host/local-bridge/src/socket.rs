@@ -182,10 +182,24 @@ async fn connection(bridge: Arc<BridgeService>, mut socket: WebSocket) {
         }
         _ => None,
     };
-    let Some(frame) = frame else {
+    let Some(mut frame) = frame else {
         close_handshake(&mut socket, 4400, "invalid_handshake").await;
         return;
     };
+    if let WireFrame::Inspect { request } = frame {
+        let reply = bridge.inspect(request).await;
+        let accepted = matches!(&reply, WireFrame::Inspected { result: Ok(_), .. });
+        if send(&mut socket, reply).await.is_err() || !accepted {
+            return;
+        }
+        frame = match tokio::time::timeout(Duration::from_secs(10), socket.recv()).await {
+            Ok(Some(Ok(Message::Binary(bytes)))) => match decode_frame(&bytes) {
+                Ok(frame) => frame,
+                Err(_) => return,
+            },
+            _ => return,
+        };
+    }
     let handshake = match &frame {
         WireFrame::Pair { .. } => "pair",
         WireFrame::Resume { .. } => "resume",
@@ -194,6 +208,13 @@ async fn connection(bridge: Arc<BridgeService>, mut socket: WebSocket) {
     let (bridge, hello) = match bridge.authenticate(frame).await {
         Ok(authenticated) => authenticated,
         Err(error) => {
+            let _ = send(
+                &mut socket,
+                WireFrame::HandshakeRejected {
+                    error: error.clone(),
+                },
+            )
+            .await;
             let (code, reason) = if error.code == ErrorCode::Timeout {
                 (4408, "pairing_expired")
             } else if error.code == ErrorCode::WorkspaceDenied {

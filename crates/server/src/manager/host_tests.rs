@@ -6,10 +6,10 @@ mod connection;
 mod conversations;
 mod direct;
 mod init_retry;
+mod native_isolation;
 mod outbound;
 use microcrab_agent_types::{AgentInfo, AgentMode, AgentRole, Variable};
-use microcrab_creator::delegate::{ChildFactory, NativeChildFactory, NativeDelegateConfig};
-use microcrab_creator::{DeclarativePermission, RetryPolicy, RetryingClient};
+use microcrab_creator::delegate::{NativeChildFactory, NativeDelegateConfig};
 use microcrab_host_api::{FsApi, HostAPI, NetApi, ProcessApi, ShellApi, ShellRequest, ToolError};
 use microcrab_session::runtime::Runtime;
 use tokio_util::sync::CancellationToken;
@@ -251,36 +251,64 @@ async fn injected_backend_is_shared_across_projects_children_and_restoration() {
     first.session.checkpoint().await.unwrap();
     second.session.checkpoint().await.unwrap();
 
-    let parent_runtime = Runtime::new(vec![], Arc::new(DeclarativePermission)).unwrap();
-    let factory = NativeChildFactory::new(NativeDelegateConfig {
-        children: Children::default(),
-        aggregate: UsageLedger::open(None).unwrap(),
-        client: Arc::new(
-            RetryingClient::new(
-                config.provider.client_config(),
-                RetryPolicy {
-                    attempts: 1,
-                    backoff_ms: 0,
-                    deadline_ms: 100,
+    let child_catalog = vec![AgentInfo {
+        tool_media_output_bytes: Default::default(),
+        name: "reviewer".into(),
+        modes: vec![AgentMode {
+            description: String::new(),
+            prompt: String::new(),
+            name: "review".into(),
+            role: AgentRole::Both,
+            permissions: vec![],
+        }],
+        tools: vec![],
+        variables: Variable::default(),
+    }];
+    struct DelegateModel(std::sync::atomic::AtomicBool);
+    #[async_trait::async_trait]
+    impl microcrab_session::Client for DelegateModel {
+        async fn complete(
+            &self,
+            _: &microcrab_session::context::Content,
+            _: &dyn microcrab_session::Auditor,
+            _: &dyn microcrab_session::VariableView,
+            _: CancellationToken,
+        ) -> Result<microcrab_protocol::Response, microcrab_transport::Error> {
+            Ok(microcrab_protocol::Response {
+                content: "host fixture".into(),
+                tool_calls: if self.0.swap(false, Ordering::AcqRel) {
+                    vec![microcrab_protocol::ToolCall {
+                        id: "delegate-host".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::json!({"target":"reviewer","mode":"review","input":"host ownership"}),
+                        provider_metadata: None,
+                    }]
+                } else {
+                    vec![]
                 },
-            )
-            .unwrap(),
-        ),
+                provider_metadata: None,
+                usage: microcrab_protocol::Usage::default(),
+            })
+        }
+    }
+    let parent_runtime = Runtime::new(
+        vec![microcrab_session::runtime::ToolRegistration::Builtin(
+            microcrab_session::runtime::BuiltinTool::Delegate,
+        )],
+        Arc::new(microcrab_session::runtime::tool::AllowTools::new([
+            "delegate",
+        ])),
+    )
+    .unwrap();
+    let children = Children::default();
+    let factory = Arc::new(NativeChildFactory::new(NativeDelegateConfig {
+        children: children.clone(),
+        aggregate: UsageLedger::open(None).unwrap(),
+        client: Arc::new(DelegateModel(std::sync::atomic::AtomicBool::new(false))),
         host: first.host.clone(),
         wasm: vec![],
         external: vec![],
-        catalog: vec![AgentInfo {
-            name: "reviewer".into(),
-            modes: vec![AgentMode {
-                description: String::new(),
-                prompt: String::new(),
-                name: "review".into(),
-                role: AgentRole::SubAgent,
-                permissions: vec![],
-            }],
-            tools: vec![],
-            variables: Variable::default(),
-        }],
+        catalog: child_catalog.clone(),
         permissions: parent_runtime.permission_controller(),
         limits: microcrab_session::Limits::default(),
         directory: config.data_dir.join("child-test"),
@@ -288,20 +316,61 @@ async fn injected_backend_is_shared_across_projects_children_and_restoration() {
         system: None,
         auditors: None,
         journals: None,
-    });
-    let child = factory
-        .create(
-            None,
-            "review",
-            None,
-            "clean",
-            first.session.process_control(),
-        )
-        .await
-        .unwrap();
-    child.session.start().await.unwrap();
-    child.session.checkpoint().await.unwrap();
-    child.session.close().await.unwrap();
+    }));
+    let parent = microcrab_session::Session::builder(
+        DelegateModel(std::sync::atomic::AtomicBool::new(true)),
+        parent_runtime.with_delegate_executor(Arc::new(
+            microcrab_creator::delegate::OwnedDelegateExecutor::new(children.clone(), factory),
+        )),
+    )
+    .session_id("host-adoption-parent")
+    .host(first.host.clone())
+    .catalog(child_catalog)
+    .build()
+    .unwrap();
+    parent.submit("create the owned child").await.unwrap();
+    let mut changes = parent.executions().subscribe();
+    let child = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row = parent
+                .execution_snapshots()
+                .into_iter()
+                .find(|row| row.tool == "delegate")
+                .expect("delegate admitted");
+            if let Some(binding) = &row.delegate_child
+                && let Ok(child) = parent.inspect_child(&binding.session_id, "reviewer")
+            {
+                break child;
+            }
+            assert!(
+                row.status.is_pending(),
+                "delegate failed before child publication: {:?}",
+                row.failure
+            );
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let mut activity = child.subscribe_activity();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while activity.borrow().outcome_sequence < 1 {
+            activity.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        child
+            .communication_identity()
+            .unwrap()
+            .parent_session_id
+            .as_deref(),
+        Some("host-adoption-parent")
+    );
+    child.checkpoint().await.unwrap();
+    parent.close().await.unwrap();
+    children.close().await.unwrap();
     manager.close().await.unwrap();
     drop(first);
     drop(second);

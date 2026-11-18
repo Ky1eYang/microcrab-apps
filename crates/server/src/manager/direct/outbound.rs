@@ -167,24 +167,22 @@ impl Manager {
                 .matching_credential(principal, &params, &locator)
                 .await?
                 .is_some()
-        {
-            if let Some(mut state) = self
+            && let Some(mut state) = self
                 .observe_direct_route(principal, &params.project_id)
                 .await?
+        {
+            state["transport"] = json!(if self
+                .routes
+                .lock()
+                .await
+                .get(&params.project_id)
+                .is_some_and(|route| route.socket.starts_with("direct:wss:"))
             {
-                state["transport"] = json!(if self
-                    .routes
-                    .lock()
-                    .await
-                    .get(&params.project_id)
-                    .is_some_and(|route| route.socket.starts_with("direct:wss:"))
-                {
-                    "outbound_wss"
-                } else {
-                    "grpc"
-                });
-                return Ok(state);
-            }
+                "outbound_wss"
+            } else {
+                "grpc"
+            });
+            return Ok(state);
         }
         let mut attempts = self
             .direct_hosts
@@ -359,9 +357,41 @@ impl Manager {
         let saved = self
             .matching_credential(&attempt.principal, &attempt.params, &url)
             .await?;
-        let (handshake, pin) = self
+        let (mut handshake, pin) = self
             .handshake(&attempt.principal, &attempt.params, saved.as_ref())
             .await?;
+        let (request_id, inspect) = preflight::inspect(&handshake)?;
+        let bytes =
+            encode_frame(&inspect).map_err(|_| unavailable("Cannot encode Host inspection"))?;
+        let probe = async {
+            socket
+                .send(Message::Binary(bytes.into()))
+                .await
+                .map_err(|_| unavailable("Outbound inspection send failed"))?;
+            match socket.recv().await {
+                Some(Ok(Message::Binary(bytes))) => decode_frame(&bytes)
+                    .map_err(|_| unavailable("Outbound inspection reply is invalid")),
+                _ => Err(unavailable(
+                    "Outbound Host closed before inspection; pairing was not sent",
+                )),
+            }
+        };
+        let reply = tokio::select! {
+            _ = attempt.stop.cancelled() => return Err(unavailable("Outbound inspection cancelled before pairing")),
+            reply = tokio::time::timeout(Duration::from_secs(10), probe) => reply.map_err(|_| unavailable("Outbound inspection exceeded 10 seconds"))??,
+        };
+        let descriptor = preflight::accept(reply, &request_id, pin.as_ref())?;
+        let _workspace = self
+            .direct_hosts
+            .admit_workspace(&attempt.principal.owner, &descriptor)
+            .await;
+        if let Some(existing) = self
+            .preflight_candidate(&attempt.principal, &attempt.params, &descriptor)
+            .await?
+        {
+            return Ok(existing);
+        }
+        preflight::guard(&mut handshake, &descriptor)?;
         let bytes = encode_frame(&handshake).map_err(|error| {
             unavailable(format!("Cannot encode Host handshake: {}", error.message))
         })?;
@@ -378,7 +408,7 @@ impl Manager {
             }
         };
         let hello = tokio::select! { _ = attempt.stop.cancelled() => return Err(unknown()), result = tokio::time::timeout(Duration::from_secs(10), exchange) => result.map_err(|_| unknown())?? };
-        let accepted = accept_hello(hello, pin.as_ref())?;
+        let accepted = accept_hello(hello, pin.as_ref(), &descriptor)?;
         attempt.begin_commit()?;
         self.save_direct_credential(
             &attempt.params.project_id,

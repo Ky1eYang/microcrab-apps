@@ -7,6 +7,7 @@ mod audit;
 mod auto_compaction;
 pub(crate) mod bindings;
 mod cancellation;
+mod child_input;
 mod child_inspection;
 pub(crate) mod citations;
 pub(crate) mod client_tools;
@@ -18,8 +19,13 @@ mod deletion;
 mod detached;
 pub(crate) mod direct;
 mod display;
+mod external_inbox;
+pub(crate) mod external_speakers;
 mod fork;
 mod host_inspection;
+#[cfg(test)]
+#[path = "../tests/support/host_shell_fixture.rs"]
+mod host_shell_fixture;
 #[cfg(test)]
 mod host_tests;
 mod hub;
@@ -32,8 +38,8 @@ mod model_tests;
 mod naming;
 mod observation;
 mod permission_ask;
-mod providers;
 mod prompt_defaults;
+mod providers;
 pub(crate) mod question_images;
 mod round_limit;
 pub(crate) mod session_watch;
@@ -41,6 +47,13 @@ pub(crate) mod settings;
 mod statistics;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[expect(
+    dead_code,
+    reason = "Shared typed fixture also provides embedding helpers used by separate integration test targets"
+)]
+#[path = "../tests/support/typed_agent_fixture.rs"]
+mod typed_agent_fixture;
 mod view;
 use crate::{
     auth::Principal,
@@ -80,6 +93,7 @@ pub struct Manager {
     conversation_routes: AsyncMutex<HashMap<String, bindings::Route>>,
     // Serialize canonical identity lookup, immutable pin publication and metadata finalization.
     identity_gate: AsyncMutex<()>,
+    speaker_gates: Mutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
     next_route: AtomicU64,
     directory: Arc<dyn Directory>,
     pub(crate) configuration: Arc<dyn microcrab_storage::configuration::Configuration>,
@@ -87,6 +101,10 @@ pub struct Manager {
     journal_open_gates: Mutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
     read_hubs: Mutex<HashMap<String, std::sync::Weak<hub::Hub>>>,
     /// Runtime-only child selection authority, isolated by owner/root/actual child.
+    #[expect(
+        clippy::type_complexity,
+        reason = "The single child Journal registry retains exact owner, root and child identity"
+    )]
     child_journals:
         Arc<Mutex<HashMap<(String, String, String), microcrab_storage::CreatorJournal>>>,
     /// Dormant journal projections keyed by exact manifest bytes (bounded LRU).
@@ -162,6 +180,8 @@ struct Managed {
     record: AsyncMutex<SessionRecord>,
     commands: AsyncMutex<()>,
     worker: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
+    child_drivers: AsyncMutex<JoinSet<Result<(), WireError>>>,
+    child_factory: Arc<microcrab_creator::delegate::NativeChildFactory>,
     tool_task_events: AsyncMutex<Option<tokio::task::JoinHandle<()>>>,
     naming: AsyncMutex<Option<naming::Task>>,
     auto_naming: AtomicBool,
@@ -189,6 +209,7 @@ struct ManagedCleanup {
 #[serde(rename_all = "snake_case")]
 enum CleanupStage {
     TurnOwner,
+    ChildTurns,
     ToolTaskEvents,
     StatisticsEvents,
     Naming,
@@ -311,6 +332,81 @@ impl Manager {
         self.record(&principal.owner, id).await?;
         let tools = self.client_tools(id).await.map_err(safe)?;
         match command.method.as_str() {
+            "client_tools.decision" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Request {
+                    kind: String,
+                    request_id: String,
+                }
+                let params = commands::parse::<Request>(command)?;
+                if !matches!(
+                    params.kind.as_str(),
+                    "permission" | "permission_proposal" | "round_limit"
+                ) || params.request_id.len() > 128
+                {
+                    return Err(WireError::new(
+                        "invalid_params",
+                        "Invalid interaction receipt identity",
+                    ));
+                }
+                tools
+                    .with_participant(socket_id, |participant| {
+                        if !participant {
+                            return Err(WireError::new(
+                                "permission_denied",
+                                "Bound owner participant required",
+                            ));
+                        }
+                        tools
+                            .decision(&params.kind, &params.request_id)
+                            .ok_or_else(|| {
+                                WireError::new("not_found", "Interaction outcome not retained")
+                            })
+                    })
+                    .await
+            }
+            "client_tools.takeover" => {
+                let params = commands::parse::<client_tools::BindRequest>(command)?;
+                serde_json::to_value(
+                    tools
+                        .takeover_idle(socket_id, &params)
+                        .await
+                        .map_err(safe)?,
+                )
+                .map_err(|_| unavailable())
+            }
+            "client_tools.arguments" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Request {
+                    invocation_id: String,
+                    lease_id: String,
+                }
+                let params = commands::parse::<Request>(command)?;
+                let arguments = tools
+                    .private_arguments(socket_id, &params.invocation_id, &params.lease_id)
+                    .await
+                    .map_err(safe)?;
+                Ok(serde_json::json!({"invocation_id":params.invocation_id,"arguments":arguments}))
+            }
+            "client_tools.secret" => {
+                let params = commands::parse::<client_tools::SecretRequest>(command)?;
+                serde_json::to_value(tools.secret(socket_id, params).await.map_err(safe)?)
+                    .map_err(|_| unavailable())
+            }
+            "client_tools.secret_operation" => {
+                #[derive(serde::Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Request {
+                    operation_id: String,
+                }
+                let params = commands::parse::<Request>(command)?;
+                tools
+                    .secret_operation(socket_id, &params.operation_id)
+                    .await
+                    .map_err(safe)
+            }
             commands::CLIENT_TOOLS_BIND => {
                 let params = commands::parse::<client_tools::BindRequest>(command)?;
                 serde_json::to_value(tools.bind(socket_id, &params).await.map_err(safe)?)
@@ -504,6 +600,7 @@ impl Manager {
             direct_hosts: direct::Hosts::default(),
             conversation_routes: AsyncMutex::new(HashMap::new()),
             identity_gate: AsyncMutex::new(()),
+            speaker_gates: Mutex::new(HashMap::new()),
             next_route: AtomicU64::new(1),
             directory,
             configuration,
@@ -746,6 +843,9 @@ impl Manager {
                 if manager.closed.load(Ordering::Acquire) {
                     return Err(WireError::new("closed", "Server is shutting down"));
                 }
+                let speaker_owner = record.owner.clone();
+                let speaker_project = record.project_id.clone();
+                let speaker_session = record.id.clone();
                 let managed = match fork_source.as_ref() {
                     Some(source) => {
                         assembly::create_from(&manager, record, restore, Some((&source.0, &source.1))).await
@@ -753,6 +853,14 @@ impl Manager {
                     None => assembly::create(&manager, record, restore).await,
                 }
                 .map_err(safe)?;
+                if let Err(error)=manager.synchronize_external_speakers(&speaker_owner,speaker_project.as_deref(),&speaker_session,&managed.session).await {
+                    if let Err(cause)=manager.close_managed(&managed).await {
+                        let mut failure=WireError::new("operation_failed","Speaker synchronization failed and Session cleanup requires reconciliation");
+                        failure.details=Some(Box::new(serde_json::json!({"cause":error,"cleanup":safe(cause)})));
+                        return Err(failure);
+                    }
+                    return Err(error);
+                }
                 // A completed initialization permit (including no-WASM Sessions)
                 // needs no interactive guest work. Preserve serialized eager start
                 // under the existing locks, so concurrent opens reuse its result.
@@ -914,6 +1022,9 @@ impl Manager {
                 "Cleanup Host identity changed",
             ));
         }
+        if managed.host_flavor == Some(conversation_flavors::HostFlavor::ChatOnly) {
+            return Ok(0);
+        }
         let (routes, key) = if let Some(project) = record.project_id.as_ref() {
             (self.routes.lock().await, project)
         } else {
@@ -1009,6 +1120,25 @@ impl Manager {
         };
         if let Some(worker) = managed.worker.lock().await.take() {
             result.retain_join(CleanupStage::TurnOwner, worker.await);
+        }
+        {
+            let mut drivers = managed.child_drivers.lock().await;
+            while let Some(joined) = drivers.join_next().await {
+                match joined {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => result.failures.push(CleanupFailure {
+                        stage: CleanupStage::ChildTurns,
+                        detail: CleanupDetail {
+                            code: error.code,
+                            message: error.message,
+                        },
+                    }),
+                    Err(error) => result.failures.push(CleanupFailure {
+                        stage: CleanupStage::ChildTurns,
+                        detail: CleanupDetail::from_join(error),
+                    }),
+                }
+            }
         }
         if let Some(worker) = managed.tool_task_events.lock().await.take() {
             result.retain_join(CleanupStage::ToolTaskEvents, worker.await);
@@ -1224,6 +1354,15 @@ fn safe(error: Error) -> WireError {
                 &description,
             );
             let mut details = serde_json::json!({"reason":description});
+            if let Some(empty) = cause.empty_completion_details() {
+                details["provider_code"] = serde_json::json!("empty_assistant_response");
+                details["reasoning_present"] = serde_json::json!(empty.reasoning_present);
+                details["finish_reason"] = serde_json::json!(match empty.finish {
+                    microcrab_transport::EmptyCompletionFinish::Stop => "stop",
+                    microcrab_transport::EmptyCompletionFinish::Length => "length",
+                    microcrab_transport::EmptyCompletionFinish::Unknown => "unknown",
+                });
+            }
             if let Some(failure) = cause.failure_details() {
                 if let Some(kind) = failure.kind() {
                     details["provider_type"] = serde_json::json!(kind);

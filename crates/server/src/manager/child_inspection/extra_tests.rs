@@ -41,12 +41,14 @@ async fn deferred_receipt_link_requires_exact_task_and_selected_tool_result() {
     });
     assert!(receipts(&checkpoint).is_empty());
     checkpoint.context.items.push(ContentItem::Tool {
+        parts: vec![],
         call_id: "deferred".into(),
         content: json!({"execution_id":8,"session_id":"parent"}).to_string(),
     });
     assert!(receipts(&checkpoint).is_empty());
     checkpoint.context.items.pop();
     checkpoint.context.items.push(ContentItem::Tool {
+        parts: vec![],
         call_id: "deferred".into(),
         content: json!({"execution_id":9,"session_id":"parent"}).to_string(),
     });
@@ -211,12 +213,14 @@ async fn typed_delegate_binding_preserves_status_and_ledger_usage_without_receip
     checkpoint.state.executions.push(row);
     assert!(child_executions("parent", &checkpoint, &checkpoint.state.executions).is_empty());
     checkpoint.context.items.push(ContentItem::Tool {
+        parts: vec![],
         call_id: "typed-call".into(),
         content: json!({"execution_id":8,"session_id":"parent"}).to_string(),
     });
     assert!(child_executions("parent", &checkpoint, &checkpoint.state.executions).is_empty());
     checkpoint.context.items.pop();
     checkpoint.context.items.push(ContentItem::Tool {
+        parts: vec![],
         call_id: "typed-call".into(),
         content: json!({"execution_id":9,"session_id":"parent"}).to_string(),
     });

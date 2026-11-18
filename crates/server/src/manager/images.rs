@@ -67,13 +67,14 @@ fn select(
     part_index: usize,
 ) -> Result<ImageContent, WireError> {
     for (index, item) in items.into_iter().enumerate() {
-        if !matches!(&item, ContentItem::User { .. })
+        if !matches!(&item, ContentItem::User { .. } | ContentItem::Tool { .. })
             || message_id(session_id, epoch, index, &item) != id
         {
             continue;
         }
-        let ContentItem::User { parts, .. } = item else {
-            unreachable!()
+        let parts = match item {
+            ContentItem::User { parts, .. } | ContentItem::Tool { parts, .. } => parts,
+            _ => unreachable!("image lookup accepts only User or Tool items"),
         };
         let part = parts.into_iter().nth(part_index).ok_or_else(unavailable)?;
         return match part {
@@ -201,5 +202,35 @@ impl Manager {
         // Release the read-only Journal before returning either bytes or errors.
         journal.close().await.map_err(safe)?;
         result
+    }
+}
+
+#[cfg(test)]
+mod tool_image_tests {
+    use super::*;
+    #[test]
+    fn exact_tool_image_resource_uses_canonical_identity_and_original_part_index() {
+        let item = ContentItem::Tool {
+            call_id: "image".into(),
+            content: "done".into(),
+            parts: vec![
+                InputPart::Text {
+                    text: "annotation".into(),
+                },
+                InputPart::Image {
+                    source: ImageSource::Data {
+                        media_type: "image/png".into(),
+                        data: vec![1, 2, 3],
+                    },
+                },
+            ],
+        };
+        let id = message_id("owned", 2, 0, &item);
+        let image = select(vec![item.clone()], 2, "owned", &id, 1).unwrap();
+        assert_eq!(image.data, vec![1, 2, 3]);
+        assert_eq!(image.media_type, "image/png");
+        assert!(select(vec![item.clone()], 2, "other", &id, 1).is_err());
+        assert!(select(vec![item.clone()], 2, "owned", &id, 0).is_err());
+        assert!(select(vec![item], 3, "owned", &id, 1).is_err());
     }
 }

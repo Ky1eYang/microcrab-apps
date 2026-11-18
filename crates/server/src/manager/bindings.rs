@@ -109,6 +109,62 @@ pub(crate) struct Attach {
     pub allow_legacy_binding: bool,
 }
 impl Manager {
+    // Caller holds identity_gate; retained pins for deleted projects do not reserve
+    // a workspace. Descriptor capability changes never bypass canonical identity.
+    pub(super) async fn canonical_project(
+        &self,
+        owner: &str,
+        requested: &str,
+        descriptor: &HostDescriptor,
+    ) -> Result<Option<String>, WireError> {
+        for project in self.projects.list(owner).await {
+            if project.id == requested {
+                continue;
+            }
+            if let Some(existing) = self.pins.project(&project.id).await.map_err(super::safe)?
+                && existing.owner == owner
+                && existing.host_id == descriptor.host_id
+                && (existing.workspace_id == descriptor.workspace_id
+                    || existing.workspace_root == descriptor.workspace_root)
+            {
+                return Ok(Some(existing.project_id));
+            }
+        }
+        Ok(None)
+    }
+    /// Caller holds identity_gate and has established that no Project pin exists.
+    /// Inspection and publication use the same legacy-history admission policy.
+    pub(super) async fn validate_unbound_project(
+        &self,
+        owner: &str,
+        project: &str,
+        registered: Option<&crate::project::ProjectRecord>,
+        allow_legacy_binding: bool,
+    ) -> Result<(), WireError> {
+        if registered.is_some_and(|record| record.provisional) {
+            return Ok(());
+        }
+        if !allow_legacy_binding {
+            return Err(WireError::new(
+                "legacy_binding_required",
+                "Explicit compatibility binding is required for this unbound Project",
+            ));
+        }
+        if self
+            .directory
+            .list(owner)
+            .await
+            .map_err(super::safe)?
+            .iter()
+            .any(|record| record.project_id.as_deref() == Some(project))
+        {
+            return Err(WireError::new(
+                "binding_mismatch",
+                "Legacy sessions cannot adopt a new execution identity",
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn project_allowed(&self, owner: &str, project: &str) -> bool {
         self.projects
             .find_sync(project)
@@ -252,21 +308,14 @@ impl Manager {
             .map_err(|_| WireError::new("invalid_host", "Host descriptor is invalid"))?;
         // Project registry membership owns canonicalization. Historical pins are
         // retained for Sessions, but a deleted Project cannot reserve a workspace.
-        for project in self.projects.list(&principal.owner).await {
-            if project.id == params.project_id {
-                continue;
-            }
-            if let Some(existing) = self.pins.project(&project.id).await.map_err(super::safe)?
-                && (existing.owner == principal.owner
-                    && existing.host_id == params.descriptor.host_id
-                    && (existing.workspace_id == params.descriptor.workspace_id
-                        || existing.workspace_root == params.descriptor.workspace_root))
-            {
-                return Ok(
-                    json!({"status":"existing_project","existing_project_id":existing.project_id,
-                    "project_id":params.project_id,"connected":false,"ready":false}),
-                );
-            }
+        if let Some(existing) = self
+            .canonical_project(&principal.owner, &params.project_id, &params.descriptor)
+            .await?
+        {
+            return Ok(
+                json!({"status":"existing_project","existing_project_id":existing,
+                "project_id":params.project_id,"connected":false,"ready":false,"pairing_token_consumed":true}),
+            );
         }
         let scope = self
             .binding_scope(&principal.owner, &params.project_id)
@@ -307,29 +356,13 @@ impl Manager {
                 existing
             }
             None => {
-                if !registered.as_ref().is_some_and(|record| record.provisional) {
-                    if !params.allow_legacy_binding {
-                        return Err(WireError::new(
-                            "legacy_binding_required",
-                            "Explicit compatibility binding is required for this unbound Project",
-                        ));
-                    }
-                    if self
-                        .directory
-                        .list(&principal.owner)
-                        .await
-                        .map_err(super::safe)?
-                        .iter()
-                        .any(|record| {
-                            record.project_id.as_deref() == Some(params.project_id.as_str())
-                        })
-                    {
-                        return Err(WireError::new(
-                            "binding_mismatch",
-                            "Legacy sessions cannot adopt a new execution identity",
-                        ));
-                    }
-                }
+                self.validate_unbound_project(
+                    &principal.owner,
+                    &params.project_id,
+                    registered.as_ref(),
+                    params.allow_legacy_binding,
+                )
+                .await?;
                 pin
             }
         };
@@ -601,7 +634,7 @@ impl Manager {
             slot.pending_suspension
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get_or_insert_with(|| reason.clone());
+                .get_or_insert(reason);
             if let Ok(active) = slot.active.try_lock() {
                 if slot.take_pending_suspension(active.as_deref())
                     && let Some(managed) = active.as_ref()

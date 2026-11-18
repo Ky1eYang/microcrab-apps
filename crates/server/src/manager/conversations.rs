@@ -1,6 +1,7 @@
 //! Browser Conversations have no Project registry membership. Immutable owner,
 //! browser and workspace pins constrain every reconnect; socket generations own
 //! transient leases. Route replacement interrupts admission and never replays effects.
+mod server_host;
 use super::conversation_flavors::HostFlavor;
 use super::{Manager, bindings::Route, safe, unavailable};
 use crate::auth::Principal;
@@ -11,6 +12,7 @@ use microcrab_protocol::application::WireError;
 use microcrab_storage::execution::{ConversationBinding, ConversationGrant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use server_host::ServerHost;
 use std::sync::{Arc, atomic::Ordering};
 use tokio::sync::mpsc;
 
@@ -28,6 +30,7 @@ pub(super) struct ConversationScope {
     #[serde(flatten)]
     scope: BindingScope,
     host_flavor: HostFlavor,
+    server_owned: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -37,6 +40,8 @@ pub(crate) struct Attach {
     pub lease_generation: String,
     #[serde(default)]
     pub host_flavor: Option<HostFlavor>,
+    #[serde(default)]
+    pub force_takeover: bool,
 }
 fn chat_only_descriptor(descriptor: &HostDescriptor) -> bool {
     descriptor.platform == "browser"
@@ -47,6 +52,50 @@ fn chat_only_descriptor(descriptor: &HostDescriptor) -> bool {
         && descriptor.supported_primitives.is_empty()
 }
 impl Manager {
+    /// Caller holds identity_gate. The grant and immutable flavor, not a socket,
+    /// authorize only this capability-empty compatibility descriptor.
+    async fn pin_chat_only(&self, grant: &ConversationGrant) -> Result<HostDescriptor, WireError> {
+        let descriptor = ServerHost::descriptor(grant)
+            .map_err(|_| WireError::new("invalid_host", "Chat Only descriptor encoding failed"))?;
+        let binding = ConversationBinding {
+            conversation_id: grant.conversation_id.clone(),
+            owner: grant.owner.clone(),
+            host_id: descriptor.host_id.clone(),
+            workspace_id: descriptor.workspace_id.clone(),
+            workspace_root: descriptor.workspace_root.clone(),
+            descriptor_digest: descriptor.descriptor_digest.clone(),
+        };
+        if self
+            .pins
+            .conversation(&grant.conversation_id)
+            .await
+            .map_err(safe)?
+            .is_some_and(|existing| existing != binding)
+        {
+            return Err(WireError::new(
+                "binding_mismatch",
+                "Chat Only execution identity is immutable",
+            ));
+        }
+        let workspace_key = microcrab_storage::history::content_hash(&json!([
+            binding.host_id,
+            binding.workspace_id
+        ]))
+        .map_err(safe)?;
+        self.pins
+            .pin_conversation_workspace(&workspace_key, &binding)
+            .await
+            .map_err(|_| {
+                WireError::new(
+                    "workspace_in_use",
+                    "Browser workspace belongs to another Conversation",
+                )
+            })?;
+        self.pins.pin_conversation(binding).await.map_err(|_| {
+            WireError::new("binding_mismatch", "Chat Only execution identity differs")
+        })?;
+        Ok(descriptor)
+    }
     pub(super) async fn conversation_scope(
         &self,
         owner: &str,
@@ -127,6 +176,9 @@ impl Manager {
             .pin_conversation_grant(grant)
             .await
             .map_err(safe)?;
+        if flavor == HostFlavor::ChatOnly {
+            self.pin_chat_only(&grant).await?;
+        }
         Ok(ConversationScope {
             scope: BindingScope::conversation(
                 grant.backend_id,
@@ -134,6 +186,7 @@ impl Manager {
                 grant.conversation_id,
             ),
             host_flavor: flavor,
+            server_owned: flavor == HostFlavor::ChatOnly,
         })
     }
     pub(crate) async fn allows_conversation(&self, principal: &Principal, id: &str) -> bool {
@@ -211,6 +264,27 @@ impl Manager {
                 "Chat Only cannot advertise execution capabilities",
             ));
         }
+        if flavor == HostFlavor::ChatOnly {
+            let expected = self.pin_chat_only(&grant).await?;
+            if !microcrab_host_protocol::descriptor_matches_pin(
+                &params.descriptor,
+                &expected.descriptor_digest,
+            )
+            .map_err(|_| WireError::new("invalid_host", "Invalid browser Host descriptor"))?
+            {
+                return Err(WireError::new(
+                    "binding_mismatch",
+                    "Chat Only descriptor differs from its immutable pin",
+                ));
+            }
+            return Ok(json!({
+                "conversation_id":params.conversation_id,"host_flavor":flavor,
+                "attached":false,"server_owned":true,"role":"participant",
+                "connected":true,"ready":true,"reconciling":false,
+                "scope":BindingScope::conversation(grant.backend_id,grant.binding_id,grant.conversation_id),
+                "readiness":{"connected":true,"ready":true,"reconciling":false,"host_flavor":flavor,"server_owned":true}
+            }));
+        }
         let scope =
             BindingScope::conversation(grant.backend_id, grant.binding_id, grant.conversation_id);
         let candidate = RemoteHost::new(params.descriptor.clone())
@@ -262,47 +336,184 @@ impl Manager {
         self.pins.pin_conversation(binding).await.map_err(|_| {
             WireError::new("binding_mismatch", "Conversation workspace pin differs")
         })?;
+        let slot = self
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .find(|slot| slot.project_id.is_none() && slot.session_id == params.conversation_id)
+            .cloned();
+        let managed = if params.force_takeover
+            && let Some(slot) = &slot
         {
+            if slot.initializing.load(Ordering::Acquire) {
+                return Err(WireError::new(
+                    "host_takeover_busy",
+                    "Conversation initialization is active",
+                ));
+            }
+            slot.active
+                .try_lock()
+                .map_err(|_| {
+                    WireError::new("host_takeover_busy", "Conversation lifecycle is active")
+                })?
+                .clone()
+        } else {
+            None
+        };
+        let command_guard = if params.force_takeover {
+            managed
+                .as_ref()
+                .map(|managed| {
+                    managed.commands.try_lock().map_err(|_| {
+                        WireError::new("host_takeover_busy", "Conversation command is active")
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let remote = {
             let mut routes = self.conversation_routes.lock().await;
-            if let Some(old) = routes.get_mut(&params.conversation_id) {
+            if let Some(old) = routes.get(&params.conversation_id) {
                 if generation <= old.generation {
                     return Err(WireError::new(
                         "route_replaced",
                         "Stale browser attachment generation",
                     ));
                 }
-                old.ready = false;
-                old.remote.detach(old.generation);
+                let readiness = old.remote.readiness();
+                if readiness["connected"] == true && !params.force_takeover {
+                    return Ok(json!({
+                        "conversation_id":params.conversation_id,"host_flavor":flavor,
+                        "attached":false,"server_owned":false,"role":"participant",
+                        "connection_generation":old.generation.to_string(),
+                        "connected":true,"ready":old.ready && readiness["ready"] == true,
+                        "reconciling":readiness["reconciling"],"scope":scope,
+                        "reconciliation_error":readiness["cause"],"readiness":readiness
+                    }));
+                }
+                if params.force_takeover
+                    && readiness["connected"] == true
+                    && (!old.ready
+                        || readiness["ready"] != true
+                        || readiness["reconciling"] == true)
+                {
+                    return Err(WireError::new(
+                        "host_takeover_reconciling",
+                        "The existing Host must finish reconciliation before takeover",
+                    ));
+                }
             }
-        }
-        self.suspend_conversation(&params.conversation_id).await;
-        let remote = {
-            let mut routes = self.conversation_routes.lock().await;
-            let remote = routes
-                .get(&params.conversation_id)
-                .map(|route| route.remote.clone())
-                .unwrap_or(candidate);
-            remote
-                .attach_with_bridge_instance(
-                    outbound,
-                    generation,
-                    params.lease_generation,
-                    params.descriptor.bridge_instance_id,
-                )
-                .map_err(|_| WireError::new("host_detached", "Browser Host attachment failed"))?;
-            routes.insert(
-                params.conversation_id.clone(),
-                Route {
-                    owner: principal.owner.clone(),
-                    socket: socket.into(),
-                    generation,
-                    remote: remote.clone(),
-                    ready: false,
-                    diagnostics: None,
-                },
-            );
-            remote
+            let replace = || -> Result<Arc<RemoteHost>, WireError> {
+                // Deferred initialization releases the command lock before Session.start.
+                // Recheck its admission while holding that lock, at the replacement boundary.
+                if params.force_takeover
+                    && slot
+                        .as_ref()
+                        .is_some_and(|slot| slot.initializing.load(Ordering::Acquire))
+                {
+                    return Err(WireError::new(
+                        "host_takeover_busy",
+                        "Conversation initialization is active",
+                    ));
+                }
+                if params.force_takeover
+                    && let Some(managed) = &managed
+                {
+                    let mut drivers = managed.child_drivers.try_lock().map_err(|_| {
+                        WireError::new("host_takeover_busy", "Child execution ownership is active")
+                    })?;
+                    while let Some(joined) = drivers.try_join_next() {
+                        if !matches!(joined, Ok(Ok(()))) {
+                            managed.faulted.store(true, Ordering::Release);
+                            return Err(WireError::new(
+                                "host_takeover_busy",
+                                "Child execution cleanup requires reconciliation",
+                            ));
+                        }
+                    }
+                    if managed.faulted.load(Ordering::Acquire)
+                        || managed.closing.load(Ordering::Acquire)
+                        || managed.session.is_faulted()
+                        || managed.hub.operation().is_some()
+                        || managed
+                            .session
+                            .execution_snapshots()
+                            .iter()
+                            .any(|execution| execution.status.is_pending())
+                        || !drivers.is_empty()
+                    {
+                        return Err(WireError::new(
+                            "host_takeover_busy",
+                            "Conversation execution is active",
+                        ));
+                    }
+                }
+                let remote = routes
+                    .get(&params.conversation_id)
+                    .map(|route| route.remote.clone())
+                    .unwrap_or(candidate);
+                if let Some(old) = routes.get_mut(&params.conversation_id) {
+                    old.ready = false;
+                    old.remote.detach(old.generation);
+                }
+                remote
+                    .attach_with_bridge_instance(
+                        outbound,
+                        generation,
+                        params.lease_generation,
+                        params.descriptor.bridge_instance_id,
+                    )
+                    .map_err(|_| {
+                        WireError::new("host_detached", "Browser Host attachment failed")
+                    })?;
+                routes.insert(
+                    params.conversation_id.clone(),
+                    Route {
+                        owner: principal.owner.clone(),
+                        socket: socket.into(),
+                        generation,
+                        remote: remote.clone(),
+                        ready: false,
+                        diagnostics: None,
+                    },
+                );
+                Ok(remote)
+            };
+            if params.force_takeover
+                && let Some(managed) = &managed
+            {
+                // Lock order: conversation route -> ClientTools -> Session inbox.
+                // The callback is synchronous: no new producer or turn can race
+                // the exact idle observation and route generation replacement.
+                managed
+                    .client_tools
+                    .with_execution_idle(|idle| {
+                        if !idle {
+                            return Err(WireError::new(
+                                "host_takeover_busy",
+                                "Browser execution is active",
+                            ));
+                        }
+                        managed.session.with_inbox_snapshot(|inbox| {
+                            if inbox.active {
+                                Err(WireError::new(
+                                    "host_takeover_busy",
+                                    "Conversation turn is active",
+                                ))
+                            } else {
+                                replace()
+                            }
+                        })
+                    })
+                    .await?
+            } else {
+                replace()?
+            }
         };
+        drop(command_guard);
+        self.suspend_conversation(&params.conversation_id).await;
         drop(identity);
         let _ = remote.reconcile_for_generation(generation).await;
         if !self
@@ -320,7 +531,7 @@ impl Manager {
         readiness["host_flavor"] = json!(flavor);
         route.ready = readiness["ready"] == true;
         Ok(
-            json!({"conversation_id":params.conversation_id,"host_flavor":flavor,"connection_generation":generation.to_string(),"connected":readiness["connected"],"ready":route.ready,"reconciling":readiness["reconciling"],"scope":scope,"reconciliation_error":readiness["cause"],"readiness":readiness}),
+            json!({"conversation_id":params.conversation_id,"host_flavor":flavor,"attached":true,"server_owned":false,"connection_generation":generation.to_string(),"connected":readiness["connected"],"ready":route.ready,"reconciling":readiness["reconciling"],"scope":scope,"reconciliation_error":readiness["cause"],"readiness":readiness}),
         )
     }
     pub(crate) async fn receive_conversation_host(
@@ -379,15 +590,50 @@ impl Manager {
         owner: &str,
         id: &str,
     ) -> Result<Arc<dyn Host>, WireError> {
-        if self.embedded
-            || self
+        if self.embedded {
+            return Err(unavailable());
+        }
+        let grant = self
+            .pins
+            .conversation_grant(id)
+            .await
+            .map_err(safe)?
+            .filter(|grant| grant.owner == owner)
+            .ok_or_else(unavailable)?;
+        let flavors = self.conversation_flavors.clone();
+        let flavor_grant = grant.clone();
+        let flavor = tokio::task::spawn_blocking(move || flavors.resolve(&flavor_grant))
+            .await
+            .map_err(|_| WireError::new("storage_error", "Conversation flavor read worker failed"))?
+            .map_err(safe)?;
+        if flavor == HostFlavor::ChatOnly {
+            let descriptor = ServerHost::descriptor(&grant).map_err(|_| {
+                WireError::new("invalid_host", "Chat Only descriptor encoding failed")
+            })?;
+            let binding = self
                 .pins
-                .conversation_grant(id)
+                .conversation(id)
                 .await
                 .map_err(safe)?
-                .is_none_or(|grant| grant.owner != owner)
-        {
-            return Err(unavailable());
+                .ok_or_else(|| {
+                    WireError::new("binding_mismatch", "Chat Only execution pin missing")
+                })?;
+            if binding.owner != grant.owner
+                || binding.conversation_id != grant.conversation_id
+                || binding.host_id != descriptor.host_id
+                || binding.workspace_id != descriptor.workspace_id
+                || binding.workspace_root != descriptor.workspace_root
+                || binding.descriptor_digest != descriptor.descriptor_digest
+            {
+                return Err(WireError::new(
+                    "binding_mismatch",
+                    "Chat Only execution pin differs",
+                ));
+            }
+            return self
+                .conversation_flavors
+                .chat_host(&grant, Arc::new(ServerHost::new(&descriptor)))
+                .map_err(safe);
         }
         let routes = self.conversation_routes.lock().await;
         let route = routes.get(id).filter(|route| route.owner == owner);

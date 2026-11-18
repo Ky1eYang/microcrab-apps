@@ -97,6 +97,33 @@ fn nested_provider_protocol_cause_publishes_only_the_safe_reason() {
     }
 }
 
+#[test]
+fn empty_completion_wire_retains_closed_facts_without_fabricating_an_answer() {
+    use microcrab_transport::{EmptyCompletionFacts, EmptyCompletionFinish, ProviderError};
+    for (finish, expected) in [
+        (EmptyCompletionFinish::Stop, "stop"),
+        (EmptyCompletionFinish::Length, "length"),
+        (EmptyCompletionFinish::Unknown, "unknown"),
+    ] {
+        for reasoning_present in [false, true] {
+            let transport = microcrab_transport::Error::Provider(ProviderError::empty_completion(
+                EmptyCompletionFacts {
+                    reasoning_present,
+                    finish,
+                },
+            ));
+            let wire = safe(Error::from(transport));
+            assert_eq!(wire.code, "provider");
+            let details = wire.details.unwrap();
+            assert_eq!(details["provider_code"], "empty_assistant_response");
+            assert_eq!(details["reasoning_present"], reasoning_present);
+            assert_eq!(details["finish_reason"], expected);
+            assert!(details.get("content").is_none());
+            assert!(details.get("reasoning").is_none());
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 struct ProtocolLogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 impl std::io::Write for ProtocolLogCapture {

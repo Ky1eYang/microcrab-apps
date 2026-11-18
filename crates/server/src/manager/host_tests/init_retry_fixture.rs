@@ -1,10 +1,6 @@
 //! Shared actual WASM construction and authenticated executor setup for init tests.
 use super::*;
-#[path = "../../../tests/support/host_shell_fixture.rs"]
-mod host_shell_fixture;
-#[allow(dead_code)]
-#[path = "../../../tests/support/typed_agent_fixture.rs"]
-mod typed_agent_fixture;
+use crate::manager::{host_shell_fixture, typed_agent_fixture};
 
 pub(super) fn configuration(root: &std::path::Path, mode: &str, effects: bool) -> Config {
     let mut configuration = config(root);

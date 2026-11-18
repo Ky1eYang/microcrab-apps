@@ -365,14 +365,14 @@ async fn watermark_reconnect_catches_up_and_live_events_keep_contiguous_wire_seq
             } else {
                 track_event(&next, &barrier, &mut sequence);
                 assert_ne!(next["event"], "snapshot");
-                if next["event"] == "model_observation" {
-                    if let Some(recorded) = next["data"]["archive_sequence"].as_u64() {
-                        assert!(
-                            recorded > archived,
-                            "real archive records must advance the subscription barrier"
-                        );
-                        archived = recorded;
-                    }
+                if next["event"] == "model_observation"
+                    && let Some(recorded) = next["data"]["archive_sequence"].as_u64()
+                {
+                    assert!(
+                        recorded > archived,
+                        "real archive records must advance the subscription barrier"
+                    );
+                    archived = recorded;
                 }
                 crate::manager::publication::apply(
                     &mut view,
@@ -507,7 +507,7 @@ async fn closing_executor_releases_lease_and_observer_or_stale_lease_cannot_revo
 
     let mut observer = fixture.socket(&path, &fixture.token).await;
     assert_eq!(frame(&mut observer).await["type"], "subscribed");
-    assert_eq!(bind(&mut observer, digest).await["role"], "observer");
+    assert_eq!(bind(&mut observer, digest).await["role"], "participant");
     close_client(&mut observer).await;
     // Observer close and unrelated global-socket close leave the executor intact.
     let mut global = fixture.socket("/api/v1/ws", &fixture.token).await;
@@ -516,7 +516,7 @@ async fn closing_executor_releases_lease_and_observer_or_stale_lease_cannot_revo
 
     let mut replacement = fixture.socket(&path, &fixture.token).await;
     assert_eq!(frame(&mut replacement).await["type"], "subscribed");
-    assert_eq!(bind(&mut replacement, digest).await["role"], "observer");
+    assert_eq!(bind(&mut replacement, digest).await["role"], "participant");
     close_client(&mut executor).await;
     let second = acquire_executor(&mut replacement, digest).await;
     assert_ne!(second["lease_id"], *first_lease);
@@ -537,7 +537,7 @@ async fn closing_executor_releases_lease_and_observer_or_stale_lease_cannot_revo
 
     let mut successor = fixture.socket(&path, &fixture.token).await;
     assert_eq!(frame(&mut successor).await["type"], "subscribed");
-    assert_eq!(bind(&mut successor, digest).await["role"], "observer");
+    assert_eq!(bind(&mut successor, digest).await["role"], "participant");
     close_client(&mut replacement).await;
     let third = acquire_executor(&mut successor, digest).await;
     assert_ne!(third["lease_id"], second["lease_id"]);
@@ -693,7 +693,7 @@ async fn native_relay_uses_binary_global_frames_and_keeps_socket_intakes_isolate
         panic!("native relay handshake must remain binary: {handshake:?}")
     };
     assert!(
-        matches!(decode_frame(&bytes).unwrap(), HostFrame::Pair { token, .. } if token == "test-pair")
+        matches!(decode_frame(&bytes).unwrap(), HostFrame::Inspect { request } if matches!(&request.authentication, microcrab_host_protocol::InspectAuthentication::Pair { token } if token == "test-pair"))
     );
 
     // An unrelated browser's binary data must never satisfy or fail this relay's
@@ -787,6 +787,11 @@ async fn native_session_fastpaths_log_the_actual_completion_result() {
         "client_tools.unbind",
         "client_tools.prepare",
         "client_tools.output",
+        "client_tools.takeover",
+        "client_tools.arguments",
+        "client_tools.secret",
+        "client_tools.secret_operation",
+        "client_tools.decision",
     ] {
         let id = uuid::Uuid::new_v4().to_string();
         let mut body = command(&id, method);

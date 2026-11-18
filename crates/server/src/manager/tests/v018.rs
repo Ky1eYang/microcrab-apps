@@ -17,7 +17,7 @@ impl microcrab_session::Client for ToolModel {
         _: CancellationToken,
     ) -> Result<Response, microcrab_transport::Error> {
         assert!(content.tools.iter().any(|tool| tool.name == "client_echo"));
-        let completed = content.items.iter().any(|item| matches!(item, microcrab_session::context::ContentItem::Tool { call_id, content } if call_id == "echo-call" && (self.deferred || content.contains("actual client reply"))));
+        let completed = content.items.iter().any(|item| matches!(item, microcrab_session::context::ContentItem::Tool { call_id, content, .. } if call_id == "echo-call" && (self.deferred || content.contains("actual client reply"))));
         Ok(Response {
             provider_metadata: None,
             content: if completed {

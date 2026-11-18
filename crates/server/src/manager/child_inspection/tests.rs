@@ -308,6 +308,7 @@ async fn completed_receipt_requires_canonical_delegate_tool_link_not_user_json()
         .used_call_ids
         .insert("delegate-call".into());
     checkpoint.context.items.push(ContentItem::Tool {
+        parts: vec![],
         call_id: "delegate-call".into(),
         content: receipt.to_string(),
     });

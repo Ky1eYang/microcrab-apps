@@ -1,6 +1,4 @@
-# Chat host flavor implementation record
-
-Status: implemented source; native acceptance requires root-coordinated validation.
+# Chat Host flavor contract
 
 Client owns `HostFlavor` (`chat_only` / `browser_sandbox`) in an immutable
 `conversation-flavors/<conversation UUID>.json` sidecar alongside the existing
@@ -26,28 +24,23 @@ Attach replies expose flavor both at top level and in readiness. Session metadat
 projections and managed snapshot refreshes preserve flavor for actual browser
 conversations. Client tools, plugin permissions and network policy are unchanged.
 
-Tests added:
+## Verification
 
-- Exact Frontend golden bytes, typed Rust serialization and SHA-256 fingerprint.
-- Manager flavor admission before attach, execution-descriptor rejection,
-  immutable identity, projection classification and restart.
-- Staged-sidecar crash recovery, independent-writer conflict, exact owner/workspace
-  fencing and legacy grant-only classification.
-- Explicit ignored maintained-component/provider acceptance test:
-  `chat_only_maintained_components_preserve_client_tools_in_provider_payload`.
-  Set `MICROCRAB_TEST_CODING_COMPONENT` and `MICROCRAB_TEST_UNIVERSAL_COMPONENT`
-  to root-built maintained component paths, then invoke the root Cargo runner for
-  Client server tests with all features and that filter, forwarding `--ignored`.
-  Both Coding and Universal remain in the catalog with empty Host tools. The test
-  creates a fresh Session for each agent and checks its actual loopback provider
-  payload, retaining question/todo/provider client tools while excluding Host tools.
-  Universal's shell-free mode carries no shell permission or execution instructions;
-  native Hosts retain the actual linked shell tool. When multiple components are
-  available, Session creation selects the exact `component` digest returned by
-  `agent.catalog`, together with the agent and mode names.
+The Server library tests cover descriptor serialization and fingerprints, flavor
+admission and projection, immutable identity, staged-sidecar recovery and conflicts,
+owner/workspace fencing, and classification of grants without a sidecar.
 
-Run the maintained-component gate from the superproject root after preparing both
-component paths above:
+The maintained-component gate checks catalog admission and the actual loopback
+provider payload for fresh Coding and Universal Sessions. Chat Only keeps question,
+todo and provider client tools while excluding Host tools. Universal's shell-free
+mode has no shell permission or execution instructions. The gate also checks that a
+native Host retains the linked shell tool. When multiple components are available,
+Session creation selects the exact `component` digest from `agent.catalog` together
+with the agent and mode names.
+
+From the superproject root, set `MICROCRAB_TEST_CODING_COMPONENT` and
+`MICROCRAB_TEST_UNIVERSAL_COMPONENT` to the prepared maintained component paths,
+then run:
 
 ```sh
 cargo xtask integration setup
@@ -55,16 +48,9 @@ cargo xtask integration metadata
 cargo xtask integration test -p microcrab-server --lib --all-features --filter chat_only_maintained_components_preserve_client_tools_in_provider_payload --ignored
 ```
 
-Verification: scoped rustfmt and `git diff --check` passed. Explicit root
-`integration setup` and `integration metadata` verified all 13 local Core package
-paths and both Client snapshot workspace packages. The ignored Server lib test
-above passed (1 passed, 0 failed, 494 filtered out), using the maintained Coding
-component and the rebuilt Universal component at explicit absolute paths. This
-proves catalog admission and fresh Session/provider payloads for both agents.
-No live service restart, deployment, push or tag was performed; browser route
-acceptance and existing immutable Session pins remain separate.
+## Limits
 
-Limits: the flavor/grant index is loaded at Manager startup to support synchronous
+The flavor/grant index is loaded at Manager startup to support synchronous
 metadata projection, so memory/startup work scales with retained conversation
 history. Existing Core pins remain the execution and owner authorities. The added
 sidecar follows the same application-owned data-directory trust boundary, rejects

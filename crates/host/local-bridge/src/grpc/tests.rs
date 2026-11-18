@@ -37,6 +37,8 @@ async fn open(client: &mut Client, directory: &Path, project: &str) -> Controlle
         directory: Some(directory.to_string_lossy().into_owned()),
         expected_host_id: None,
         expected_workspace_id: None,
+        expected_descriptor_digest: None,
+        expected_workspace_root: None,
     };
     sender.send(frame_to_proto(&pair).unwrap()).await.unwrap();
     let mut request = Request::new(ReceiverStream::new(rx));
@@ -217,6 +219,80 @@ async fn request_on_grpc_control_is_rejected_before_effect_admission() {
         .await
         .unwrap_err();
     assert_eq!(rejected.code(), tonic::Code::Unauthenticated);
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn inspection_and_guard_rejection_keep_existing_grpc_execute_capability_live() {
+    use microcrab_host_protocol::{ErrorCode, InspectRequest};
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("sentinel.txt"), "still-live").unwrap();
+    let (mut client, server) = start(root.path()).await;
+    let controller = open(&mut client, root.path(), "a").await;
+    let mut candidate = WireFrame::Pair {
+        token: "wrong".into(),
+        scope: BindingScope::project("backend".into(), "binding-b".into(), "b".into()),
+        directory: None,
+        expected_host_id: None,
+        expected_workspace_id: None,
+        expected_descriptor_digest: None,
+        expected_workspace_root: None,
+    };
+    for valid in [false, true] {
+        if valid && let WireFrame::Pair { token, .. } = &mut candidate {
+            *token = "pair-secret".into();
+        }
+        let probe = WireFrame::Inspect {
+            request: InspectRequest::new(format!("probe-{valid}"), &candidate).unwrap(),
+        };
+        let mut request = Request::new(frame_to_proto(&probe).unwrap());
+        request
+            .metadata_mut()
+            .insert("origin", ORIGIN.parse().unwrap());
+        let reply = client.inspect(request).await.unwrap();
+        assert!(reply.metadata().get(GRPC_EXECUTE_TOKEN_HEADER).is_none());
+        let WireFrame::Inspected {
+            result: inspected, ..
+        } = frame_from_proto(reply.into_inner()).unwrap()
+        else {
+            panic!("inspection required")
+        };
+        if !valid {
+            assert_eq!(inspected.unwrap_err().code, ErrorCode::PairingDenied);
+        } else {
+            let descriptor = inspected.unwrap();
+            if let WireFrame::Pair {
+                expected_host_id,
+                expected_workspace_id,
+                expected_descriptor_digest,
+                expected_workspace_root,
+                ..
+            } = &mut candidate
+            {
+                *expected_host_id = Some(descriptor.host_id);
+                *expected_workspace_id = Some(descriptor.workspace_id);
+                *expected_workspace_root = Some(descriptor.workspace_root);
+                *expected_descriptor_digest = Some("0".repeat(64));
+            }
+            let (tx, rx) = mpsc::channel(1);
+            tx.send(frame_to_proto(&candidate).unwrap()).await.unwrap();
+            let mut request = Request::new(ReceiverStream::new(rx));
+            request
+                .metadata_mut()
+                .insert("origin", ORIGIN.parse().unwrap());
+            let response = client.control(request).await.unwrap();
+            assert!(response.metadata().get(GRPC_EXECUTE_TOKEN_HEADER).is_none());
+            let first = response.into_inner().message().await.unwrap().unwrap();
+            assert!(
+                matches!(frame_from_proto(first).unwrap(), WireFrame::HandshakeRejected { error } if error.code == ErrorCode::BindingMismatch)
+            );
+        }
+        assert_eq!(
+            result(&mut client, &controller, read()).await["content"],
+            "still-live"
+        );
+    }
     server.abort();
     let _ = server.await;
 }

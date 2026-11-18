@@ -2,9 +2,7 @@
 use super::*;
 use microcrab_session::Journal;
 
-#[allow(dead_code)]
-#[path = "../../../../tests/support/typed_agent_fixture.rs"]
-mod typed_agent_fixture;
+use crate::manager::typed_agent_fixture;
 
 async fn create(manager: &Arc<Manager>) -> Arc<Managed> {
     let created = commands::create(
@@ -84,6 +82,7 @@ fn user_texts(managed: &Managed) -> Vec<String> {
             microcrab_transport::ContentItem::User {
                 source: None,
                 parts,
+                ..
             } => Some(
                 parts
                     .iter()

@@ -228,6 +228,7 @@ async fn actual_provider_switch_preserves_context_and_restores_selected_wire_mod
         subagent: Some("child".into()),
         system: "Child system".into(),
         items: vec![microcrab_transport::ContentItem::User {
+            envelope: None,
             source: None,
             parts: vec![microcrab_protocol::InputPart::Text {
                 text: "child input".into(),
@@ -657,6 +658,7 @@ async fn functional_issue_route_is_pinned_before_its_future_is_polled() {
         subagent: Some("rename".into()),
         system: "issued helper".into(),
         items: vec![microcrab_transport::ContentItem::User {
+            envelope: None,
             source: None,
             parts: vec![microcrab_protocol::InputPart::Text {
                 text: "begin".into(),

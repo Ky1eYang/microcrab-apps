@@ -75,6 +75,8 @@ pub enum SessionRuntimeEvent {
     ClientToolSettled(Value),
     #[serde(rename = "client_tool.cancel_requested")]
     ClientToolCancelRequested(Value),
+    #[serde(rename = "client_tools.lease_changed")]
+    ClientToolsLeaseChanged(Value),
     #[serde(rename = "audit.available")]
     AuditAvailable(Value),
     #[serde(rename = "child.display.available")]
@@ -134,6 +136,7 @@ impl SessionRuntimeEvent {
             Self::ClientToolPaused(..) => "client_tool.paused",
             Self::ClientToolSettled(..) => "client_tool.settled",
             Self::ClientToolCancelRequested(..) => "client_tool.cancel_requested",
+            Self::ClientToolsLeaseChanged(..) => "client_tools.lease_changed",
             Self::AuditAvailable(..) => "audit.available",
             Self::ChildDisplayAvailable(..) => "child.display.available",
             Self::ChildDisplayUnavailable(..) => "child.display.unavailable",
@@ -176,6 +179,7 @@ impl SessionRuntimeEvent {
             | ClientToolPaused(v)
             | ClientToolSettled(v)
             | ClientToolCancelRequested(v)
+            | ClientToolsLeaseChanged(v)
             | AuditAvailable(v)
             | ChildDisplayAvailable(v)
             | ChildDisplayUnavailable(v)

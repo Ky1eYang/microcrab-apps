@@ -112,6 +112,95 @@ fn stops(snapshot: &Value) -> Vec<&Value> {
 
 #[cfg(feature = "storage-file")]
 #[tokio::test]
+async fn bound_participant_can_answer_round_question_without_executor_lease() {
+    use microcrab_session::budget::{
+        ConfirmationKind, RoundLimitCallback, RoundLimitDecision, RoundLimitRequest,
+    };
+    let (manager, _) = manager(Arc::new(RoundModel(AtomicUsize::new(0))), "file").await;
+    let id = create(&manager).await;
+    let owner = Principal::for_test("owner");
+    let managed = manager
+        .active(manager.record("owner", &id).await.unwrap(), true)
+        .await
+        .unwrap();
+    let digest = managed.client_tools.snapshot().await.catalog_digest;
+    for (socket, client) in [("executor", "primary"), ("participant", "secondary")] {
+        let bound = managed
+            .client_tools
+            .bind(
+                socket,
+                &super::super::client_tools::BindRequest {
+                    client_id: client.into(),
+                    catalog_digest: digest.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bound.lease_id.is_some(), socket == "executor");
+    }
+    let mut subscription = managed.hub.subscribe();
+    let bridge = managed.round_limit.clone();
+    let session_id = id.clone();
+    let pending = tokio::spawn(async move {
+        bridge
+            .request(
+                RoundLimitRequest {
+                    session_id,
+                    epoch: 0,
+                    turn_id: 1,
+                    kind: ConfirmationKind::Rounds,
+                    used: 1,
+                    block: 1,
+                },
+                CancellationToken::new(),
+            )
+            .await
+    });
+    let requested = event(&mut subscription, "round_limit.requested").await;
+    let reply = command(
+        "round_limit.reply",
+        Some(&id),
+        json!({
+            "request_id":requested["request"]["request_id"], "decision":"stop"
+        }),
+    );
+    assert_eq!(
+        manager
+            .round_limit_reply(&owner, "observer", &reply)
+            .await
+            .unwrap_err()
+            .code,
+        "round_limit_participant_required"
+    );
+    let accepted = manager
+        .round_limit_reply(&owner, "participant", &reply)
+        .await
+        .unwrap();
+    assert_eq!(accepted["decision"], "stop");
+    assert_eq!(accepted["duplicate"], false);
+    assert_eq!(pending.await.unwrap().unwrap(), RoundLimitDecision::Stop);
+    let settled = event(&mut subscription, "round_limit.settled").await;
+    assert_eq!(settled["responder_socket"], "participant");
+    let duplicate = manager
+        .round_limit_reply(&owner, "executor", &reply)
+        .await
+        .unwrap();
+    assert_eq!(duplicate["decision"], "stop");
+    assert_eq!(duplicate["duplicate"], true);
+    managed.client_tools.detach("participant").await.unwrap();
+    assert_eq!(
+        manager
+            .round_limit_reply(&owner, "participant", &reply)
+            .await
+            .unwrap_err()
+            .code,
+        "round_limit_participant_required"
+    );
+    manager.close().await.unwrap();
+}
+
+#[cfg(feature = "storage-file")]
+#[tokio::test]
 async fn queued_stop_receipt_is_once_only_anchored_and_survives_reload_and_travel() {
     let model = Arc::new(RoundModel(AtomicUsize::new(0)));
     let (manager, _) = manager(model.clone(), "file").await;

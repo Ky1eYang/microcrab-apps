@@ -446,12 +446,11 @@ pub(super) async fn command(
     } else {
         ("settings", "user")
     };
-    if write.is_some() {
-        if let Some(id) = id {
-            if let Some(managed) = active(manager, id).await {
-                ensure_mutable(&managed)?;
-            }
-        }
+    if write.is_some()
+        && let Some(id) = id
+        && let Some(managed) = active(manager, id).await
+    {
+        ensure_mutable(&managed)?;
     }
     let mut application = "defaults_saved";
     let mut reason = None;
@@ -548,7 +547,7 @@ pub(super) async fn command(
                         .await;
                         if let Err(error) = publication {
                             return Err(quarantine(
-                                &managed,
+                                managed,
                                 stored.revision,
                                 &effective,
                                 "applied revision publication",
@@ -563,7 +562,7 @@ pub(super) async fn command(
                             || managed.faulted.load(std::sync::atomic::Ordering::Acquire)
                         {
                             return Err(quarantine(
-                                &managed,
+                                managed,
                                 stored.revision,
                                 &effective,
                                 "live application or metadata publication",
@@ -589,10 +588,10 @@ pub(super) async fn command(
             .map_err(configuration_error)?
     };
     let (mut effective, sources) = manager.effective_settings(owner, project, id).await?;
-    if let Some(id) = id {
-        if let Some(managed) = active(manager, id).await {
-            resolve_mode(&mut effective, &managed)?;
-        }
+    if let Some(id) = id
+        && let Some(managed) = active(manager, id).await
+    {
+        resolve_mode(&mut effective, &managed)?;
     }
     let desired = values(manager, &effective)?;
     let mut actual = if let Some(id) = id {

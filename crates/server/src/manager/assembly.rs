@@ -569,64 +569,69 @@ pub(super) async fn create_from(
         }
     }
     let child_client = routing.client(false);
-    let delegate = microcrab_creator::delegate::OwnedDelegateExecutor::new(
-        children.clone(),
-        Arc::new(
-            NativeChildFactory::new(NativeDelegateConfig {
-                children: children.clone(),
-                aggregate: aggregate.clone(),
-                client: child_client,
-                host: host.clone(),
-                wasm,
-                external: external
-                    .into_iter()
-                    .filter_map(|registration| match registration {
-                        ToolRegistration::External(tool) => Some(tool),
-                        _ => None,
-                    })
-                    .collect(),
-                catalog: catalog.clone(),
-                permissions,
-                limits: limits.clone(),
-                directory: directory.clone(),
-                disk: true,
-                system: None,
-                auditors: Some(Arc::new(AuditFactory {
-                    hub: hub.clone(),
-                    config: manager.config.clone(),
-                    owner: record.owner.clone(),
-                    root: record.id.clone(),
-                })),
-                journals: Some(Arc::new(JournalFactory {
-                    #[cfg(feature = "storage-sqlite")]
-                    owner: record.owner.clone(),
-                    #[cfg(feature = "storage-sqlite")]
-                    root: record.id.clone(),
-                    storage: manager.config.storage,
-                    #[cfg(feature = "storage-sqlite")]
-                    database: manager.config.data_dir.join("storage.sqlite"),
-                })),
-            })
-            .prompt_config(prompt_config.clone())
-            .with_child_configuration(Arc::new(super::settings::grants::Grants {
+    let child_factory = Arc::new(
+        NativeChildFactory::new(NativeDelegateConfig {
+            children: children.clone(),
+            aggregate: aggregate.clone(),
+            client: child_client,
+            host: host.clone(),
+            wasm,
+            external: external
+                .into_iter()
+                .filter_map(|registration| match registration {
+                    ToolRegistration::External(tool) => Some(tool),
+                    _ => None,
+                })
+                .collect(),
+            catalog: catalog.clone(),
+            permissions,
+            limits: limits.clone(),
+            directory: directory.clone(),
+            disk: true,
+            system: None,
+            auditors: Some(Arc::new(AuditFactory {
+                hub: hub.clone(),
+                config: manager.config.clone(),
+                owner: record.owner.clone(),
+                root: record.id.clone(),
+            })),
+            journals: Some(Arc::new(JournalFactory {
+                restore: false,
+                #[cfg(feature = "storage-sqlite")]
+                owner: record.owner.clone(),
+                #[cfg(feature = "storage-sqlite")]
+                root: record.id.clone(),
+                storage: manager.config.storage,
+                #[cfg(feature = "storage-sqlite")]
+                database: manager.config.data_dir.join("storage.sqlite"),
+            })),
+        })
+        .prompt_config(prompt_config.clone())
+        .with_child_configuration(Arc::new(InteractionChildConfiguration {
+            grants: super::settings::grants::Grants {
                 owner: record.owner.clone(),
                 storage: manager.configuration.clone(),
                 directory: manager.directory.clone(),
                 manager: manager.self_ref.clone(),
-            }))
-            .with_external_source(Arc::new(ClientToolSource(client_tools.clone())))
-            .with_permission_adapter(permission_ask.clone())
-            .with_round_limit_callback(round_limit.clone())
-            .with_attachment_resolver(attachments.clone())
-            .with_display_factory(Arc::new(super::display::ChildDisplay::new(
-                manager.config.clone(),
-                record.owner.clone(),
-                record.id.clone(),
-                routing.clone(),
-                hub.clone(),
-                manager.child_journals.clone(),
-            ))),
-        ),
+            },
+            tools: client_tools.clone(),
+        }))
+        .with_external_source(Arc::new(ClientToolSource(client_tools.clone())))
+        .with_permission_adapter(permission_ask.clone())
+        .with_round_limit_callback(round_limit.clone())
+        .with_attachment_resolver(attachments.clone())
+        .with_display_factory(Arc::new(super::display::ChildDisplay::new(
+            manager.config.clone(),
+            record.owner.clone(),
+            record.id.clone(),
+            routing.clone(),
+            hub.clone(),
+            manager.child_journals.clone(),
+        ))),
+    );
+    let delegate = microcrab_creator::delegate::OwnedDelegateExecutor::new(
+        children.clone(),
+        child_factory.clone(),
     );
     let runtime = runtime.with_delegate_executor(Arc::new(delegate));
     let main_client = routing.client(true);
@@ -708,6 +713,7 @@ pub(super) async fn create_from(
         }
         .restore(&session)
         .await?;
+        client_tools.install_secret_state(&session).await?;
         Ok::<Session, Error>(session)
     }
     .await;
@@ -741,6 +747,12 @@ pub(super) async fn create_from(
         .cloned();
     if select_initial_mode
         && session.state().agent_initialization_pending
+        && super::agent_init::requires_deferred_start(
+            record.project_id.is_none()
+                && manager.conversation_flavors.get(&record.owner, &record.id)
+                    == Some(super::conversation_flavors::HostFlavor::ChatOnly),
+            record.initialization,
+        )
         && let Some(slot) = &slot
     {
         slot.initialization_deferred.store(true, Ordering::Release);
@@ -774,6 +786,8 @@ pub(super) async fn create_from(
         record: Mutex::new(record.clone()),
         commands: Mutex::new(()),
         worker: Mutex::new(None),
+        child_drivers: Mutex::new(tokio::task::JoinSet::new()),
+        child_factory,
         tool_task_events: Mutex::new(None),
         naming: Mutex::new(None),
         auto_naming: AtomicBool::new(
@@ -805,6 +819,7 @@ pub(super) async fn create_from(
     // The Context watch follows admitted input, validated replies and real tool
     // results. Streaming observations remain advisory and never enter snapshots.
     let mut conversation_changes = managed.session.context_measurement_changes();
+    let mut executor_changes = managed.client_tools.executor_changes();
     let mut turn_events = managed.hub.subscribe().receiver;
     let task_hub = managed.hub.clone();
     let task_close = managed.close_token.clone();
@@ -837,6 +852,14 @@ pub(super) async fn create_from(
                 }
                 changed = inbox_activity.changed() => {
                     if changed.is_err() { break; }
+                }
+                changed = executor_changes.changed() => {
+                    if changed.is_err() { break; }
+                    let executor_connected = executor_changes.borrow_and_update().is_some();
+                    task_hub.publish(super::SessionRuntimeEvent::ClientToolsLeaseChanged(
+                        serde_json::json!({"executor_connected": executor_connected}),
+                    ));
+                    continue;
                 }
                 changed = conversation_changes.changed() => {
                     if changed.is_err() { break; }
@@ -998,7 +1021,47 @@ impl microcrab_creator::delegate::ExternalToolSource for ClientToolSource {
     }
 }
 
+struct InteractionChildConfiguration {
+    grants: super::settings::grants::Grants,
+    tools: Arc<super::client_tools::ClientTools>,
+}
+#[async_trait::async_trait]
+impl microcrab_creator::delegate::ChildConfiguration for InteractionChildConfiguration {
+    async fn apply(&self, child: &Session) -> Result<(), Error> {
+        self.grants.restore(child).await?;
+        self.tools.install_secret_state(child).await
+    }
+}
+
+pub(super) async fn restore_child(
+    manager: &Manager,
+    parent: &Managed,
+    directory: &Path,
+    id: &str,
+) -> Result<Session, Error> {
+    let record = parent.record.lock().await.clone();
+    let factory = JournalFactory {
+        restore: true,
+        storage: manager.config.storage,
+        #[cfg(feature = "storage-sqlite")]
+        owner: record.owner,
+        #[cfg(feature = "storage-sqlite")]
+        root: record.id,
+        #[cfg(feature = "storage-sqlite")]
+        database: manager.config.data_dir.join("storage.sqlite"),
+    };
+    // Register the exact existing owner/root/child audit scope through the same port.
+    // Opening this Journal does not allocate a child directory or record.
+    let journal = factory.open(directory, id).await?;
+    let child = parent
+        .child_factory
+        .restore_child(&parent.session, directory, journal)
+        .await?;
+    Ok(child.session)
+}
+
 struct JournalFactory {
+    restore: bool,
     storage: Storage,
     #[cfg(feature = "storage-sqlite")]
     owner: String,
@@ -1044,7 +1107,7 @@ impl ChildJournalFactory for JournalFactory {
                             .ok_or_else(|| Error::config("child path is not UTF8"))?,
                         session_id.into(),
                         true,
-                        false,
+                        self.restore,
                     )
                     .await?
                     .0)
@@ -1071,9 +1134,13 @@ impl ChildJournalFactory for JournalFactory {
                         .await
                         .map_err(|_| Error::audit("child scope worker failed"))??;
                     Ok(
-                        CreatorJournal::open_sqlite(&self.database, session_id.into(), false)
-                            .await?
-                            .0,
+                        CreatorJournal::open_sqlite(
+                            &self.database,
+                            session_id.into(),
+                            self.restore,
+                        )
+                        .await?
+                        .0,
                     )
                 }
                 #[cfg(not(feature = "storage-sqlite"))]

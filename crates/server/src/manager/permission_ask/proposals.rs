@@ -9,11 +9,8 @@ impl PermissionAsk {
         let id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         let deadline = Instant::now() + PROPOSAL_TIMEOUT;
-        let mut changes = self.tools.executor_changes();
-        let lease = self
-            .tools
-            .with_executor(|executor| {
-                let (socket, lease) = executor.ok_or(PermissionError::Unavailable)?;
+        self.tools
+            .with_interaction_audience(|_connected| {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.closed
                     || state.proposals.len() + state.proposal_committing.len() >= MAX_PENDING
@@ -32,8 +29,6 @@ impl PermissionAsk {
                     id.clone(),
                     PendingProposal {
                         proposal: proposal.clone(),
-                        socket: socket.into(),
-                        lease: lease.into(),
                         deadline,
                         sender,
                         adoption,
@@ -44,25 +39,14 @@ impl PermissionAsk {
                         json!({"proposal":proposal}),
                     ),
                 );
-                Ok((socket.to_owned(), lease.to_owned()))
+                Ok(())
             })
             .await?;
         let _retire = ProposalRetire {
             bridge: self,
             id: id.clone(),
         };
-        let revoked = async {
-            loop {
-                if changes.borrow_and_update().as_ref() != Some(&lease) {
-                    break;
-                }
-                if changes.changed().await.is_err() {
-                    break;
-                }
-            }
-        };
         tokio::select! {biased;
-            _=revoked=>{self.retire_proposal(&id,"declined","executor_disconnected");Err(PermissionError::Unavailable)},
             _=tokio::time::sleep_until(deadline)=>{self.retire_proposal(&id,"expired","confirmation deadline exceeded");Ok(())},
             _=receiver=>Ok(()),
         }
@@ -70,15 +54,20 @@ impl PermissionAsk {
     fn retire_proposal(&self, id: &str, status: &str, reason: &str) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pending) = state.proposals.remove(id) {
-            let result = json!({"proposal_id":id,"session_id":pending.proposal.grant.session_id,"status":status,"reason":reason,"remembered":false,"duplicate":false,"revision":null});
+            let mut result = json!({"proposal_id":id,"session_id":pending.proposal.grant.session_id,"status":status,"reason":reason,"remembered":false,"duplicate":false,"revision":null});
+            if let Err(error) = self
+                .tools
+                .record_decision("permission_proposal", id, &result)
+            {
+                result["status"] = json!("outcome_unavailable");
+                result["durable"] = json!(false);
+                result["cause"] = json!(error.diagnostic_reason());
+            }
             self.hub.publish(
                 crate::manager::SessionRuntimeEvent::PermissionProposalSettled(result.clone()),
             );
             state.proposal_receipts.push_back(ProposalReceipt {
                 id: id.into(),
-                socket: pending.socket,
-                lease: pending.lease,
-                accept: false,
                 result,
             });
             while state.proposal_receipts.len() > MAX_SETTLED {
@@ -96,15 +85,15 @@ impl PermissionAsk {
             Pending(PendingProposal),
             Duplicate(Value),
         }
-        let accepted=self.tools.with_executor(|executor| {
-            if executor!=Some((socket,reply.lease_id.as_str())) {return Err(WireError::new("permission_executor_required","Current executor lease required"));}
+        let accepted=self.tools.with_participant(socket, |participant| {
+            if !participant {return Err(WireError::new("permission_participant_required","A bound owner participant is required"));}
             let mut state=self.state.lock().unwrap_or_else(|e|e.into_inner());
-            if let Some(receipt)=state.proposal_receipts.iter().chain(state.proposal_committing.values()).find(|r|r.id==reply.proposal_id&&r.socket==socket&&r.lease==reply.lease_id&&r.accept==reply.accept) {return Ok(Accepted::Duplicate(receipt.result.clone()));}
+            if let Some(receipt)=state.proposal_receipts.iter().chain(state.proposal_committing.values()).find(|r|r.id==reply.proposal_id) {return Ok(Accepted::Duplicate(receipt.result.clone()));}
+            if let Some(receipt)=self.tools.decision("permission_proposal", &reply.proposal_id) { return Ok(Accepted::Duplicate(receipt)); }
             let pending=state.proposals.get(&reply.proposal_id).ok_or_else(||WireError::new("permission_proposal_settled","Proposal is absent or settled"))?;
-            if state.closed||pending.socket!=socket||pending.lease!=reply.lease_id||Instant::now()>=pending.deadline {return Err(WireError::new("permission_proposal_settled","Proposal expired, closed or belongs to a revoked executor"));}
+            if state.closed||Instant::now()>=pending.deadline {return Err(WireError::new("permission_proposal_settled","Proposal expired, closed or belongs to a revoked executor"));}
             let pending=state.proposals.remove(&reply.proposal_id).ok_or_else(||WireError::new("permission_proposal_settled","Proposal already settled"))?;
-            state.proposal_committing.insert(reply.proposal_id.clone(),ProposalReceipt {id:reply.proposal_id.clone(),socket:socket.into(),lease:reply.lease_id.clone(),accept:reply.accept,
-                result:json!({"proposal_id":reply.proposal_id,"session_id":pending.proposal.grant.session_id,"status":"persisting","reason":"Future grant confirmation accepted; persistence pending","remembered":false,"revision":null,"duplicate":false})});
+            state.proposal_committing.insert(reply.proposal_id.clone(),ProposalReceipt {id:reply.proposal_id.clone(),                result:json!({"proposal_id":reply.proposal_id,"session_id":pending.proposal.grant.session_id,"status":"persisting","reason":"Future grant confirmation accepted; persistence pending","remembered":false,"revision":null,"duplicate":false})});
             Ok(Accepted::Pending(pending))
         }).await?;
         let pending = match accepted {
@@ -137,15 +126,30 @@ impl PermissionAsk {
             } else {
                 ("declined", String::from("User declined future grant"), None)
             };
-            let result = json!({"proposal_id":reply.proposal_id,"session_id":pending.proposal.grant.session_id,"status":status,"reason":reason,"remembered":status=="accepted","revision":revision,"duplicate":false});
+            let result = json!({"proposal_id":reply.proposal_id,"session_id":pending.proposal.grant.session_id,"status":status,"reason":reason,"responder_socket":socket,"remembered":status=="accepted","revision":revision,"duplicate":false});
+            if let Err(error) =
+                bridge
+                    .tools
+                    .record_decision("permission_proposal", &reply.proposal_id, &result)
+            {
+                let unknown = json!({"proposal_id":reply.proposal_id,"status":"outcome_unknown","remembered":false,"reason":"Adoption outcome receipt was not acknowledged; observe the original proposal","cause":error.diagnostic_reason()});
+                if let Some(receipt) = bridge
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .proposal_committing
+                    .get_mut(&reply.proposal_id)
+                {
+                    receipt.result = unknown.clone();
+                }
+                let _ = sender.send(unknown);
+                return;
+            }
             {
                 let mut state = bridge.state.lock().unwrap_or_else(|e| e.into_inner());
                 state.proposal_committing.remove(&reply.proposal_id);
                 state.proposal_receipts.push_back(ProposalReceipt {
                     id: reply.proposal_id,
-                    socket,
-                    lease: reply.lease_id,
-                    accept: reply.accept,
                     result: result.clone(),
                 });
                 while state.proposal_receipts.len() > MAX_SETTLED {

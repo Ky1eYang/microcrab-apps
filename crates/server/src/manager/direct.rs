@@ -5,6 +5,7 @@
 mod credentials;
 mod diagnostics;
 pub(crate) mod outbound;
+mod preflight;
 pub(super) use diagnostics::Correlation;
 use diagnostics::StopReason;
 use tracing::{Instrument, instrument::WithSubscriber};
@@ -31,6 +32,11 @@ pub(super) struct Hosts {
     entries: Mutex<HashMap<String, Arc<AsyncMutex<Connection>>>>,
     persistence: AsyncMutex<()>,
     outbound: outbound::Attempts,
+    #[expect(
+        clippy::type_complexity,
+        reason = "Owner and workspace identities jointly scope the existing weak admission registry"
+    )]
+    workspace_admission: Mutex<HashMap<(String, String), std::sync::Weak<AsyncMutex<()>>>>,
 }
 #[derive(Default)]
 struct Connection {
@@ -155,6 +161,48 @@ fn classify(value: &str) -> Result<Carrier, WireError> {
     }
 }
 impl Hosts {
+    // Two canonical identity keys preserve the existing workspace-ID OR root rule.
+    // Weak entries are reclaimed on the next admission; no carrier is shared.
+    async fn admit_workspace(
+        &self,
+        owner: &str,
+        descriptor: &HostDescriptor,
+    ) -> Vec<tokio::sync::OwnedMutexGuard<()>> {
+        let mut keys = vec![
+            (
+                owner.to_owned(),
+                format!("{}:id:{}", descriptor.host_id, descriptor.workspace_id),
+            ),
+            (
+                owner.to_owned(),
+                format!("{}:root:{}", descriptor.host_id, descriptor.workspace_root),
+            ),
+        ];
+        keys.sort();
+        let gates = {
+            let mut entries = self
+                .workspace_admission
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            entries.retain(|_, gate| gate.strong_count() > 0);
+            keys.into_iter()
+                .map(|key| {
+                    if let Some(gate) = entries.get(&key).and_then(std::sync::Weak::upgrade) {
+                        gate
+                    } else {
+                        let gate = Arc::new(AsyncMutex::new(()));
+                        entries.insert(key, Arc::downgrade(&gate));
+                        gate
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut guards = Vec::with_capacity(gates.len());
+        for gate in gates {
+            guards.push(gate.lock_owned().await);
+        }
+        guards
+    }
     fn entry(&self, project: &str) -> Arc<AsyncMutex<Connection>> {
         self.entries
             .lock()
@@ -178,7 +226,11 @@ struct AcceptedHello {
 fn accept_hello(
     hello: HostFrame,
     pin: Option<&microcrab_storage::execution::ProjectBinding>,
+    inspected: &HostDescriptor,
 ) -> Result<AcceptedHello, WireError> {
+    if let HostFrame::HandshakeRejected { error } = hello {
+        return Err(preflight::rejection(error));
+    }
     let HostFrame::Hello {
         descriptor,
         credential,
@@ -187,28 +239,7 @@ fn accept_hello(
     else {
         return Err(failure("Native Host must return authenticated Hello"));
     };
-    if descriptor.protocol_version != microcrab_host_protocol::PROTOCOL_VERSION
-        || microcrab_host_protocol::descriptor_fingerprint(&descriptor)
-            .map_err(|_| failure("Host descriptor cannot be fingerprinted"))?
-            != descriptor.descriptor_digest
-    {
-        return Err(failure(
-            "Native Host descriptor fingerprint or protocol version differs",
-        ));
-    }
-    if let Some(pin) = pin {
-        if descriptor.host_id != pin.host_id
-            || descriptor.workspace_id != pin.workspace_id
-            || descriptor.workspace_root != pin.workspace_root
-            || !microcrab_host_protocol::descriptor_matches_pin(&descriptor, &pin.descriptor_digest)
-                .map_err(|_| failure("Native Host descriptor digest is invalid"))?
-        {
-            return Err(WireError::new(
-                "binding_mismatch",
-                "Native Host identity or descriptor differs from the immutable Project pin",
-            ));
-        }
-    }
+    preflight::validate_hello(&descriptor, pin, inspected)?;
     Ok(AcceptedHello {
         descriptor,
         credential,
@@ -221,20 +252,20 @@ async fn retire_connection(connection: &mut Connection) {
     if let Some(stop) = connection.stop.take() {
         stop.cancel();
     }
-    if let Some(worker) = connection.worker.take() {
-        if let Err(error) = worker.await {
-            let error_code = if error.is_cancelled() {
-                "worker_cancelled"
-            } else {
-                "worker_panicked"
-            };
-            tracing::warn!(
-                error_code,
-                "Native Host worker could not complete retirement"
-            );
-            if let Some(diagnostics) = &connection.diagnostics {
-                diagnostics.stopped(StopReason::StopCancelled, error_code);
-            }
+    if let Some(worker) = connection.worker.take()
+        && let Err(error) = worker.await
+    {
+        let error_code = if error.is_cancelled() {
+            "worker_cancelled"
+        } else {
+            "worker_panicked"
+        };
+        tracing::warn!(
+            error_code,
+            "Native Host worker could not complete retirement"
+        );
+        if let Some(diagnostics) = &connection.diagnostics {
+            diagnostics.stopped(StopReason::StopCancelled, error_code);
         }
     }
 }
@@ -256,12 +287,16 @@ impl Drop for RelayGuard<'_> {
     }
 }
 fn clear_relay(relay: &Mutex<Option<RelayBytes>>, id: uuid::Uuid) {
-    if let Ok(mut guard) = relay.lock() {
-        if guard.as_ref().is_some_and(|item| item.id == id) {
-            *guard = None;
-        }
+    if let Ok(mut guard) = relay.lock()
+        && guard.as_ref().is_some_and(|item| item.id == id)
+    {
+        *guard = None;
     }
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The relay worker retains explicit authenticated route identities and independent carrier ownership ports"
+)]
 fn spawn_relay_worker(
     outbound_bytes: mpsc::Sender<Vec<u8>>,
     mut inbound_bytes: mpsc::Receiver<Vec<u8>>,
@@ -439,32 +474,48 @@ impl Manager {
         force: bool,
     ) -> Result<Value, WireError> {
         let saved = self.matching_credential(principal, &params, &url).await?;
-        if !force && params.token.as_ref().is_none_or(|token| token.is_empty()) && saved.is_some() {
-            if let Some(mut state) = self
+        if !force
+            && params.token.as_ref().is_none_or(|token| token.is_empty())
+            && saved.is_some()
+            && let Some(mut state) = self
                 .observe_direct_route(principal, &params.project_id)
                 .await?
+        {
+            state["transport"] = json!(if self
+                .routes
+                .lock()
+                .await
+                .get(&params.project_id)
+                .is_some_and(|route| route.socket.starts_with("direct:wss:"))
             {
-                state["transport"] = json!(if self
-                    .routes
-                    .lock()
-                    .await
-                    .get(&params.project_id)
-                    .is_some_and(|route| route.socket.starts_with("direct:wss:"))
-                {
-                    "outbound_wss"
-                } else {
-                    "grpc"
-                });
-                if let Some(diagnostics) = &connection.diagnostics {
-                    diagnostics.connect("observe_existing", false, force);
-                }
-                return Ok(state);
+                "outbound_wss"
+            } else {
+                "grpc"
+            });
+            if let Some(diagnostics) = &connection.diagnostics {
+                diagnostics.connect("observe_existing", false, force);
             }
+            return Ok(state);
         }
-        let (handshake, pin) = self.handshake(principal, &params, saved.as_ref()).await?;
+        let (mut handshake, pin) = self.handshake(principal, &params, saved.as_ref()).await?;
         let origin = server_origin(&self.config.auth.redirect_uri)?;
-        let (link, hello) = grpc::dial(&url, &origin, &handshake).await?;
-        let accepted = accept_hello(hello, pin.as_ref())?;
+        let mut client = grpc::connect(&url).await?;
+        let (request_id, inspect) = preflight::inspect(&handshake)?;
+        let reply = grpc::inspect(&mut client, &origin, &inspect).await?;
+        let descriptor = preflight::accept(reply, &request_id, pin.as_ref())?;
+        let _workspace = self
+            .direct_hosts
+            .admit_workspace(&principal.owner, &descriptor)
+            .await;
+        if let Some(existing) = self
+            .preflight_candidate(principal, &params, &descriptor)
+            .await?
+        {
+            return Ok(existing);
+        }
+        preflight::guard(&mut handshake, &descriptor)?;
+        let (link, hello) = grpc::dial(client, &origin, &handshake).await?;
+        let accepted = accept_hello(hello, pin.as_ref(), &descriptor)?;
         self.save_direct_credential(
             &params.project_id,
             Some(Credential {
@@ -512,6 +563,10 @@ impl Manager {
     }
     /// Browser relay. The server emits Pair or Resume on the caller's socket and
     /// never dials the loopback bridge. Closing that socket drops the relay.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Relay attachment keeps the authenticated socket, byte ports and exact relay identity explicit"
+    )]
     pub(crate) async fn attach_client_relay(
         &self,
         principal: &Principal,
@@ -538,27 +593,25 @@ impl Manager {
         let mut connection = entry.lock().await;
         connection.pending_outbound = None;
         let saved = self.matching_credential(principal, &params, &url).await?;
-        let (handshake, pin) = self.handshake(principal, &params, saved.as_ref()).await?;
-        let bytes = encode_frame(&handshake)
-            .map_err(|error| failure(format!("Cannot encode Host handshake: {}", error.message)))?;
-        if bytes.len() > MAX_FRAME_BYTES {
-            return Err(failure("Host handshake exceeds the protocol byte limit"));
+        let (mut handshake, pin) = self.handshake(principal, &params, saved.as_ref()).await?;
+        let (request_id, inspect) = preflight::inspect(&handshake)?;
+        let reply =
+            preflight::relay_exchange(&outbound_bytes, &mut inbound_bytes, &inspect).await?;
+        let descriptor = preflight::accept(reply, &request_id, pin.as_ref())?;
+        let _workspace = self
+            .direct_hosts
+            .admit_workspace(&principal.owner, &descriptor)
+            .await;
+        if let Some(existing) = self
+            .preflight_candidate(principal, &params, &descriptor)
+            .await?
+        {
+            return Ok(existing);
         }
-        tokio::time::timeout(Duration::from_secs(10), outbound_bytes.send(bytes))
-            .await
-            .map_err(|_| failure("Host relay handshake exceeded 10 seconds"))?
-            .map_err(|_| failure("Host relay disconnected while sending handshake"))?;
-        let hello_bytes = tokio::time::timeout(Duration::from_secs(10), inbound_bytes.recv())
-            .await
-            .map_err(|_| failure("Host relay handshake exceeded 10 seconds"))?
-            .ok_or_else(|| failure("Host relay closed before authenticated Hello"))?;
-        let hello = decode_frame(&hello_bytes).map_err(|error| {
-            failure(format!(
-                "Host relay returned an invalid handshake frame: {}",
-                error.message
-            ))
-        })?;
-        let accepted = accept_hello(hello, pin.as_ref())?;
+        preflight::guard(&mut handshake, &descriptor)?;
+        let hello =
+            preflight::relay_exchange(&outbound_bytes, &mut inbound_bytes, &handshake).await?;
+        let accepted = accept_hello(hello, pin.as_ref(), &descriptor)?;
         self.save_direct_credential(
             &params.project_id,
             Some(Credential {
@@ -743,6 +796,8 @@ impl Manager {
                 directory: params.directory.clone(),
                 expected_host_id,
                 expected_workspace_id,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
             }
         } else if let Some(saved) = saved {
             HostFrame::Resume {
@@ -751,6 +806,8 @@ impl Manager {
                 directory: params.directory.clone(),
                 expected_host_id,
                 expected_workspace_id,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
             }
         } else {
             HostFrame::Pair {
@@ -759,10 +816,16 @@ impl Manager {
                 directory: params.directory.clone(),
                 expected_host_id,
                 expected_workspace_id,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
             }
         };
         Ok((frame, pin))
     }
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Carrier publication transfers the existing route, cleanup and immutable identity witnesses together"
+    )]
     async fn publish_carrier(
         &self,
         principal: &Principal,
@@ -871,15 +934,13 @@ impl Manager {
                 .await
                 .is_ok_and(|result| result.is_ok());
             }
-            if detach_sent {
-                if let Some(worker) = connection.worker.as_mut() {
-                    if tokio::time::timeout(Duration::from_secs(3), worker)
-                        .await
-                        .is_ok()
-                    {
-                        connection.worker.take();
-                    }
-                }
+            if detach_sent
+                && let Some(worker) = connection.worker.as_mut()
+                && tokio::time::timeout(Duration::from_secs(3), worker)
+                    .await
+                    .is_ok()
+            {
+                connection.worker.take();
             }
         }
         connection.detach = None;

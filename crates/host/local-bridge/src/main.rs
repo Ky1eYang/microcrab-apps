@@ -217,7 +217,7 @@ async fn run(
             #[cfg(not(feature = "ws"))]
             let _ = (ws_listener, ws_bridge, ws_origin);
             std::future::pending::<Result<(), String>>().await
-        } => result.map_err(|error| std::io::Error::other(error))?,
+        } => result.map_err(std::io::Error::other)?,
         result = async move {
             #[cfg(feature = "grpc")]
             if let Some(listener) = grpc_listener {
@@ -226,7 +226,7 @@ async fn run(
             #[cfg(not(feature = "grpc"))]
             let _ = (grpc_listener, grpc_bridge, grpc_origin);
             std::future::pending::<Result<(), String>>().await
-        } => result.map_err(|error| std::io::Error::other(error))?,
+        } => result.map_err(std::io::Error::other)?,
     }
     Ok(())
 }

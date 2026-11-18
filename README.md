@@ -1,8 +1,8 @@
 # microcrab-client
 
 Application hosts for the [microcrab core runtime](https://github.com/Ky1eYang/microcrab-core).
-The current Rust workspace contains an authenticated HTTP/WebSocket server and a
-local Host bridge. Future desktop and terminal applications belong in this layer.
+The Rust workspace contains an authenticated HTTP/WebSocket server and a local
+Host bridge.
 
 ## Layout
 
@@ -13,7 +13,7 @@ local Host bridge. Future desktop and terminal applications belong in this layer
 - [`dev`](dev): source-only integration and browser acceptance tooling.
 
 Core packages are Git dependencies from the same repository and revision. The
-committed lockfile pins their resolved source. APIs may change before v1.0.
+committed lockfile pins their resolved source.
 
 ## Development
 
@@ -55,6 +55,15 @@ file. Legacy `.microcrab/config.json` is considered only when the default JSONC
 file is absent. The optional external TOML provider catalog is a distinct advanced
 input; it is not the Server startup configuration. Each native Project requires
 authenticated Host attachment.
+
+Native Host attachment requires a Bridge that supports authenticated descriptor
+preflight. Keep the Bridge and Server compatible. Each Project pins its Host
+identity and capabilities. For a mismatch, connect a compatible Host or use a
+different workspace. Selecting the same Host workspace follows duplicate
+Project detection. Deleting a Project also deletes its Sessions.
+
+See [Chat Host flavors](docs/chat-host-flavors.md) for the browser conversation
+binding and attachment contract.
 
 Optional acceptance tooling uses `npm install` and
 `python -m pip install -r dev/requirements.txt`. Its browser fixtures require

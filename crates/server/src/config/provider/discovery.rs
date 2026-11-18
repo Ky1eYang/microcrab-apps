@@ -123,6 +123,7 @@ fn parse_page(bytes: &[u8]) -> Result<(BTreeMap<String, ModelMeta>, Option<Strin
         models.insert(
             id.clone(),
             ModelMeta {
+                google_function_response_media: false,
                 protocol: None,
                 endpoint: None,
                 auth: None,
@@ -172,6 +173,7 @@ fn parse_data_page(
         models.insert(
             model.id.clone(),
             ModelMeta {
+                google_function_response_media: false,
                 protocol: None,
                 endpoint: None,
                 auth: None,
@@ -417,6 +419,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let provider = Provider {
+            google_function_response_media: false,
             protocol: microcrab_transport::Protocol::Google,
             auth: microcrab_transport::AuthMode::Native,
             endpoint: base.clone(),
@@ -476,6 +479,7 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             });
             let provider = Provider {
+                google_function_response_media: false,
                 protocol: microcrab_transport::Protocol::Google,
                 auth: microcrab_transport::AuthMode::Native,
                 endpoint,
@@ -514,6 +518,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
         let provider = Provider {
+            google_function_response_media: false,
             protocol: microcrab_transport::Protocol::Google,
             auth: microcrab_transport::AuthMode::Native,
             endpoint,
@@ -532,6 +537,7 @@ mod tests {
 
     fn provider(protocol: Protocol, endpoint: String) -> Provider {
         Provider {
+            google_function_response_media: false,
             protocol,
             auth: microcrab_transport::AuthMode::Native,
             endpoint,

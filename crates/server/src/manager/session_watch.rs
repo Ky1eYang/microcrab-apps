@@ -186,6 +186,9 @@ pub(crate) struct WatchedDirectory {
 }
 #[async_trait]
 impl Directory for WatchedDirectory {
+    async fn session_owner(&self, id: &str) -> Result<Option<String>, Error> {
+        self.inner.session_owner(id).await
+    }
     async fn unavailable_unowned_count(&self) -> Result<usize, Error> {
         self.inner.unavailable_unowned_count().await
     }

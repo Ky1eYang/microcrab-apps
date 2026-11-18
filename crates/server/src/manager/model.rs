@@ -1,4 +1,6 @@
 pub(super) mod admission;
+#[cfg(all(test, feature = "storage-file"))]
+mod media_tests;
 // Session-local provider routing. Manager owns mutation under its command gate;
 // requests retain an immutable target before awaiting so retries never change it.
 use super::{Managed, Manager, hub::Hub};
@@ -389,6 +391,9 @@ pub(super) async fn target(
         "variant": resolved.options.reasoning_effort,
         "projection": "state-first-neutral-v1",
     });
+    if resolved.provider.google_function_response_media {
+        route["google_function_response_media"] = serde_json::json!(true);
+    }
     if selection.provider_id.starts_with("user:") {
         route["owner"] = serde_json::json!(owner);
         route["provider_id"] = serde_json::json!(selection.provider_id);
@@ -408,6 +413,7 @@ pub(super) async fn target(
         resolved.provider.client_transport_config(),
         retry_policy(resolved.provider.timeout_ms),
     )?
+    .with_function_response_media(resolved.provider.google_function_response_media)
     .with_request_options(resolved.options)?;
     let recordable = manager.client_override.is_none().then(|| client.clone());
     let child = manager

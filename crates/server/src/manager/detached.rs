@@ -466,6 +466,12 @@ impl Manager {
             &self.config.provider.model,
             if record.archived { "closed" } else { "idle" },
         );
+        view::communication_identity(
+            &mut session,
+            recover
+                .and_then(|recover| recover.state.communication.as_ref())
+                .map(|communication| &communication.identity),
+        );
         if let Some(kind) = recover.and_then(|recover| recover.state.session_kind.as_ref()) {
             session["kind"] = json!(kind);
         }

@@ -92,12 +92,47 @@ pub(super) fn session(
     status: &str,
 ) -> Value {
     let mut value = base_session(record, legacy_model, status);
-    if record.project_id.is_none() {
-        if let Some(flavor) = manager.conversation_flavors.get(&record.owner, &record.id) {
-            value["host_flavor"] = json!(flavor);
-        }
+    communication_identity(&mut value, None);
+    let slot = manager
+        .registry
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&record.id)
+        .cloned();
+    if let Some(slot) = slot
+        && let Ok(active) = slot.active.try_lock()
+        && let Some(managed) = active.as_ref()
+    {
+        let _ = communication_session(&mut value, &managed.session, None);
+    }
+    if record.project_id.is_none()
+        && let Some(flavor) = manager.conversation_flavors.get(&record.owner, &record.id)
+    {
+        value["host_flavor"] = json!(flavor);
     }
     value
+}
+pub(super) fn communication_identity(
+    value: &mut Value,
+    identity: Option<&microcrab_session::state::communication::ConversationIdentity>,
+) {
+    value["agent_id"] = json!(identity.map(|identity| identity.agent_id.as_str()));
+    value["depth"] = json!(identity.map(|identity| identity.depth));
+    value["interaction"] = json!(identity.map(|identity| identity.interaction));
+    value["parent_session_id"] =
+        json!(identity.and_then(|identity| identity.parent_session_id.as_deref()));
+    value["current_role"] = Value::Null;
+    value["accepts_user_input"] = json!(false);
+}
+pub(super) fn communication_session(
+    value: &mut Value,
+    session: &microcrab_session::Session,
+    targeted: Option<bool>,
+) -> Result<(), Error> {
+    communication_identity(value, session.communication_identity().as_ref());
+    value["current_role"] = json!(session.current_agent_role()?);
+    value["accepts_user_input"] = json!(targeted.unwrap_or_else(|| session.accepts_user_input()));
+    Ok(())
 }
 fn base_session(record: &SessionRecord, legacy_model: &str, status: &str) -> Value {
     let model = record
@@ -235,7 +270,7 @@ pub(super) fn messages(items: Vec<ContentItem>, epoch: u64, session_id: &str) ->
         };
         let mut message = match item {
             ContentItem::State(_) => unreachable!("State frames are projected above"),
-            ContentItem::User { parts, source } => {
+            ContentItem::User { parts, source, .. } => {
                 let text = parts
                     .iter()
                     .filter_map(|part| match part {
@@ -292,7 +327,22 @@ pub(super) fn messages(items: Vec<ContentItem>, epoch: u64, session_id: &str) ->
                     .collect();
                 json!({"id":id,"role":"assistant","text":content,"parts":[],"tool_calls":tool_calls,"position":scope})
             }
-            ContentItem::Tool { call_id, content } => {
+            ContentItem::Tool {
+                call_id,
+                content,
+                parts,
+            } => {
+                let images_omitted = parts.iter().any(|part| matches!(part,microcrab_protocol::InputPart::Image {source} if !super::images::available(source)));
+                let image_parts: Vec<_> = parts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, part)| match part {
+                        microcrab_protocol::InputPart::Image { source } => {
+                            Some(super::images::reference(session_id, &id, index, source))
+                        }
+                        _ => None,
+                    })
+                    .collect();
                 let call = calls.get(&call_id);
                 let builtin = call
                     .filter(|(name, _)| {
@@ -302,7 +352,7 @@ pub(super) fn messages(items: Vec<ContentItem>, epoch: u64, session_id: &str) ->
                         )
                     })
                     .map(|_| "delegate");
-                json!({"id":id,"role":"tool","text":content,"parts":[],"tool_calls":[],"tool_name":call.map(|c| &c.0),"tool_builtin":builtin,"call_id":call_id,"position":call.map(|c| &c.1)})
+                json!({"id":id,"role":"tool","text":content,"parts":image_parts,"images_omitted":images_omitted,"tool_calls":[],"tool_name":call.map(|c| &c.0),"tool_builtin":builtin,"call_id":call_id,"position":call.map(|c| &c.1)})
             }
         };
         // Historical records without State frames expose unknown positions instead
@@ -442,6 +492,7 @@ pub(super) async fn snapshot(
         retry_operation.as_deref(),
     );
     let mut projection = base_session(record, model, status);
+    communication_session(&mut projection, &managed.session, None)?;
     if let Some(flavor) = managed.host_flavor {
         projection["host_flavor"] = json!(flavor);
     }
@@ -587,6 +638,7 @@ mod tests {
     #[test]
     fn framework_source_is_explicit_and_ordinary_message_shape_is_unchanged() {
         let user = |source| ContentItem::User {
+            envelope: None,
             parts: vec![microcrab_protocol::InputPart::Text {
                 text: "Framework execution notice".into(),
             }],
@@ -605,10 +657,52 @@ mod tests {
         assert_ne!(projected[0]["id"], projected[1]["id"]);
     }
     #[test]
+    fn communication_sources_preserve_identity_without_state_conversation_blocks() {
+        use microcrab_transport::{CarrierEnvelopeVersion, StateFrame, UserSource};
+        let source = |source| ContentItem::User {
+            source: Some(source),
+            envelope: Some(CarrierEnvelopeVersion::V1),
+            parts: vec![microcrab_protocol::InputPart::Text {
+                text: "carrier".into(),
+            }],
+        };
+        let messages = messages(
+            vec![
+                ContentItem::State(StateFrame::StateSnapshot {
+                    state: json!({"external_speakers":[{"identity":"monitor"}]}),
+                }),
+                source(UserSource::External {
+                    identity: "monitor".into(),
+                }),
+                source(UserSource::Agent {
+                    agent_id: "agt_0123456789abcdef".into(),
+                    exchange: None,
+                }),
+            ],
+            0,
+            "session",
+        );
+        assert_eq!(messages.len(), 2);
+        assert_eq!(
+            messages[0]["source"],
+            json!({"external":{"identity":"monitor"}})
+        );
+        assert_eq!(
+            messages[1]["source"],
+            json!({"agent":{"agent_id":"agt_0123456789abcdef"}})
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.get("state").is_none())
+        );
+    }
+    #[test]
     fn messages_keep_recorded_positions_across_tool_rounds_and_epochs() {
         use microcrab_transport::StateFrame;
         let items = vec![
             ContentItem::User {
+                envelope: None,
                 source: None,
                 parts: vec![microcrab_protocol::InputPart::Text { text: "go".into() }],
             },
@@ -628,6 +722,7 @@ mod tests {
                 }],
             },
             ContentItem::Tool {
+                parts: vec![],
                 call_id: "c".into(),
                 content: "ok".into(),
             },
@@ -682,10 +777,12 @@ mod tests {
                     }],
                 },
                 ContentItem::Tool {
+                    parts: vec![],
                     call_id: "delegate-call".into(),
                     content: "opaque receipt".into(),
                 },
                 ContentItem::Tool {
+                    parts: vec![],
                     call_id: "orphan".into(),
                     content: json!({"child_id":"0123456789abcdef","builtin":"delegate"})
                         .to_string(),

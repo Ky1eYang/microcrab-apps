@@ -297,7 +297,9 @@ impl From<WireError> for Error {
             "unauthenticated" => StatusCode::UNAUTHORIZED,
             "internal_error" => StatusCode::INTERNAL_SERVER_ERROR,
             "permission_denied" | "variable_forbidden" => StatusCode::FORBIDDEN,
-            "not_found" | "unavailable" | "inbox_item_not_found" => StatusCode::NOT_FOUND,
+            "not_found" | "operation_not_found" | "unavailable" | "inbox_item_not_found" => {
+                StatusCode::NOT_FOUND
+            }
             "request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
             "capacity" | "command_limit" | "subscription_limit" => StatusCode::TOO_MANY_REQUESTS,
             "inbox_changed"
@@ -329,6 +331,7 @@ impl From<WireError> for Error {
             | "operation_failed"
             | "workspace_unavailable"
             | "host_verification_failed"
+            | "outcome_unknown"
             | "storage_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::BAD_REQUEST,
         };

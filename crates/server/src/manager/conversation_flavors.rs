@@ -25,6 +25,7 @@ struct Pin {
 pub(super) struct Flavors {
     root: PathBuf,
     pins: Mutex<HashMap<String, Pin>>,
+    chat_hosts: Mutex<HashMap<String, std::sync::Arc<dyn microcrab_host_api::Host>>>,
 }
 impl Flavors {
     pub(super) fn open(data: &Path) -> Result<Self, Error> {
@@ -79,7 +80,28 @@ impl Flavors {
         Ok(Self {
             root,
             pins: Mutex::new(pins),
+            chat_hosts: Mutex::new(HashMap::new()),
         })
+    }
+    pub(super) fn chat_host(
+        &self,
+        grant: &ConversationGrant,
+        candidate: std::sync::Arc<dyn microcrab_host_api::Host>,
+    ) -> Result<std::sync::Arc<dyn microcrab_host_api::Host>, Error> {
+        if self
+            .pins
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&grant.conversation_id)
+            .is_none_or(|pin| pin.grant != *grant || pin.host_flavor != HostFlavor::ChatOnly)
+        {
+            return Err(Error::config("Chat Only Host grant differs"));
+        }
+        let mut hosts = self.chat_hosts.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(hosts
+            .entry(grant.conversation_id.clone())
+            .or_insert(candidate)
+            .clone())
     }
     pub(super) fn get(&self, owner: &str, id: &str) -> Option<HostFlavor> {
         self.pins
@@ -131,10 +153,10 @@ impl Flavors {
         let value = Pin { grant, host_flavor };
         let id = &value.grant.conversation_id;
         let mut pins = self.pins.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = pins.get(id) {
-            if old != &value {
-                return Err(Error::config("conversation flavor is immutable"));
-            }
+        if let Some(old) = pins.get(id)
+            && old != &value
+        {
+            return Err(Error::config("conversation flavor is immutable"));
         }
         std::fs::create_dir_all(&self.root)?;
         directory(&self.root)?;
@@ -171,6 +193,39 @@ impl Flavors {
         Ok(())
     }
 }
+fn redirected(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+fn directory(path: &Path) -> Result<(), Error> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if redirected(&meta) || !meta.is_dir() {
+        return Err(Error::config("invalid conversation identity directory"));
+    }
+    Ok(())
+}
+fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if redirected(&meta) || !meta.is_file() {
+        return Err(Error::config("invalid conversation identity file"));
+    }
+    let mut bytes = vec![];
+    std::fs::File::open(path)?
+        .take(128 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > 128 * 1024 {
+        return Err(Error::config("conversation flavor exceeds budget"));
+    }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,36 +316,4 @@ mod tests {
         assert_eq!(store.get("owner", "unrelated-projectless-session"), None);
         assert!(store.pin(grant, HostFlavor::ChatOnly).is_err());
     }
-}
-fn redirected(meta: &std::fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        meta.file_attributes() & 0x400 != 0
-    }
-    #[cfg(not(windows))]
-    {
-        meta.file_type().is_symlink()
-    }
-}
-fn directory(path: &Path) -> Result<(), Error> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if redirected(&meta) || !meta.is_dir() {
-        return Err(Error::config("invalid conversation identity directory"));
-    }
-    Ok(())
-}
-fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if redirected(&meta) || !meta.is_file() {
-        return Err(Error::config("invalid conversation identity file"));
-    }
-    let mut bytes = vec![];
-    std::fs::File::open(path)?
-        .take(128 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > 128 * 1024 {
-        return Err(Error::config("conversation flavor exceeds budget"));
-    }
-    Ok(serde_json::from_slice(&bytes)?)
 }

@@ -119,6 +119,11 @@ pub(crate) const CLIENT_TOOLS_RESULT: &str = "client_tools.result";
 pub(crate) const CLIENT_TOOLS_UNBIND: &str = "client_tools.unbind";
 pub(crate) const CLIENT_TOOLS_OUTPUT: &str = "client_tools.output";
 pub(crate) const CLIENT_TOOLS_PREPARE: &str = "client_tools.prepare";
+pub(crate) const CLIENT_TOOLS_TAKEOVER: &str = "client_tools.takeover";
+pub(crate) const CLIENT_TOOLS_ARGUMENTS: &str = "client_tools.arguments";
+pub(crate) const CLIENT_TOOLS_SECRET: &str = "client_tools.secret";
+pub(crate) const CLIENT_TOOLS_SECRET_OPERATION: &str = "client_tools.secret_operation";
+pub(crate) const CLIENT_TOOLS_DECISION: &str = "client_tools.decision";
 pub(crate) const EXECUTIONS_LIST: &str = "executions.list";
 pub(crate) const EXECUTIONS_CANCEL: &str = "executions.cancel";
 /// Read retained invocation output without consuming it or starting a runtime.
@@ -126,6 +131,17 @@ pub(crate) const EXECUTIONS_READ: &str = "executions.read";
 pub(crate) const EXECUTIONS_CONTENT: &str = "executions.content";
 
 const METHODS: &[&str] = &[
+    "child.enter",
+    "child.turn.submit",
+    "child.turn.get",
+    "project.external_speakers.operation",
+    "session.external_speakers.operation",
+    "project.external_speakers.get",
+    "project.external_speakers.set",
+    "project.external_speakers.key",
+    "session.external_speakers.get",
+    "session.external_speakers.set",
+    "session.external_speakers.key",
     "settings.get",
     "settings.set",
     "project.settings.get",
@@ -212,6 +228,11 @@ const METHODS: &[&str] = &[
     CLIENT_TOOLS_UNBIND,
     CLIENT_TOOLS_PREPARE,
     CLIENT_TOOLS_OUTPUT,
+    CLIENT_TOOLS_TAKEOVER,
+    CLIENT_TOOLS_ARGUMENTS,
+    CLIENT_TOOLS_SECRET,
+    CLIENT_TOOLS_SECRET_OPERATION,
+    CLIENT_TOOLS_DECISION,
     EXECUTIONS_LIST,
     EXECUTIONS_CANCEL,
     EXECUTIONS_READ,
@@ -695,6 +716,28 @@ pub(super) async fn execute(
         ));
     }
     let owner = &principal.owner;
+    if command.method == "child.enter" {
+        return super::child_input::enter(manager, owner, command).await;
+    }
+    if matches!(
+        command.method.as_str(),
+        "child.turn.submit" | "child.turn.get"
+    ) {
+        return super::child_input::command(manager, owner, command).await;
+    }
+    if matches!(
+        command.method.as_str(),
+        "project.external_speakers.operation"
+            | "session.external_speakers.operation"
+            | "project.external_speakers.get"
+            | "project.external_speakers.set"
+            | "project.external_speakers.key"
+            | "session.external_speakers.get"
+            | "session.external_speakers.set"
+            | "session.external_speakers.key"
+    ) {
+        return super::external_speakers::command(manager, owner, command).await;
+    }
     if command.method.starts_with("provider.") {
         return super::providers::command(manager, owner, &command.method, command.params.clone())
             .await;
@@ -1241,8 +1284,16 @@ pub(super) async fn execute(
                 .map_err(safe)?;
             return serde_json::to_value(page).map_err(|_| serialization());
         }
-        CLIENT_TOOLS_BIND | CLIENT_TOOLS_RESULT | CLIENT_TOOLS_UNBIND | CLIENT_TOOLS_PREPARE
-        | CLIENT_TOOLS_OUTPUT => {
+        CLIENT_TOOLS_BIND
+        | CLIENT_TOOLS_RESULT
+        | CLIENT_TOOLS_UNBIND
+        | CLIENT_TOOLS_PREPARE
+        | CLIENT_TOOLS_OUTPUT
+        | CLIENT_TOOLS_TAKEOVER
+        | CLIENT_TOOLS_ARGUMENTS
+        | CLIENT_TOOLS_SECRET
+        | CLIENT_TOOLS_SECRET_OPERATION
+        | CLIENT_TOOLS_DECISION => {
             return Err(WireError::new(
                 "socket_required",
                 "Client tool execution belongs to its authenticated socket",
@@ -1866,8 +1917,7 @@ async fn finish_session(
                 .replace(owner, revision, next)
                 .await
                 .map_err(safe)?;
-            let session =
-                view::session(manager, &current, &manager.config.provider.model, "closed");
+            let session = super::deletion::archived_view(manager, &current).await?;
             managed.hub.session(session.clone());
             Ok(session)
         } else {

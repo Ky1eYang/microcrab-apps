@@ -58,6 +58,7 @@ pub fn hard_limits() -> Limits {
         max_tool_calls_per_round: 1024,
         max_context_bytes: 1024 * 1024 * 1024,
         max_tool_output_bytes: 16 * 1024 * 1024,
+        max_tool_image_bytes: 1024 * 1024,
         max_output_tokens: 1_048_576,
         interaction_timeout_ms: 3_600_000,
         max_pending_executions: 1024,
@@ -71,10 +72,12 @@ pub fn hard_limits() -> Limits {
     }
 }
 pub fn limits(merged: &BTreeMap<String, u64>, ceilings: &Limits) -> Result<Limits, String> {
-    let mut result =
-        serde_json::to_value(default_limits()).map_err(|_| "cannot encode default limits")?;
-    let ceiling =
+    let defaults = default_limits();
+    let mut result = serde_json::to_value(&defaults).map_err(|_| "cannot encode default limits")?;
+    let mut ceiling =
         serde_json::to_value(ceilings).map_err(|_| "cannot encode administrator ceilings")?;
+    result["max_tool_image_bytes"] = serde_json::json!(defaults.max_tool_image_bytes);
+    ceiling["max_tool_image_bytes"] = serde_json::json!(ceilings.max_tool_image_bytes);
     for (key, value) in merged {
         let Some(max) = ceiling.get(key).and_then(serde_json::Value::as_u64) else {
             return Err(format!("unknown Limits field: {key}"));
@@ -106,7 +109,12 @@ pub fn limits(merged: &BTreeMap<String, u64>, ceilings: &Limits) -> Result<Limit
             *value = max.into();
         }
     }
-    serde_json::from_value(result).map_err(|_| "Limits value exceeds platform capacity".into())
+    let result: Limits = serde_json::from_value(result)
+        .map_err(|_| "Limits value exceeds platform capacity".to_owned())?;
+    result
+        .validate()
+        .map_err(|error| error.diagnostic_reason())?;
+    Ok(result)
 }
 fn nullable_override<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -188,6 +196,43 @@ mod prompt_tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn typed_media_limits_override_and_clamp_independently_of_historical_serde_omission() {
+        let ceilings = hard_limits();
+        let explicit = BTreeMap::from([("max_tool_image_bytes".into(), 512 * 1024)]);
+        assert_eq!(
+            limits(&explicit, &ceilings).unwrap().max_tool_image_bytes,
+            512 * 1024
+        );
+        let mut low = ceilings.clone();
+        low.max_tool_image_bytes = 256 * 1024;
+        assert_eq!(
+            limits(&BTreeMap::new(), &low).unwrap().max_tool_image_bytes,
+            256 * 1024
+        );
+        assert!(limits(&explicit, &low).is_err());
+        assert!(limits(&BTreeMap::from([("not_a_limit".into(), 1)]), &ceilings).is_err());
+        let mut project = SettingsOverrides::default();
+        project
+            .limits
+            .insert("max_tool_image_bytes".into(), 512 * 1024);
+        let mut session = project.clone();
+        session.overlay(
+            &serde_json::from_value(json!({"limits":{"max_tool_image_bytes":128*1024}})).unwrap(),
+        );
+        assert_eq!(
+            limits(&project.limits, &ceilings)
+                .unwrap()
+                .max_tool_image_bytes,
+            512 * 1024
+        );
+        assert_eq!(
+            limits(&session.limits, &ceilings)
+                .unwrap()
+                .max_tool_image_bytes,
+            128 * 1024
+        );
+    }
     #[test]
     fn omitted_and_null_prompts_inherit_but_empty_overrides_are_retained() {
         let mut settings: SettingsOverrides = serde_json::from_value(json!({

@@ -47,6 +47,10 @@ pub(crate) async fn serve(
         .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "Origin admission returns Tonic's native Status for direct propagation through gRPC service methods"
+)]
 fn same_origin(metadata: &MetadataMap, expected: &str) -> Result<(), Status> {
     let presented = metadata.get("origin").and_then(|value| value.to_str().ok());
     if presented != Some(expected) {
@@ -109,6 +113,22 @@ impl HostBridge for Service {
     type ControlStream = ReceiverStream<Result<pb::HostFrame, Status>>;
     type ExecuteStream = ReceiverStream<Result<pb::HostFrame, Status>>;
 
+    async fn inspect(
+        &self,
+        request: Request<pb::HostFrame>,
+    ) -> Result<Response<pb::HostFrame>, Status> {
+        same_origin(request.metadata(), &self.origin)?;
+        let WireFrame::Inspect { request } =
+            frame_from_proto(request.into_inner()).map_err(status_for)?
+        else {
+            return Err(Status::invalid_argument(
+                "Inspect requires an inspection request",
+            ));
+        };
+        let reply = self.bridge.inspect(request).await;
+        Ok(Response::new(frame_to_proto(&reply).map_err(status_for)?))
+    }
+
     async fn control(
         &self,
         request: Request<Streaming<pb::HostFrame>>,
@@ -125,7 +145,20 @@ impl HostBridge for Service {
             ));
         };
         let frame = frame_from_proto(first).map_err(status_for)?;
-        let (bridge, hello) = self.bridge.authenticate(frame).await.map_err(status_for)?;
+        let (bridge, hello) = match self.bridge.authenticate(frame).await {
+            Ok(value) => value,
+            Err(error) => {
+                // A structured pre-admission reply carries the exact closed code.
+                // No Execute capability or Live owner exists on this path.
+                let (tx, rx) = mpsc::channel(1);
+                tx.send(Ok(
+                    frame_to_proto(&WireFrame::HandshakeRejected { error }).map_err(status_for)?
+                ))
+                .await
+                .map_err(|_| Status::unavailable("cannot queue handshake rejection"))?;
+                return Ok(Response::new(ReceiverStream::new(rx)));
+            }
+        };
         let WireFrame::Hello {
             lease_generation: generation,
             ..

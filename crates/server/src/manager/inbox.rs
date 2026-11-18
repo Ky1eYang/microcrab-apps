@@ -109,12 +109,14 @@ pub(super) async fn settle_failure(manager: &Manager, managed: &Managed) -> Resu
             protocol_reason,
             reason,
             failure,
-        } => Error::Provider(match (protocol_reason, failure) {
-            (Some(reason), _) => microcrab_transport::ProviderError::protocol(
+            empty_completion,
+        } => Error::Provider(match (empty_completion, protocol_reason, failure) {
+            (Some(facts), _, _) => microcrab_transport::ProviderError::empty_completion(facts),
+            (None, Some(reason), _) => microcrab_transport::ProviderError::protocol(
                 microcrab_transport::ProtocolError::from(reason),
             ),
-            (None, Some(failure)) => microcrab_transport::ProviderError::failure(failure),
-            (None, None) => reason.into(),
+            (None, None, Some(failure)) => microcrab_transport::ProviderError::failure(failure),
+            (None, None, None) => reason.into(),
         }),
         InboxFailureKind::Protocol(reason) => match reason {
             Some(reason) => Error::Protocol(reason.into()),

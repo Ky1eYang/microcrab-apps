@@ -32,10 +32,19 @@ pub(crate) fn all_endpoints() -> impl Iterator<Item = &'static Endpoint> {
         .chain(session::ENDPOINTS.iter())
         .chain(super::children::ENDPOINTS.iter())
         .chain(super::settings::ENDPOINTS.iter())
+        .chain(super::external_speakers::ENDPOINTS.iter())
 }
 
 pub(super) fn router() -> Router<Arc<Application>> {
     let mut router = Router::new()
+        .route(
+            "/api/v1/sessions/{session_id}/inbox",
+            axum::routing::post(super::external_inbox::enqueue),
+        )
+        .route(
+            "/api/v1/sessions/{session_id}/inbox/operations/{operation_id}",
+            get(super::external_inbox::observe),
+        )
         .route(
             "/api/v1/sessions/{session_id}/attachments",
             axum::routing::post(super::attachment::upload),
@@ -88,6 +97,9 @@ async fn execute(
         .map(|id| id.0.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     match dispatch(state, matched, path, request, request_id).await {
+        Ok(value) if value["method"] == "child.turn.submit" && value["status"] == "accepted" => {
+            (StatusCode::ACCEPTED, Json(value)).into_response()
+        }
         Ok(value) => Json(value).into_response(),
         Err(response) => response,
     }
@@ -168,8 +180,12 @@ async fn dispatch(
                 )
                 .into_response()
             })?;
-        let params: Value =
-            serde_json::from_slice(&bytes).map_err(|error| Error::json(error).into_response())?;
+        let params: Value = if endpoint.command.contains(".external_speakers.") {
+            super::external_speakers::parse(&bytes)
+        } else {
+            serde_json::from_slice(&bytes)
+        }
+        .map_err(|error| Error::json(error).into_response())?;
         if !params.is_object() {
             return Err(
                 Error::parameters("json", "JSON request body must be an object").into_response(),

@@ -186,15 +186,49 @@ pub(crate) async fn run(
         Ok(Some(Ok(Message::Binary(bytes)))) => decode_frame(&bytes).ok(),
         _ => None,
     };
-    let Some(frame) = frame else {
-        let _=progress.send(json!({"status":"failed","phase":"auth_unknown","message":"Server authentication frame was not received; inspect the authoritative finish result"})).await;
+    let Some(mut frame) = frame else {
+        let _=progress.send(json!({"status":"failed","phase":"pre_auth","message":"Server handshake frame was not received"})).await;
         return;
     };
+    if let WireFrame::Inspect { request } = frame {
+        let reply = bridge.inspect(request).await;
+        let accepted = matches!(&reply, WireFrame::Inspected { result: Ok(_), .. });
+        let Ok(bytes) = encode_frame(&reply) else {
+            return;
+        };
+        if !matches!(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                socket.send(Message::Binary(bytes.into()))
+            )
+            .await,
+            Ok(Ok(()))
+        ) || !accepted
+        {
+            return;
+        }
+        frame = match tokio::time::timeout(Duration::from_secs(10), socket.next()).await {
+            Ok(Some(Ok(Message::Binary(bytes)))) => match decode_frame(&bytes) {
+                Ok(frame) => frame,
+                Err(_) => return,
+            },
+            _ => return,
+        };
+    }
     let (bridge, hello) = match bridge.authenticate(frame).await {
         Ok(value) => value,
         Err(error) => {
+            if let Ok(bytes) = encode_frame(&WireFrame::HandshakeRejected {
+                error: error.clone(),
+            }) {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    socket.send(Message::Binary(bytes.into())),
+                )
+                .await;
+            }
             let _ = progress
-                .send(json!({"status":"failed","phase":"auth_unknown","message":error.message}))
+                .send(json!({"status":"failed","phase":"pre_auth","message":error.message}))
                 .await;
             return;
         }
@@ -360,6 +394,8 @@ mod tests {
                         directory: None,
                         expected_host_id: None,
                         expected_workspace_id: None,
+                        expected_descriptor_digest: None,
+                        expected_workspace_root: None,
                     };
                     socket
                         .send(axum::extract::ws::Message::Binary(

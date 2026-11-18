@@ -68,6 +68,8 @@ struct Entry {
 #[serde(deny_unknown_fields)]
 struct ModelMeta {
     #[serde(default)]
+    google_function_response_media: bool,
+    #[serde(default)]
     protocol: Option<Protocol>,
     #[serde(default)]
     endpoint: Option<String>,
@@ -221,6 +223,7 @@ pub(super) fn resolve(
             })?;
         let discovery_provider = Provider {
             protocol: entry.protocol,
+            google_function_response_media: false,
             auth: options.auth,
             endpoint: resolved_endpoint.clone(),
             // Discovery validates common transport options without inferring a model route.
@@ -254,6 +257,7 @@ pub(super) fn resolve(
                 return Err(ConfigError::new("provider_catalog", "invalid_models"));
             }
             if let Some(discovered) = merged.get_mut(&id) {
+                discovered.google_function_response_media = meta.google_function_response_media;
                 discovered.protocol = meta.protocol;
                 discovered.endpoint = meta.endpoint;
                 discovered.auth = meta.auth;
@@ -281,6 +285,7 @@ pub(super) fn resolve(
                 merged.insert(
                     model.clone(),
                     ModelMeta {
+                        google_function_response_media: false,
                         protocol: None,
                         endpoint: None,
                         auth: None,
@@ -337,6 +342,7 @@ pub(super) fn resolve(
             };
             let route = Provider {
                 protocol: effective_protocol,
+                google_function_response_media: meta.google_function_response_media,
                 auth: meta.auth.unwrap_or(options.auth),
                 endpoint: effective_endpoint,
                 model: id.clone(),
@@ -345,6 +351,9 @@ pub(super) fn resolve(
                 timeout_ms: options.timeout_ms,
                 max_response_bytes: options.max_response_bytes,
             };
+            route
+                .validate_media_capability()
+                .map_err(|error| model_failure(error.code, &error.cause))?;
             microcrab_transport::TransportClient::new(route.client_transport_config()).map_err(
                 |error| model_failure("invalid_model_route", &error.diagnostic_reason()),
             )?;
@@ -410,6 +419,9 @@ pub(super) fn resolve(
         .ok_or_else(|| ConfigError::new("provider_catalog", "provider_not_found"))?;
     value["provider"] = serde_json::json!({"protocol":resolved.protocol,"auth":resolved.auth,"endpoint":resolved.endpoint,"model":resolved.model,
         "api_key":resolved.api_key,"timeout_ms":resolved.timeout_ms,"max_response_bytes":resolved.max_response_bytes});
+    if resolved.google_function_response_media {
+        value["provider"]["google_function_response_media"] = serde_json::json!(true);
+    }
     value["available_models"] = serde_json::to_value(&models).map_err(|error| {
         ConfigError::with_cause(
             "provider_catalog",

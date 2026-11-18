@@ -32,6 +32,14 @@ pub(crate) struct ClientInteraction {
     pub mode_pointer: String,
     #[serde(default = "default_wait_timeout")]
     pub wait_timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_writes: Option<SecretWrites>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SecretWrites {
+    pub keys_pointer: String,
+    pub max_keys: usize,
 }
 fn default_wait_timeout() -> u64 {
     300_000
@@ -51,6 +59,7 @@ pub(crate) struct BindRequest {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ResultRequest {
+    #[serde(default)]
     pub lease_id: String,
     pub invocation_id: String,
     #[serde(default, deserialize_with = "present_json")]
@@ -61,6 +70,7 @@ pub(crate) struct ResultRequest {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct OutputRequest {
+    #[serde(default)]
     pub lease_id: String,
     pub invocation_id: String,
     pub event: ProducerEvent,
@@ -89,6 +99,7 @@ pub(crate) enum ProducerEvent {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PrepareRequest {
+    #[serde(default)]
     pub lease_id: String,
     pub invocation_id: String,
     #[serde(default, deserialize_with = "present_json")]
@@ -103,6 +114,7 @@ fn present_json<'de, D: serde::Deserializer<'de>>(
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ClientRole {
     Executor,
+    Participant,
     Observer,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +164,10 @@ pub(crate) struct CallRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<microcrab_session::runtime::execution::ToolFailure>,
     pub reclaimable: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interaction: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responder_socket: Option<String>,
     #[serde(default)]
     pub blocking_mode: Option<InteractionMode>,
     #[serde(default)]
@@ -168,6 +184,9 @@ pub(crate) struct CallRecord {
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct BindSnapshot {
     pub role: ClientRole,
+    pub can_interact: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participation_id: Option<String>,
     pub lease_id: Option<String>,
     pub catalog_digest: String,
     pub definitions: Vec<ClientToolDefinition>,
@@ -208,6 +227,22 @@ pub(super) struct Durable {
     pub staged: Option<Catalog>,
     pub catalogs: Vec<Catalog>,
     pub calls: Vec<CallRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_operations: Vec<SecretOperation>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SecretOperation {
+    pub operation_id: String,
+    pub invocation_id: String,
+    pub status: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SecretRequest {
+    pub invocation_id: String,
+    pub operation_id: String,
+    pub values: std::collections::BTreeMap<String, String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -257,6 +292,15 @@ pub(super) fn validate_catalog(definitions: &[ClientToolDefinition]) -> Result<(
             return Err(invalid("invalid client tool definition"));
         }
         if let Some(interaction) = &entry.interaction {
+            if let Some(secret) = &interaction.secret_writes
+                && (!entry.reclaimable
+                    || !secret.keys_pointer.starts_with('/')
+                    || secret.keys_pointer.len() > 256
+                    || secret.max_keys == 0
+                    || secret.max_keys > 8)
+            {
+                return Err(invalid("invalid private interaction write capability"));
+            }
             if !interaction.mode_pointer.starts_with('/')
                 || interaction.mode_pointer.len() > 256
                 || interaction.wait_timeout_ms == 0

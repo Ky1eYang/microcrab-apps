@@ -1,4 +1,6 @@
 //! Bridge state-machine regression tests. No real browser or model is required.
+#[path = "participation_tests.rs"]
+mod participation_tests;
 use super::*;
 use microcrab_protocol::ToolDefinition;
 use microcrab_session::{
@@ -25,7 +27,7 @@ impl TextTool {
         arguments: serde_json::Value,
         context: ToolContext,
     ) -> Result<String, microcrab_session::Error> {
-        match self.0.execute(arguments, context).await? {
+        match self.execute_output(arguments, context).await? {
             microcrab_session::runtime::tool::ToolOutput::Final(output) => match output.failure {
                 Some(failure) => Err(microcrab_session::Error::ToolFailure(failure)),
                 None => Ok(output.content),
@@ -34,6 +36,49 @@ impl TextTool {
                 "expected Final in bridge state-machine fixture".into(),
             )),
         }
+    }
+    async fn execute_output(
+        &self,
+        arguments: serde_json::Value,
+        mut context: ToolContext,
+    ) -> Result<microcrab_session::runtime::tool::ToolOutput, microcrab_session::Error> {
+        use microcrab_session::runtime::{Runtime, tool::AllowTools};
+        let runtime = Runtime::new(
+            vec![ToolRegistration::External(self.0.clone())],
+            Arc::new(AllowTools::new([self.0.definition().name.clone()])),
+        )?;
+        context.tool = self.0.definition().name;
+        context.ensure_detached_execution()?;
+        let issuer = microcrab_session::context::Content {
+            epoch: 0,
+            subagent: None,
+            system: "Direct bridge fixture admission".into(),
+            items: vec![],
+            tools: vec![],
+            max_output_tokens: 1024,
+            max_bytes: 65536,
+            turn_id: None,
+            round: None,
+        };
+        runtime
+            .admit_invocation(
+                &microcrab_protocol::ToolCall {
+                    provider_metadata: None,
+                    id: context.call_id.clone(),
+                    name: context.tool.clone(),
+                    arguments: arguments.clone(),
+                },
+                &mut context,
+                &issuer,
+            )
+            .await
+            .map_err(|error| {
+                microcrab_session::Error::protocol_with_private_reason(
+                    "fixture admission failed",
+                    error.to_string(),
+                )
+            })?;
+        self.0.execute(arguments, context).await
     }
 }
 
@@ -193,7 +238,7 @@ async fn child_routes_to_parent_single_executor_and_duplicate_results_are_idempo
         )
         .await
         .expect("observer bind");
-    assert_eq!(observer.role, ClientRole::Observer);
+    assert_eq!(observer.role, ClientRole::Participant);
     assert!(observer.lease_id.is_none());
     bridge
         .set_history_anchor("child_session", Some("history_a".into()))
@@ -410,7 +455,7 @@ async fn stale_unbind_cannot_revoke_new_same_socket_generation() {
         )
         .await
         .expect("observer");
-    assert_eq!(still_bound.role, ClientRole::Observer);
+    assert_eq!(still_bound.role, ClientRole::Participant);
     assert!(
         bridge
             .unbind("socket_a", &rebound.lease_id.expect("new lease"))
@@ -610,6 +655,7 @@ fn interaction_definition(wait_timeout_ms: u64) -> ClientToolDefinition {
     entry.interaction = Some(super::model::ClientInteraction {
         mode_pointer: "/presentation/mode".into(),
         wait_timeout_ms,
+        secret_writes: None,
     });
     entry
 }
@@ -828,7 +874,7 @@ async fn late_prepare_applies_fallback_but_deferred_never_expires() {
     let mut invocation = context("deferred");
     invocation.interaction_timeout_ms = 1;
     let mut task = tokio::spawn(async move {
-        tool.execute(json!({"presentation":{"mode":"deferred"}}), invocation)
+        tool.execute_output(json!({"presentation":{"mode":"deferred"}}), invocation)
             .await
     });
     let call = pending(&bridge).await;
@@ -840,11 +886,15 @@ async fn late_prepare_applies_fallback_but_deferred_never_expires() {
         )
         .await
         .unwrap();
-    assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(20), &mut task)
-            .await
-            .is_err()
-    );
+    let deferred = tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        deferred,
+        microcrab_session::runtime::tool::ToolOutput::Buffered(_)
+    ));
     let current = bridge.snapshot().await.pending[0].clone();
     assert_eq!(current.status, CallStatus::Pending);
     assert!(!current.timeout_applied);
@@ -860,7 +910,10 @@ async fn late_prepare_applies_fallback_but_deferred_never_expires() {
         )
         .await
         .unwrap();
-    assert_eq!(task.await.unwrap().unwrap(), "actual answer");
+    assert_eq!(
+        bridge.snapshot().await.calls.last().unwrap().result,
+        Some(json!("actual answer"))
+    );
 }
 
 #[tokio::test]
@@ -965,6 +1018,7 @@ async fn completed_linkage_uses_full_original_output_and_newest_identical_branch
             .unwrap();
         assert_eq!(task.await.unwrap().unwrap(), original);
     }
+    bridge.use_unlinked_receipt_fixture().await;
     assert_eq!(
         bridge
             .match_canonical_output(
@@ -1043,6 +1097,7 @@ async fn arbitrary_json_never_becomes_a_runtime_receipt() {
     let task =
         tokio::spawn(async move { tool.execute(json!({}), context("background_call")).await });
     pending(&bridge).await;
+    bridge.use_unlinked_receipt_fixture().await;
     let receipt = json!({"task_id":42,"session_id":"child_session","status":"running","background":true,"reason":"deferred","message":"opaque text"});
     assert_eq!(
         bridge
@@ -1065,9 +1120,12 @@ async fn arbitrary_json_never_becomes_a_runtime_receipt() {
 #[tokio::test]
 async fn typed_final_preserves_failure_and_content_without_semantic_json_parsing() {
     let (_directory, bridge, tool, bind) = setup(false).await;
-    let native = tool.0.clone();
-    let task =
-        tokio::spawn(async move { native.execute(json!({}), context("typed_failure")).await });
+    let native = tool.clone();
+    let task = tokio::spawn(async move {
+        native
+            .execute_output(json!({}), context("typed_failure"))
+            .await
+    });
     let call = pending(&bridge).await;
     let request: model::OutputRequest = serde_json::from_value(json!({"lease_id":bind.lease_id.unwrap(),"invocation_id":call.invocation_id,"event":{"kind":"final","content":"partial detail","failure":{"kind":"timeout","code":"service_timeout","message":"Service deadline exceeded","retryable":true}}})).unwrap();
     assert!(bridge.output("other-socket", &request).await.is_err());

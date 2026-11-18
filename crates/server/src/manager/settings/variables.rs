@@ -199,12 +199,11 @@ pub(super) async fn command(
         )
     })?;
     let gate = managed.commands.lock().await;
-    if let Some(params) = &params {
-        if let Some(result) =
+    if let Some(params) = &params
+        && let Some(result) =
             existing(manager, owner, id, &params.operation_id, Some(&digest)).await?
-        {
-            return reply(result);
-        }
+    {
+        return reply(result);
     }
     mutable(manager, &managed, id)?;
     let Some(params) = params else {

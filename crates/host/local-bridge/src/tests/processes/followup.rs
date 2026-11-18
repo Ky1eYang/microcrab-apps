@@ -90,6 +90,8 @@ async fn retained_bridge_inventory_identifies_orphan_processes_across_controller
             directory: None,
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
         })
         .await
         .unwrap();

@@ -45,7 +45,7 @@ async fn definite_review_before_original_expiry_gets_complete_five_second_window
     assert_eq!(selected.reason, "user_once");
 }
 #[tokio::test(start_paused = true)]
-async fn late_or_retired_review_cannot_revive_request_and_revoke_denies_auto_allow() {
+async fn late_or_retired_review_cannot_revive_request_and_executor_loss_preserves_review() {
     let (_root, bridge, _lease) = setup().await;
     let interaction = bridge
         .open(&request("child", "call"), &attribution())
@@ -73,11 +73,15 @@ async fn late_or_retired_review_cannot_revive_request_and_revoke_denies_auto_all
     let deadline = next.review(&suggestion(), Instant::now()).await.unwrap();
     bridge.tools.detach("socket_a").await.unwrap();
     tokio::time::sleep_until(deadline).await;
-    assert!(matches!(
+    assert_eq!(
         next.settle(&Decision::new(Action::Allow, "safe", "review"))
-            .await,
-        Err(PermissionError::Unavailable)
-    ));
+            .await
+            .unwrap()
+            .action,
+        Action::Allow
+    );
+    assert!(next.validate_dispatch().is_ok());
+    bridge.close();
     assert!(next.validate_dispatch().is_err());
 }
 #[tokio::test]
@@ -108,6 +112,8 @@ async fn wallclock_ui_expiry_does_not_override_monotonic_user_deadline() {
         Action::Allow
     );
     bridge.tools.detach("socket_a").await.unwrap();
+    assert!(interaction.validate_dispatch().is_ok());
+    bridge.close();
     assert!(interaction.validate_dispatch().is_err());
 }
 struct Adoption {

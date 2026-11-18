@@ -1,6 +1,8 @@
 //! No hidden Project, owner/scope fences, and socket-generation reconnect safety.
 #[path = "chat_flavors.rs"]
 mod chat_flavors;
+#[path = "governance.rs"]
+mod governance;
 use super::super::conversations::{Attach, Binding};
 use super::*;
 use microcrab_host_protocol::{HostDescriptor, HostFrame, HostRequest};
@@ -75,6 +77,7 @@ async fn attach(
             owner,
             socket,
             Attach {
+                force_takeover: false,
                 host_flavor: None,
                 conversation_id: id.into(),
                 descriptor,
@@ -231,6 +234,7 @@ async fn projectless_owner_pins_and_generation_survive_disconnect_and_restart() 
                 &owner,
                 "old",
                 Attach {
+                    force_takeover: false,
                     host_flavor: None,
                     conversation_id: id.clone(),
                     descriptor: descriptor.clone(),
@@ -254,6 +258,7 @@ async fn projectless_owner_pins_and_generation_survive_disconnect_and_restart() 
                 &owner,
                 "wrong",
                 Attach {
+                    force_takeover: false,
                     host_flavor: None,
                     conversation_id: id.clone(),
                     descriptor: changed,
@@ -333,6 +338,7 @@ async fn conversation_workspace_cannot_be_leased_by_another_scope_or_missing_bin
                 &owner,
                 "second",
                 Attach {
+                    force_takeover: false,
                     host_flavor: None,
                     conversation_id: second,
                     descriptor,

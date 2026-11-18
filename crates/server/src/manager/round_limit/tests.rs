@@ -114,12 +114,11 @@ async fn parent_and_child_answers_are_once_only_and_executor_fenced() {
         } else {
             RoundLimitDecision::Continue
         };
-        assert!(
-            bridge
-                .reply("socket_a", answer(id, &lease, conflicting))
-                .await
-                .is_err()
-        );
+        let lost = bridge
+            .reply("socket_a", answer(id, &lease, conflicting))
+            .await
+            .unwrap();
+        assert_eq!(lost["decision"], serde_json::to_value(decision).unwrap());
         assert_eq!(
             event(&mut subscription, "round_limit.settled").await["request_id"],
             id
@@ -128,7 +127,7 @@ async fn parent_and_child_answers_are_once_only_and_executor_fenced() {
     }
 }
 #[tokio::test]
-async fn missing_executor_waits_and_reconnect_requires_a_fresh_question() {
+async fn missing_executor_does_not_hide_questions_and_reconnect_keeps_identity() {
     let (_root, bridge, _) = setup(false).await;
     let mut subscription = bridge.hub.subscribe();
     let worker = bridge.clone();
@@ -137,50 +136,25 @@ async fn missing_executor_waits_and_reconnect_requires_a_fresh_question() {
             .request(invocation("parent"), CancellationToken::new())
             .await
     });
-    tokio::task::yield_now().await;
-    assert!(!pending.is_finished());
-    assert_eq!(bridge.snapshot().await["executor_connected"], false);
-    let old_lease = bind(&bridge, "socket_a", "client_a").await;
     let first = event(&mut subscription, "round_limit.requested").await;
-    let old_id = first["request"]["request_id"].as_str().unwrap();
+    let id = first["request"]["request_id"].as_str().unwrap();
+    let old = bind(&bridge, "socket_a", "client_a").await;
     bridge.tools.detach("socket_a").await.unwrap();
-    let retired = event(&mut subscription, "round_limit.settled").await;
-    assert_eq!(retired["request_id"], old_id);
-    assert!(retired["decision"].is_null());
-    assert!(!pending.is_finished());
-    let new_lease = bind(&bridge, "socket_b", "client_b").await;
-    let fresh = event(&mut subscription, "round_limit.requested").await;
-    let id = fresh["request"]["request_id"].as_str().unwrap();
-    assert_ne!(id, old_id);
+    let new = bind(&bridge, "socket_b", "client_b").await;
     assert!(
         bridge
-            .reply(
-                "socket_a",
-                answer(old_id, &old_lease, RoundLimitDecision::Continue)
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        bridge
-            .reply(
-                "socket_b",
-                answer(old_id, &new_lease, RoundLimitDecision::Continue)
-            )
+            .reply("socket_a", answer(id, &old, RoundLimitDecision::Continue))
             .await
             .is_err()
     );
     bridge
-        .reply(
-            "socket_b",
-            answer(id, &new_lease, RoundLimitDecision::Continue),
-        )
+        .reply("socket_b", answer(id, &new, RoundLimitDecision::Continue))
         .await
         .unwrap();
-    assert!(matches!(
+    assert_eq!(
         pending.await.unwrap().unwrap(),
         RoundLimitDecision::Continue
-    ));
+    );
 }
 #[tokio::test]
 async fn cancellation_drop_and_close_retire_without_approving_or_leaking() {
@@ -201,7 +175,8 @@ async fn cancellation_drop_and_close_retire_without_approving_or_leaking() {
         bridge
             .reply("socket_a", answer(id, &lease, RoundLimitDecision::Continue))
             .await
-            .is_err()
+            .unwrap()["decision"]
+            .is_null()
     );
     let worker = bridge.clone();
     let dropped = tokio::spawn(async move {

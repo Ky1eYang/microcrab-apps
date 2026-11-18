@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-local-bridge"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "axum",
  "futures-util",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-server"
-version = "0.1.16"
+version = "0.1.19"
 dependencies = [
  "async-trait",
  "axum",

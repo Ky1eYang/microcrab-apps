@@ -101,6 +101,17 @@ fn decode_catalog(value: &serde_json::Value, location: &str) -> Result<(), Error
     Ok(())
 }
 
+pub(super) fn reject_symlink(path: &Path) -> Result<(), Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid(
+            "client tool storage paths cannot be symbolic links",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,16 +150,5 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         assert!(Store::open(&root, "healthy-session").is_ok());
         std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-fn reject_symlink(path: &Path) -> Result<(), Error> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(invalid(
-            "client tool storage paths cannot be symbolic links",
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
     }
 }

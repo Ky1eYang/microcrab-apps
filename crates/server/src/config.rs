@@ -205,6 +205,9 @@ pub struct Provider {
     /// Safety ceiling for one provider response; reception warns before it.
     #[serde(default = "response_budget")]
     pub max_response_bytes: usize,
+    /// Exact configured Google route/model API capability; never inferred by discovery.
+    #[serde(default)]
+    pub google_function_response_media: bool,
 }
 fn provider_protocol() -> Protocol {
     Protocol::OpenaiCompatible
@@ -217,6 +220,16 @@ fn response_budget() -> usize {
     1024 * 1024 * 1024
 }
 impl Provider {
+    pub(crate) fn validate_media_capability(&self) -> Result<(), ConfigError> {
+        if self.google_function_response_media && self.protocol != Protocol::Google {
+            return Err(ConfigError::new(
+                "provider",
+                "google_media_requires_google_protocol",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn client_transport_config(&self) -> TransportConfig {
         TransportConfig {
             protocol: self.protocol,
@@ -342,6 +355,7 @@ impl Config {
                 .ok_or_else(|| ConfigError::new("model_selection", "model_route_not_found"))?,
             None => self.provider.clone(),
         };
+        provider.validate_media_capability()?;
         if variant.is_some() && provider.protocol != Protocol::OpenaiCompatible {
             return Err(ConfigError::new("model_selection", "unsupported_variant"));
         }
@@ -403,6 +417,7 @@ impl Config {
         if let Some(secret) = &mut config.provider.api_key {
             *secret = resolve_secret(secret)?;
         }
+        config.provider.validate_media_capability()?;
         if config.provider_catalog.is_none() || !config.provider.model.is_empty() {
             microcrab_transport::TransportClient::new(config.provider.client_transport_config())
                 .map_err(|error| {

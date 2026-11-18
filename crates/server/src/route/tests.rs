@@ -3,6 +3,7 @@
 mod attachments;
 mod citations;
 mod children;
+mod external_speakers;
 mod host_connection;
 mod images;
 mod model_metadata;

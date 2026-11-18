@@ -151,6 +151,8 @@ async fn service_selected_workspace_inherits_unrestricted_scope_and_external_pri
             directory: Some(second.to_string_lossy().into()),
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
             token: String::new(),
             scope: scope(),
         })
@@ -196,6 +198,8 @@ async fn service_selected_workspace_inherits_unrestricted_scope_and_external_pri
                 directory: Some(third.to_string_lossy().into()),
                 expected_host_id: None,
                 expected_workspace_id: None,
+                expected_descriptor_digest: None,
+                expected_workspace_root: None,
                 token: String::new(),
                 scope: scope()
             })
@@ -305,6 +309,8 @@ async fn service_selected_workspace_inherits_startup_restrictions() {
             directory: Some(child.to_string_lossy().into()),
             expected_host_id: None,
             expected_workspace_id: None,
+            expected_descriptor_digest: None,
+            expected_workspace_root: None,
             token: "fixture-token".into(),
             scope: scope(),
         })

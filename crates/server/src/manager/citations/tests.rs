@@ -7,6 +7,7 @@ fn canonical_projection_grants_only_final_assistant_content() {
     let messages = crate::manager::view::messages(
         vec![
             ContentItem::User {
+                envelope: None,
                 source: None,
                 parts: vec![microcrab_protocol::InputPart::Text {
                     text: "[user](user.txt)".into(),
@@ -18,6 +19,7 @@ fn canonical_projection_grants_only_final_assistant_content() {
                 provider_metadata: None,
             },
             ContentItem::Tool {
+                parts: vec![],
                 call_id: "call".into(),
                 content: "[tool](tool.txt)".into(),
             },

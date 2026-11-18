@@ -61,7 +61,16 @@ async fn immutable_chat_flavor_precedes_attach_and_survives_restart() {
             .unwrap()
             .is_some()
     );
-    assert!(manager.pins.conversation(&id).await.unwrap().is_none());
+    let pin = manager.pins.conversation(&id).await.unwrap().unwrap();
+    assert_eq!(pin.workspace_root, "/chat");
+    assert_eq!(wire["server_owned"], true);
+    let host = manager.conversation_host(&owner.owner, &id).await.unwrap();
+    assert!(host.capabilities().supported_operations.is_empty());
+    assert!(host.tool_capabilities().is_empty());
+    assert!(host.info().unwrap().capabilities.is_empty());
+    let again = manager.conversation_host(&owner.owner, &id).await.unwrap();
+    assert!(Arc::ptr_eq(&host, &again));
+    assert!(manager.conversation_routes.lock().await.get(&id).is_none());
     let mut switched = binding(&id, &browser, &workspace);
     switched.host_flavor = Some(HostFlavor::BrowserSandbox);
     assert_eq!(
@@ -78,6 +87,7 @@ async fn immutable_chat_flavor_precedes_attach_and_survives_restart() {
             &owner,
             "execution",
             Attach {
+                force_takeover: false,
                 conversation_id: id.clone(),
                 descriptor: browser_descriptor(&browser, &workspace),
                 lease_generation: "lease".into(),
@@ -121,4 +131,112 @@ async fn immutable_chat_flavor_precedes_attach_and_survives_restart() {
         scope
     );
     reopened.close().await.unwrap();
+}
+
+struct AnswerClient;
+#[async_trait::async_trait]
+impl microcrab_session::Client for AnswerClient {
+    async fn complete(
+        &self,
+        _content: &microcrab_transport::Content,
+        _auditor: &dyn microcrab_auditor::Auditor,
+        _variables: &dyn microcrab_auditor::VariableView,
+        _cancellation: CancellationToken,
+    ) -> Result<microcrab_protocol::Response, microcrab_transport::Error> {
+        Ok(microcrab_protocol::Response {
+            content: "A complete host-independent answer.".into(),
+            tool_calls: vec![],
+            usage: Default::default(),
+            provider_metadata: None,
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires root-built Universal component path in MICROCRAB_TEST_UNIVERSAL_COMPONENT"]
+async fn maintained_chat_only_server_host_survives_catalog_init_turn_compaction_and_restart_without_browser()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let mut configuration = config(root.path());
+    configuration.storage = crate::config::Storage::File;
+    configuration.agent = Some(serde_json::from_value(json!({
+        "path":std::env::var("MICROCRAB_TEST_UNIVERSAL_COMPONENT").expect("root-built Universal component path"),
+        "name":"universal","mode":"execute"
+    })).unwrap());
+    crate::project::seed_test_projects(&configuration.data_dir, json!([]));
+    let manager = Manager::initialize(
+        configuration.clone(),
+        Arc::new(crate::noop::NoopHost),
+        Some(Arc::new(AnswerClient)),
+        false,
+    )
+    .await
+    .unwrap();
+    let owner = Principal::for_test("owner");
+    let id = uuid::Uuid::new_v4().to_string();
+    let browser = uuid::Uuid::new_v4().to_string();
+    let workspace = uuid::Uuid::new_v4().to_string();
+    let mut scope = binding(&id, &browser, &workspace);
+    scope.host_flavor = Some(HostFlavor::ChatOnly);
+    manager
+        .conversation_scope(&owner.owner, scope)
+        .await
+        .unwrap();
+    let catalog = commands::execute(
+        &manager,
+        &owner,
+        &command("agent.catalog", json!({"conversation_id":id})),
+    )
+    .await
+    .unwrap();
+    assert_eq!(catalog["items"][0]["tools"], json!([]));
+    commands::create(
+        &manager,
+        &owner.owner,
+        &command(
+            "session.create",
+            json!({
+                "conversation_id":id,"agent":"universal","mode":"execute",
+                "operation_id":uuid::Uuid::new_v4().to_string()
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    let managed = manager
+        .active(manager.record(&owner.owner, &id).await.unwrap(), true)
+        .await
+        .unwrap();
+    assert!(managed.session.agent_initialization_complete());
+    let record = managed.record.lock().await.clone();
+    assert!(Arc::ptr_eq(
+        &managed.host,
+        &manager.record_host(&record).await.unwrap()
+    ));
+    let answer = managed.session.submit("hello").await.unwrap();
+    assert_eq!(answer.content, "A complete host-independent answer.");
+    managed
+        .session
+        .compact_with_model("Summarize the conversation.", json!({}))
+        .await
+        .unwrap();
+    assert!(managed.session.compaction().is_some());
+    assert!(manager.conversation_routes.lock().await.is_empty());
+    manager.close().await.unwrap();
+    let restarted = Manager::initialize(
+        configuration,
+        Arc::new(crate::noop::NoopHost),
+        Some(Arc::new(AnswerClient)),
+        false,
+    )
+    .await
+    .unwrap();
+    let restored = restarted
+        .active(restarted.record(&owner.owner, &id).await.unwrap(), true)
+        .await
+        .unwrap();
+    let answer = restored.session.submit("continue").await.unwrap();
+    assert_eq!(answer.content, "A complete host-independent answer.");
+    assert!(restarted.conversation_routes.lock().await.is_empty());
+    restarted.close().await.unwrap();
 }

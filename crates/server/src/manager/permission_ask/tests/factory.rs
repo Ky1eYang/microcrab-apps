@@ -48,6 +48,7 @@ async fn native_child_factory_injects_callback_and_preserves_child_identity() {
     let host: Arc<dyn microcrab_host_api::Host> = Arc::new(crate::noop::NoopHost);
     let effect = Arc::new(Effect(count.clone()));
     let catalog = vec![AgentInfo {
+        tool_media_output_bytes: Default::default(),
         name: "child-agent".into(),
         modes: vec![AgentMode {
             name: "execute".into(),

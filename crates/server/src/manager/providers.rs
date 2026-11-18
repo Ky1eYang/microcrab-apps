@@ -157,6 +157,8 @@ fn merged(provider: &PrivateProvider) -> Vec<ModelOverlay> {
 }
 fn transport(provider: &PrivateProvider, model: Option<&ModelOverlay>) -> Provider {
     Provider {
+        // Owner Provider UI does not expose verified native media capability.
+        google_function_response_media: false,
         protocol: model
             .and_then(|m| m.protocol)
             .unwrap_or(provider.provider.protocol),
@@ -257,20 +259,17 @@ pub(super) async fn command(
     if matches!(
         method,
         "provider.set" | "provider.delete" | "provider.discover"
-    ) {
-        if let Some(id) = params.get("provider_id").and_then(Value::as_str) {
-            if manager
-                .config
-                .shared_providers()
-                .iter()
-                .any(|(shared, _)| shared == id)
-            {
-                return Err(WireError::new(
-                    "read_only",
-                    "Shared administrator Provider identity is read-only and cannot be shadowed by an owner record",
-                ));
-            }
-        }
+    ) && let Some(id) = params.get("provider_id").and_then(Value::as_str)
+        && manager
+            .config
+            .shared_providers()
+            .iter()
+            .any(|(shared, _)| shared == id)
+    {
+        return Err(WireError::new(
+            "read_only",
+            "Shared administrator Provider identity is read-only and cannot be shadowed by an owner record",
+        ));
     }
     match method {
         "provider.list" => {

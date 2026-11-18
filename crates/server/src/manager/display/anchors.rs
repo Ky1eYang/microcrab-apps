@@ -21,6 +21,10 @@ pub(in crate::manager) struct Anchors {
     recorder: Arc<DisplayRecorder>,
     retry: Mutex<Option<String>>,
     index: Arc<Mutex<Option<Index>>>,
+    #[expect(
+        clippy::type_complexity,
+        reason = "Display failure reporting retains one optional thread-safe observer behind a short registration lock"
+    )]
     failure: Mutex<Option<Arc<dyn Fn(String) + Send + Sync>>>,
     failure_reported: std::sync::atomic::AtomicBool,
 }
@@ -344,11 +348,12 @@ impl Index {
             content["canonical_message_id"].as_str(),
             content["canonical_source_id"].as_str(),
         ) {
-            if content["message"]["role"] == "user" && content["message"]["source"] != "framework" {
-                if let Some(operation) = content["message"]["submission_operation_id"].as_str() {
-                    self.submissions
-                        .insert(source_id.to_owned(), operation.to_owned());
-                }
+            if content["message"]["role"] == "user"
+                && content["message"]["source"] != "framework"
+                && let Some(operation) = content["message"]["submission_operation_id"].as_str()
+            {
+                self.submissions
+                    .insert(source_id.to_owned(), operation.to_owned());
             }
             let certificate = (id.to_owned(), source_id.to_owned());
             if binding {

@@ -1,3 +1,5 @@
+#[path = "media_tests.rs"]
+mod media_tests;
 use super::*;
 use serde_json::json;
 
@@ -394,6 +396,7 @@ auth='bearer'
         subagent: None,
         system: "Synthetic system".into(),
         items: vec![ContentItem::User {
+            envelope: None,
             parts: vec![InputPart::Text {
                 text: "begin".into(),
             }],

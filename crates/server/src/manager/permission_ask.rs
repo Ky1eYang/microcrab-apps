@@ -1,5 +1,5 @@
-//! Lease-backed permission transport. Session owns the sole review arbiter.
-//! Executor -> registry -> Hub is the synchronous lock order; no registry guard
+//! Owner-participant permission transport. Session owns the sole review arbiter.
+//! Membership -> registry -> Hub is the synchronous lock order; no registry guard
 //! crosses await. Accepted user receipts remain authoritative at timer settlement.
 use super::{Manager, client_tools::ClientTools, hub::Hub, now, unavailable};
 use crate::auth::Principal;
@@ -47,15 +47,12 @@ struct Request {
 }
 struct Pending {
     request: Request,
-    socket: String,
-    lease: String,
+    responder: Option<String>,
     sender: oneshot::Sender<AskReply>,
     deadline: Instant,
 }
 struct Settled {
     request_id: String,
-    socket: String,
-    lease: String,
     decision: Action,
     reason: String,
     evidence: Value,
@@ -71,17 +68,12 @@ struct Proposal {
 }
 struct PendingProposal {
     proposal: Proposal,
-    socket: String,
-    lease: String,
     deadline: Instant,
     sender: oneshot::Sender<bool>,
     adoption: Arc<dyn FutureGrantAdoption>,
 }
 struct ProposalReceipt {
     id: String,
-    socket: String,
-    lease: String,
-    accept: bool,
     result: Value,
 }
 #[derive(Default)]
@@ -105,6 +97,7 @@ pub(super) struct PermissionAsk {
 #[serde(deny_unknown_fields)]
 struct Reply {
     request_id: String,
+    #[serde(default)]
     lease_id: String,
     decision: ReplyDecision,
 }
@@ -126,14 +119,13 @@ impl ReplyDecision {
 #[serde(deny_unknown_fields)]
 struct ProposalReply {
     proposal_id: String,
+    #[serde(default)]
     lease_id: String,
     accept: bool,
 }
 struct Interaction {
     bridge: Arc<PermissionAsk>,
     id: String,
-    socket: String,
-    lease: String,
     deadline: Instant,
     receiver: tokio::sync::Mutex<Option<oneshot::Receiver<AskReply>>>,
 }
@@ -160,8 +152,10 @@ impl PermissionAsk {
         id: &str,
         action: Action,
         reason: &str,
-    ) -> Option<AskReply> {
-        let pending = state.pending.remove(id)?;
+    ) -> Result<Option<AskReply>, microcrab_session::Error> {
+        let Some(pending) = state.pending.get(id) else {
+            return Ok(None);
+        };
         let reply = AskReply {
             action,
             reason: reason.into(),
@@ -177,16 +171,18 @@ impl PermissionAsk {
             "session_id":pending.request.invocation.session_id,"owning_session_id":pending.request.owning_session_id,
             "call_id":pending.request.invocation.call_id,"revision":pending.request.invocation.revision,
             "agent":pending.request.invocation.agent,"mode":pending.request.invocation.mode,"tool":pending.request.invocation.tool,
-            "controller_id":pending.request.controller_id,"decision":action,"source":source,"reason":reason,
+            "controller_id":pending.request.controller_id,"responder_socket":pending.responder,"decision":action,"source":source,"reason":reason,
             "review_reason":pending.request.review.as_ref().map(|r| &r.reason),"remembered":false});
+        self.tools.record_decision("permission", id, &evidence)?;
+        let Some(pending) = state.pending.remove(id) else {
+            return Ok(None);
+        };
         self.hub
             .publish(super::SessionRuntimeEvent::PermissionSettled(
                 evidence.clone(),
             ));
         state.settled.push_back(Settled {
             request_id: id.into(),
-            socket: pending.socket,
-            lease: pending.lease,
             decision: action,
             reason: reason.into(),
             evidence,
@@ -195,18 +191,26 @@ impl PermissionAsk {
             state.settled.pop_front();
         }
         let _ = pending.sender.send(reply.clone());
-        Some(reply)
+        Ok(Some(reply))
     }
     fn retire(&self, id: &str, reason: &str) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        self.finish(&mut state, id, Action::Deny, reason);
+        self.retire_locked(&mut state, id, reason);
+    }
+    fn retire_locked(&self, state: &mut State, id: &str, reason: &str) {
+        if let Err(error) = self.finish(state, id, Action::Deny, reason) {
+            // A failed receipt cannot authorize. Drop the sender to wake the runtime
+            // as unavailable; do not retain a closed question waiting on failed disk.
+            state.pending.remove(id);
+            self.hub.publish(super::SessionRuntimeEvent::PermissionSettled(json!({"request_id":id,"decision":"deny","reason":"outcome_unavailable","durable":false,"cause":error.diagnostic_reason()})));
+        }
     }
     pub(super) fn close(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state.closed = true;
         let ids: Vec<_> = state.pending.keys().cloned().collect();
         for id in ids {
-            self.finish(&mut state, &id, Action::Deny, "session_closed");
+            self.retire_locked(&mut state, &id, "session_closed");
         }
         for (_, proposal) in state.proposals.drain() {
             let _ = proposal.sender.send(false);
@@ -215,9 +219,9 @@ impl PermissionAsk {
     async fn snapshot(&self) -> Value {
         self.tools.with_executor(|executor| {
             let state=self.state.lock().unwrap_or_else(|e|e.into_inner());
-            let mut requests:Vec<_>=state.pending.values().filter(|p|executor==Some((p.socket.as_str(),p.lease.as_str()))).map(|p|p.request.clone()).collect();
+            let mut requests:Vec<_>=state.pending.values().map(|p|p.request.clone()).collect();
             requests.sort_by(|a,b|a.created_at_ms.cmp(&b.created_at_ms).then(a.request_id.cmp(&b.request_id)));
-            let mut proposals:Vec<_>=state.proposals.values().filter(|p|executor==Some((p.socket.as_str(),p.lease.as_str())) && Instant::now()<p.deadline).map(|p|p.proposal.clone()).collect();
+            let mut proposals:Vec<_>=state.proposals.values().filter(|p|Instant::now()<p.deadline).map(|p|p.proposal.clone()).collect();
             proposals.sort_by(|a,b|a.proposal_id.cmp(&b.proposal_id));
             let mut proposal_results:Vec<_>=state.proposal_receipts.iter().chain(state.proposal_committing.values()).map(|receipt|receipt.result.clone()).collect();
             proposal_results.sort_by(|a,b|a["proposal_id"].as_str().cmp(&b["proposal_id"].as_str()));
@@ -226,21 +230,22 @@ impl PermissionAsk {
         }).await
     }
     async fn reply(&self, socket: &str, reply: Reply) -> Result<Value, WireError> {
-        self.tools.with_executor(|executor| {
-            if executor!=Some((socket,reply.lease_id.as_str())) { return Err(WireError::new("permission_executor_required","Current executor lease required")); }
+        self.tools.with_participant(socket, |participant| {
+            if !participant { return Err(WireError::new("permission_participant_required","A bound owner participant is required")); }
             let mut state=self.state.lock().unwrap_or_else(|e|e.into_inner()); let action=reply.decision.action();
             if let Some(pending)=state.pending.get(&reply.request_id) {
-                if pending.socket!=socket || pending.lease!=reply.lease_id { return Err(WireError::new("permission_request_settled","Permission request belongs to an expired executor")); }
                 if Instant::now()>=pending.deadline || state.closed {
-                    self.finish(&mut state,&reply.request_id,Action::Deny,"timeout_or_closed");
+                    self.finish(&mut state,&reply.request_id,Action::Deny,"timeout_or_closed").map_err(super::safe)?;
                     return Err(WireError::new("permission_request_settled","Permission request expired or closed"));
                 }
-                self.finish(&mut state,&reply.request_id,action,"user_once");
+                if let Some(pending) = state.pending.get_mut(&reply.request_id) { pending.responder = Some(socket.into()); }
+                self.finish(&mut state,&reply.request_id,action,"user_once").map_err(super::safe)?.ok_or_else(|| WireError::new("interaction_outcome_unknown", "Permission outcome was not acknowledged; observe the request"))?;
                 return Ok(json!({"request_id":reply.request_id,"decision":action,"remembered":false,"duplicate":false}));
             }
-            if state.settled.iter().any(|s|s.request_id==reply.request_id&&s.socket==socket&&s.lease==reply.lease_id&&s.decision==action&&s.reason=="user_once") {
-                return Ok(json!({"request_id":reply.request_id,"decision":action,"remembered":false,"duplicate":true}));
+            if let Some(receipt) = state.settled.iter().find(|s|s.request_id==reply.request_id) {
+                return Ok(json!({"request_id":reply.request_id,"decision":receipt.decision,"remembered":false,"duplicate":true}));
             }
+            if let Some(receipt) = self.tools.decision("permission", &reply.request_id) { return Ok(receipt); }
             Err(WireError::new("permission_request_settled","Permission request is absent or settled"))
         }).await
     }
@@ -260,10 +265,8 @@ impl PermissionAsk {
         let id = uuid::Uuid::new_v4().to_string();
         let (sender, receiver) = oneshot::channel();
         let deadline = Instant::now() + self.timeout;
-        let (socket, lease) = self
-            .tools
-            .with_executor(|executor| {
-                let (socket, lease) = executor.ok_or(PermissionError::Unavailable)?;
+        self.tools
+            .with_interaction_audience(|_connected| {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.closed || state.pending.len() >= MAX_PENDING {
                     return Err(PermissionError::Unavailable);
@@ -284,8 +287,7 @@ impl PermissionAsk {
                     id.clone(),
                     Pending {
                         request: row.clone(),
-                        socket: socket.into(),
-                        lease: lease.into(),
+                        responder: None,
                         sender,
                         deadline,
                     },
@@ -294,14 +296,12 @@ impl PermissionAsk {
                     .publish(super::SessionRuntimeEvent::PermissionRequested(
                         json!({"request":row}),
                     ));
-                Ok((socket.to_owned(), lease.to_owned()))
+                Ok(())
             })
             .await?;
         Ok(Arc::new(Interaction {
             bridge: self.weak.upgrade().ok_or(PermissionError::Unavailable)?,
             id,
-            socket,
-            lease,
             deadline,
             receiver: tokio::sync::Mutex::new(Some(receiver)),
         }))
@@ -313,44 +313,21 @@ impl PermissionInteraction for Interaction {
         self.deadline
     }
     fn validate_dispatch(&self) -> Result<(), PermissionError> {
-        let changes = self.bridge.tools.executor_changes();
-        let current = changes.borrow().clone();
-        if current.as_ref() != Some(&(self.socket.clone(), self.lease.clone()))
-            || self
-                .bridge
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .closed
-        {
+        let state = self.bridge.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.closed {
             Err(PermissionError::Unavailable)
         } else {
             Ok(())
         }
     }
     async fn user_reply(&self) -> Result<AskReply, PermissionError> {
-        let receiver = self
-            .receiver
+        self.receiver
             .lock()
             .await
             .take()
-            .ok_or(PermissionError::Unavailable)?;
-        let mut changes = self.bridge.tools.executor_changes();
-        let lease = (self.socket.clone(), self.lease.clone());
-        let revoked = async {
-            loop {
-                if changes.borrow_and_update().as_ref() != Some(&lease) {
-                    break;
-                }
-                if changes.changed().await.is_err() {
-                    break;
-                }
-            }
-        };
-        tokio::select! { biased;
-            _=revoked=>{self.bridge.retire(&self.id,"executor_disconnected");Err(PermissionError::Unavailable)},
-            reply=receiver=>reply.map_err(|_|PermissionError::Unavailable),
-        }
+            .ok_or(PermissionError::Unavailable)?
+            .await
+            .map_err(|_| PermissionError::Unavailable)
     }
     async fn review(
         &self,
@@ -359,10 +336,7 @@ impl PermissionInteraction for Interaction {
     ) -> Result<Instant, PermissionError> {
         self.bridge
             .tools
-            .with_executor(|executor| {
-                if executor != Some((self.socket.as_str(), self.lease.as_str())) {
-                    return Err(PermissionError::Unavailable);
-                }
+            .with_interaction_audience(|_connected| {
                 let mut state = self.bridge.state.lock().unwrap_or_else(|e| e.into_inner());
                 // Accepted user reply already won. It remains available through the
                 // receipt; do not turn a user win into a transport error.
@@ -404,16 +378,14 @@ impl PermissionInteraction for Interaction {
     async fn settle(&self, decision: &Decision) -> Result<AskReply, PermissionError> {
         self.bridge
             .tools
-            .with_executor(|executor| {
+            .with_interaction_audience(|_connected| {
                 let mut state = self.bridge.state.lock().unwrap_or_else(|e| e.into_inner());
-                if executor != Some((self.socket.as_str(), self.lease.as_str())) || state.closed {
+                if state.closed {
                     self.bridge
-                        .finish(&mut state, &self.id, Action::Deny, "executor_disconnected");
+                        .retire_locked(&mut state, &self.id, "session_closed");
                     return Err(PermissionError::Unavailable);
                 }
-                if let Some(receipt) = state.settled.iter().find(|r| {
-                    r.request_id == self.id && r.socket == self.socket && r.lease == self.lease
-                }) {
+                if let Some(receipt) = state.settled.iter().find(|r| r.request_id == self.id) {
                     return Ok(AskReply {
                         action: receipt.decision,
                         reason: receipt.reason.clone(),
@@ -433,6 +405,9 @@ impl PermissionInteraction for Interaction {
                 };
                 self.bridge
                     .finish(&mut state, &self.id, decision.action, reason)
+                    .map_err(|error| {
+                        PermissionError::InvalidConfiguration(error.diagnostic_reason())
+                    })?
                     .ok_or(PermissionError::Unavailable)
             })
             .await
@@ -463,7 +438,7 @@ impl SessionPermission for PermissionAsk {
         request: &PermissionRequest,
         attribution: &AskAttribution,
     ) -> Result<Option<Arc<dyn PermissionInteraction>>, PermissionError> {
-        Ok(Some(self.open(request, attribution).await?))
+        self.open(request, attribution).await.map(Some)
     }
     async fn ask(&self, request: &PermissionRequest) -> Result<AskReply, PermissionError> {
         let interaction = self

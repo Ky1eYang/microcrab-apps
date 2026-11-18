@@ -197,6 +197,9 @@ impl Bridge {
                         name.as_str(),
                         "file_mutation"
                             | "filesystem.stat"
+                            | "filesystem.open"
+                            | "filesystem.read"
+                            | "filesystem.close"
                             | "process.spawn"
                             | "process.status"
                             | "process.pid"
@@ -267,19 +270,75 @@ impl Bridge {
         ))
     }
     pub async fn authenticate(&self, frame: WireFrame) -> Result<WireFrame, WireError> {
-        let (expected_host, expected_workspace) = match &frame {
+        self.authenticate_mode(frame, None).await
+    }
+    fn authorize(auth: &Authority, frame: &WireFrame) -> Result<(), WireError> {
+        let scope = match frame {
+            WireFrame::Pair { scope, .. } | WireFrame::Resume { scope, .. } => scope,
+            _ => return Err(WireError::new(ErrorCode::PairingDenied, "pairing required")),
+        };
+        if !scope.valid() || !scope.is_project() {
+            return Err(WireError::new(
+                ErrorCode::InvalidRequest,
+                "invalid binding scope",
+            ));
+        }
+        match frame {
+            WireFrame::Pair { token, .. } if auth.require_token => {
+                if auth.token.as_ref() != Some(token) {
+                    return Err(WireError::new(ErrorCode::PairingDenied, "pairing denied"));
+                }
+                if Instant::now() >= auth.pair_deadline {
+                    return Err(WireError::new(
+                        ErrorCode::Timeout,
+                        "pairing capability expired; obtain a fresh local capability",
+                    ));
+                }
+            }
+            WireFrame::Resume {
+                credential, scope, ..
+            } if auth.require_token
+                && (auth.credential.as_ref() != Some(credential)
+                    || auth.scope.as_ref() != Some(scope)
+                    || Instant::now() >= auth.credential_deadline) =>
+            {
+                return Err(WireError::new(ErrorCode::PairingDenied, "resume rejected"));
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+    pub(crate) async fn check_authorization(&self, frame: &WireFrame) -> Result<(), WireError> {
+        Self::authorize(&*self.authority.lock().await, frame)
+    }
+    // The authority lock spans capability validation, effective identity selection,
+    // conditional admission and mutation. Inspection never mutates authority.
+    pub(crate) async fn authenticate_mode(
+        &self,
+        frame: WireFrame,
+        inspection: Option<String>,
+    ) -> Result<WireFrame, WireError> {
+        let mut auth = self.authority.lock().await;
+        Self::authorize(&auth, &frame)?;
+        let (expected_host, expected_workspace, expected_digest, expected_root) = match &frame {
             WireFrame::Pair {
                 expected_host_id,
                 expected_workspace_id,
+                expected_descriptor_digest,
+                expected_workspace_root,
                 ..
             }
             | WireFrame::Resume {
                 expected_host_id,
                 expected_workspace_id,
+                expected_descriptor_digest,
+                expected_workspace_root,
                 ..
             } => (
                 expected_host_id.as_deref(),
                 expected_workspace_id.as_deref(),
+                expected_descriptor_digest.as_deref(),
+                expected_workspace_root.as_deref(),
             ),
             _ => return Err(WireError::new(ErrorCode::PairingDenied, "pairing required")),
         };
@@ -292,7 +351,6 @@ impl Bridge {
                 ));
             }
             descriptor.host_id = host.to_owned();
-            descriptor.descriptor_digest = descriptor_fingerprint(&descriptor)?;
         }
         if expected_workspace.is_some_and(|id| id != descriptor.workspace_id) {
             return Err(WireError::new(
@@ -300,27 +358,6 @@ impl Bridge {
                 "workspace identity mismatch",
             ));
         }
-        let mut auth = self.authority.lock().await;
-        let requested_scope = match &frame {
-            WireFrame::Pair { scope, .. } | WireFrame::Resume { scope, .. } => scope,
-            _ => unreachable!(),
-        };
-        if auth.require_token
-            && matches!(&frame, WireFrame::Pair{token,..} if auth.token.as_ref()==Some(token) && Instant::now()>=auth.pair_deadline)
-        {
-            return Err(WireError::new(
-                ErrorCode::Timeout,
-                "pairing capability expired; obtain a fresh local capability",
-            ));
-        }
-        if !requested_scope.valid() || !requested_scope.is_project() {
-            return Err(WireError::new(
-                ErrorCode::InvalidRequest,
-                "invalid binding scope",
-            ));
-        }
-        // Resume retains the Host chosen by this credential. A fresh authorized
-        // Pair may register another backend Project without consulting old IDs.
         if matches!(&frame, WireFrame::Resume { .. })
             && let Some(bound_host) = &auth.bound_host_id
         {
@@ -331,20 +368,28 @@ impl Bridge {
                 ));
             }
             descriptor.host_id = bound_host.clone();
-            descriptor.descriptor_digest = descriptor_fingerprint(&descriptor)?;
         }
-        let scope = match frame {
-            WireFrame::Pair { token, scope, .. }
-                if !auth.require_token
-                    || (auth.token.as_ref() == Some(&token)
-                        && Instant::now() < auth.pair_deadline) =>
-            {
-                if !scope.valid() || !scope.is_project() {
-                    return Err(WireError::new(
-                        ErrorCode::InvalidRequest,
-                        "invalid binding scope",
-                    ));
-                }
+        descriptor.descriptor_digest = descriptor_fingerprint(&descriptor)?;
+        if expected_digest.is_some_and(|digest| digest != descriptor.descriptor_digest)
+            || expected_root.is_some_and(|root| root != descriptor.workspace_root)
+        {
+            return Err(WireError::new(
+                ErrorCode::BindingMismatch,
+                "inspected Host descriptor or workspace changed",
+            ));
+        }
+        if let Some(request_id) = inspection {
+            return Ok(WireFrame::Inspected {
+                request_id,
+                result: Ok(descriptor),
+            });
+        }
+        let generation = auth
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| WireError::new(ErrorCode::Limit, "lease generations exhausted"))?;
+        match frame {
+            WireFrame::Pair { scope, .. } => {
                 if auth.require_token
                     && auth.pair_deadline < Instant::now() + Duration::from_secs(3600)
                 {
@@ -352,42 +397,22 @@ impl Bridge {
                 }
                 auth.credential = Some(Uuid::new_v4().to_string());
                 auth.credential_deadline = Instant::now() + Duration::from_secs(43200);
-                auth.scope = Some(scope.clone());
+                auth.scope = Some(scope);
                 auth.bound_host_id = Some(descriptor.host_id.clone());
-                scope
             }
             WireFrame::Resume {
                 credential, scope, ..
-            } if (auth.credential.as_ref() == Some(&credential)
-                && auth.scope.as_ref() == Some(&scope)
-                && Instant::now() < auth.credential_deadline)
-                || !auth.require_token =>
-            {
+            } => {
                 if !auth.require_token {
-                    auth.credential = Some(credential.clone());
-                    auth.scope = Some(scope.clone());
+                    auth.credential = Some(credential);
+                    auth.scope = Some(scope);
                     auth.bound_host_id = Some(descriptor.host_id.clone());
                     auth.credential_deadline = Instant::now() + Duration::from_secs(43200);
                 }
-                scope
             }
-            _ => {
-                return Err(WireError::new(
-                    ErrorCode::PairingDenied,
-                    "pairing or resume rejected",
-                ));
-            }
-        };
-        if !scope.valid() || !scope.is_project() {
-            return Err(WireError::new(
-                ErrorCode::InvalidRequest,
-                "invalid binding scope",
-            ));
+            _ => return Err(WireError::new(ErrorCode::PairingDenied, "pairing required")),
         }
-        auth.generation = auth
-            .generation
-            .checked_add(1)
-            .ok_or_else(|| WireError::new(ErrorCode::Limit, "lease generations exhausted"))?;
+        auth.generation = generation;
         auth.lease_deadline = Instant::now() + Duration::from_secs(15);
         Ok(WireFrame::Hello {
             descriptor,
@@ -395,7 +420,7 @@ impl Bridge {
                 .credential
                 .clone()
                 .ok_or_else(|| WireError::new(ErrorCode::Denied, "missing credential"))?,
-            lease_generation: auth.generation.to_string(),
+            lease_generation: generation.to_string(),
         })
     }
     pub(crate) async fn check_lease(&self, generation: &str) -> Result<BindingScope, WireError> {

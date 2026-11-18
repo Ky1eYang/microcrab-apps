@@ -67,10 +67,19 @@ pub(super) fn deferred(managed: &super::Managed) -> bool {
         .upgrade()
         .is_some_and(|slot| slot.initialization_deferred.load(Ordering::Acquire))
 }
+/// A capability-empty Server Host needs no browser compute route to initialize.
+/// This controls startup scheduling only; Session.start still enforces actual policy.
+pub(super) fn requires_deferred_start(
+    chat_only: bool,
+    initialization: microcrab_permission::Action,
+) -> bool {
+    !(chat_only && initialization == microcrab_permission::Action::Allow)
+}
+
 pub(super) fn deferred_error() -> WireError {
     WireError::new(
         "agent_init_deferred",
-        "Bind the session executor, then explicitly open the session to initialize its Agent",
+        "Bind an owner interaction client, then explicitly open the session to initialize its Agent; execution Hosts also require their executor",
     )
 }
 pub(super) async fn open_deferred(
@@ -109,15 +118,30 @@ pub(super) async fn open_deferred(
     if !manager.embedded {
         manager.record_host(record).await?;
     }
-    if !managed
-        .client_tools
-        .with_executor(|executor| executor.is_some())
-        .await
-    {
-        return Err(WireError::new(
-            "executor_required",
-            "Bind the session executor before initializing its Agent",
-        ));
+    let chat_only = managed.host_flavor == Some(super::conversation_flavors::HostFlavor::ChatOnly);
+    let interactive = if chat_only {
+        managed
+            .client_tools
+            .with_interaction_audience(|present| present)
+            .await
+    } else {
+        managed
+            .client_tools
+            .with_executor(|executor| executor.is_some())
+            .await
+    };
+    if !interactive {
+        return Err(if chat_only {
+            WireError::new(
+                "participant_required",
+                "Bind an owner participant before initializing this Chat Only Agent",
+            )
+        } else {
+            WireError::new(
+                "executor_required",
+                "Bind the session executor before initializing its Agent",
+            )
+        });
     }
     let admission = Admission::acquire(slot.clone())?;
     slot.initialization_deferred.store(false, Ordering::Release);
@@ -326,4 +350,19 @@ pub(super) async fn retry(
     let snapshot = manager.refresh(&managed).await.map_err(safe)?;
     result?;
     view::bound_snapshot(snapshot).map_err(safe)
+}
+
+#[cfg(test)]
+mod startup_policy_tests {
+    use super::*;
+    #[test]
+    fn only_chat_only_allow_starts_without_a_bound_browser_client() {
+        use microcrab_permission::Action;
+        assert!(!requires_deferred_start(true, Action::Allow));
+        assert!(requires_deferred_start(true, Action::Ask));
+        assert!(requires_deferred_start(true, Action::Deny));
+        for policy in [Action::Allow, Action::Ask, Action::Deny] {
+            assert!(requires_deferred_start(false, policy));
+        }
+    }
 }

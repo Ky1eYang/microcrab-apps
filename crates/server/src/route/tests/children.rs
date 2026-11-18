@@ -62,5 +62,53 @@ async fn child_resources_are_parent_scoped_readonly_and_validate_query_limits() 
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let enter_path = format!("{path}/{child}/enter");
+    let foreign = fixture
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&enter_path)
+                .header("cookie", format!("microcrab_session={other}"))
+                .header("origin", "http://127.0.0.1:4096")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), StatusCode::NOT_FOUND);
+    let wrong_origin = fixture
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&enter_path)
+                .header("cookie", format!("microcrab_session={}", fixture.token))
+                .header("origin", "https://untrusted.example")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_origin.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        fixture
+            .request("POST", &enter_path, Some(json!({"unexpected":true})))
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let pending = fixture.request("POST", &enter_path, Some(json!({}))).await;
+    assert!(
+        !pending.status().is_success(),
+        "unpublished child has no parent retention certificate and cannot be entered"
+    );
+    let after = body(fixture.request("GET", &detail_path, None).await).await;
+    assert_eq!(after["availability"], "pending");
+    assert_eq!(after["accepts_user_input"], false);
     fixture.state.manager.close().await.unwrap();
 }

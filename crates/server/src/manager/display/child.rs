@@ -18,11 +18,19 @@ pub(in crate::manager) struct ChildDisplay {
     root: String,
     routing: super::super::model::Routing,
     hub: Arc<Hub>,
+    #[expect(
+        clippy::type_complexity,
+        reason = "Child Journals retain exact owner, root and child identity in the existing shared registry"
+    )]
     journals:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, String, String), CreatorJournal>>>,
     archives: Arc<std::sync::Mutex<std::collections::HashMap<String, ChildDisplayResources>>>,
 }
 impl ChildDisplay {
+    #[expect(
+        clippy::type_complexity,
+        reason = "Construction accepts the same canonical owner-root-child Journal registry rather than introducing an alias owner"
+    )]
     pub(in crate::manager) fn new(
         config: Config,
         owner: String,
@@ -72,10 +80,11 @@ impl microcrab_creator::delegate::ChildDisplayFactory for ChildDisplay {
             let key = (self.owner.clone(), self.root.clone(), id.to_owned());
             // An evicted child falls back to checkpoint-based read-only identity;
             // no historical continuity is guessed after its runtime proof is gone.
-            if journals.len() >= 4096 && !journals.contains_key(&key) {
-                if let Some(evicted) = journals.keys().next().cloned() {
-                    journals.remove(&evicted);
-                }
+            if journals.len() >= 4096
+                && !journals.contains_key(&key)
+                && let Some(evicted) = journals.keys().next().cloned()
+            {
+                journals.remove(&evicted);
             }
             journals.insert(key, journal.clone());
         }

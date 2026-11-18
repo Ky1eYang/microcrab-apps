@@ -200,7 +200,26 @@ pub(super) async fn connection(
                     if send(&sender, ServerFrame::result(request_id, result), &cancellation).await.is_err() { log.reason = "delivery_failed"; break; }
                     continue;
                 }
-                if matches!(method, SessionMethod::ClientToolsBind | SessionMethod::ClientToolsResult | SessionMethod::ClientToolsUnbind | SessionMethod::ClientToolsPrepare | SessionMethod::ClientToolsOutput) {
+                if matches!(method, SessionMethod::ClientToolsSecret) {
+                    if requests.len() >= 32 {
+                        let result: Result<Value, WireError> = Err(WireError::new("command_limit", "Too many pending commands"));
+                        span.in_scope(|| command_completed(&result, started));
+                        if send(&sender, ServerFrame::result(request_id, result), &cancellation).await.is_err() { log.reason = "delivery_failed"; break; }
+                        continue;
+                    }
+                    let (task_state, task_principal, task_socket) = (state.clone(), principal.clone(), socket_id.clone());
+                    requests.spawn(async move {
+                        let result = if task_state.auth.check_active(&task_principal).is_err() {
+                            Err(WireError::new("unauthenticated", "Authentication unavailable"))
+                        } else {
+                            task_state.manager.client_tool_command(&task_principal, &task_socket, &command).await
+                        };
+                        command_completed(&result, started);
+                        Completed::Command { request_id, result }
+                    }.instrument(span));
+                    continue;
+                }
+                if matches!(method, SessionMethod::ClientToolsBind | SessionMethod::ClientToolsResult | SessionMethod::ClientToolsUnbind | SessionMethod::ClientToolsPrepare | SessionMethod::ClientToolsOutput | SessionMethod::ClientToolsTakeover | SessionMethod::ClientToolsArguments | SessionMethod::ClientToolsSecretOperation | SessionMethod::ClientToolsDecision) {
                     let result = state.manager.client_tool_command(&principal, &socket_id, &command).instrument(span.clone()).await;
                     span.in_scope(|| command_completed(&result, started));
                     if send(&sender, ServerFrame::result(request_id, result), &cancellation).await.is_err() { log.reason = "delivery_failed"; break; }

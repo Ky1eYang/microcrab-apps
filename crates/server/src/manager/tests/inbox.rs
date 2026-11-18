@@ -52,6 +52,14 @@ impl microcrab_session::Client for InboxModel {
                         ),
                     ),
                 ),
+                "empty_completion" => microcrab_transport::Error::Provider(
+                    microcrab_transport::ProviderError::empty_completion(
+                        microcrab_transport::EmptyCompletionFacts {
+                            reasoning_present: true,
+                            finish: microcrab_transport::EmptyCompletionFinish::Stop,
+                        },
+                    ),
+                ),
                 "limit" => microcrab_transport::Error::Limit("private limit details".into()),
                 "cancelled" => microcrab_transport::Error::Cancelled,
                 _ => unreachable!(),
@@ -174,7 +182,7 @@ async fn autonomous_pre_admission_errors_keep_exact_retry_evidence_without_provi
 #[cfg(feature = "storage-file")]
 #[tokio::test]
 async fn autonomous_known_protocol_causes_survive_queue_publication_without_private_ids() {
-    for kind in ["known_protocol", "known_provider_protocol"] {
+    for kind in ["known_protocol", "known_provider_protocol", "empty_completion"] {
         // Both producers fail within Client.complete before response admission;
         // wrapping the same cause as Provider cannot change that phase witness.
         let retry_ready = true;
@@ -212,15 +220,22 @@ async fn autonomous_known_protocol_causes_survive_queue_publication_without_priv
             .collect::<Vec<_>>();
         assert_eq!(failures.len(), 1, "{kind}");
         let result = &failures[0]["result"];
-        assert_eq!(result["error"]["code"], "protocol", "{kind}");
-        assert_eq!(
-            result["error"]["message"], "invalid tool arguments JSON",
-            "{kind}"
-        );
-        assert_eq!(
-            result["error"]["details"]["reason"], "invalid tool arguments JSON",
-            "{kind}"
-        );
+        if kind == "empty_completion" {
+            assert_eq!(result["error"]["code"], "provider");
+            assert_eq!(result["error"]["details"]["provider_code"], "empty_assistant_response");
+            assert_eq!(result["error"]["details"]["reasoning_present"], true);
+            assert_eq!(result["error"]["details"]["finish_reason"], "stop");
+        } else {
+            assert_eq!(result["error"]["code"], "protocol", "{kind}");
+            assert_eq!(
+                result["error"]["message"], "invalid tool arguments JSON",
+                "{kind}"
+            );
+            assert_eq!(
+                result["error"]["details"]["reason"], "invalid tool arguments JSON",
+                "{kind}"
+            );
+        }
         assert_eq!(result["retry_ready"], retry_ready, "{kind}");
         assert_eq!(snapshot["session"]["retry_ready"], retry_ready, "{kind}");
         assert_eq!(snapshot["inbox"]["paused"], true, "{kind}");
@@ -528,6 +543,7 @@ async fn busy_queue_and_steer_use_actual_lanes_and_replays_never_duplicate() {
                 microcrab_transport::ContentItem::User {
                     parts,
                     source: None,
+                    ..
                 } => Some(parts),
                 _ => None,
             })
@@ -600,6 +616,7 @@ async fn busy_queue_and_steer_use_actual_lanes_and_replays_never_duplicate() {
                 microcrab_transport::ContentItem::User {
                     parts,
                     source: None,
+                    ..
                 } => Some(parts),
                 _ => None,
             })

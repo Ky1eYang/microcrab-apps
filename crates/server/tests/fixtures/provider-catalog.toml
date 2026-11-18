@@ -85,3 +85,9 @@ baseURL = "https://example.com/v1beta"
 model = "gemini-2.5-flash"
 apiKey = "replace-with-your-private-provider-key"
 timeoutMs = 30000
+
+# Opt in only after verifying this exact model/route supports functionResponse.parts.
+# Discovery and omission never grant this capability; owner Provider UI has no toggle.
+[provider.example_provider_4.models.gemini-2_5-flash]
+id = "gemini-2.5-flash"
+google_function_response_media = false

@@ -2,6 +2,7 @@
 mod concurrency;
 mod factory;
 mod manager;
+mod persistence;
 use super::super::client_tools::BindRequest;
 use super::*;
 use microcrab_permission::{Permission, PermissionConfig};
@@ -73,7 +74,7 @@ fn answer(id: &str, lease: &str, decision: ReplyDecision) -> Reply {
     }
 }
 #[tokio::test]
-async fn parent_and_child_once_replies_are_executor_fenced_and_idempotent() {
+async fn parent_and_child_owner_participants_share_first_winner_receipts() {
     let (_root, bridge, lease) = setup().await;
     let observer = bridge
         .tools
@@ -96,20 +97,16 @@ async fn parent_and_child_once_replies_are_executor_fenced_and_idempotent() {
         assert_eq!(row["request"]["session_id"], session);
         assert_eq!(row["request"]["parent_session_id"], "parent");
         let id = row["request"]["request_id"].as_str().unwrap();
-        let observer_error = bridge
-            .reply("observer", answer(id, &lease, ReplyDecision::Allow))
-            .await
-            .unwrap_err();
-        assert_eq!(observer_error.code, "permission_executor_required");
         assert_eq!(
-            bridge.snapshot().await["requests"]
-                .as_array()
-                .unwrap()
-                .len(),
-            1
+            bridge
+                .reply("unbound", answer(id, "", ReplyDecision::Allow))
+                .await
+                .unwrap_err()
+                .code,
+            "permission_participant_required"
         );
         let accepted = bridge
-            .reply("socket_a", answer(id, &lease, ReplyDecision::Allow))
+            .reply("observer", answer(id, "", ReplyDecision::Allow))
             .await
             .unwrap();
         assert_eq!(accepted["remembered"], false);
@@ -119,12 +116,12 @@ async fn parent_and_child_once_replies_are_executor_fenced_and_idempotent() {
             .await
             .unwrap();
         assert_eq!(duplicate["duplicate"], true);
-        assert!(
-            bridge
-                .reply("socket_a", answer(id, &lease, ReplyDecision::Deny))
-                .await
-                .is_err()
-        );
+        let losing = bridge
+            .reply("socket_a", answer(id, &lease, ReplyDecision::Deny))
+            .await
+            .unwrap();
+        assert_eq!(losing["decision"], "allow");
+        assert_eq!(losing["duplicate"], true);
         let settled = event(&mut subscription, "permission.settled").await;
         assert_eq!(settled["request_id"], id);
         assert_eq!(settled["decision"], "allow");
@@ -134,7 +131,7 @@ async fn parent_and_child_once_replies_are_executor_fenced_and_idempotent() {
     assert!(bridge.features().remembered_grants);
 }
 #[tokio::test]
-async fn disconnect_and_rebind_never_reclaim_an_old_permission_grant() {
+async fn executor_disconnect_preserves_live_question_but_restart_never_revives_it() {
     let (_root, bridge, old_lease) = setup().await;
     let mut subscription = bridge.hub.subscribe();
     let pending_bridge = bridge.clone();
@@ -161,26 +158,17 @@ async fn disconnect_and_rebind_never_reclaim_an_old_permission_grant() {
             .await
             .is_err()
     );
-    assert!(
-        bridge
-            .reply("socket_b", answer(id, &new_lease, ReplyDecision::Allow))
-            .await
-            .is_err()
-    );
-    assert!(matches!(
-        pending.await.unwrap(),
-        Err(PermissionError::Unavailable)
-    ));
+    bridge
+        .reply("socket_b", answer(id, &new_lease, ReplyDecision::Allow))
+        .await
+        .unwrap();
+    assert_eq!(pending.await.unwrap().unwrap().action, Action::Allow);
     assert_eq!(
         event(&mut subscription, "permission.settled").await["decision"],
-        "deny"
+        "allow"
     );
     assert_eq!(bridge.snapshot().await["requests"], json!([]));
     bridge.tools.detach("socket_b").await.unwrap();
-    assert!(matches!(
-        bridge.ask(&request("parent", "next")).await,
-        Err(PermissionError::Unavailable)
-    ));
     let reopened = ClientTools::open(_root.path(), "parent").await.unwrap();
     let fresh = PermissionAsk::new("parent".into(), reopened, Arc::new(Hub::new()));
     assert_eq!(fresh.snapshot().await["requests"], json!([]));
@@ -468,27 +456,26 @@ async fn runtime_interrupt_cancels_but_questions_outlive_old_tool_deadline() {
                 ),
             )
             .await;
-        if cancelled {
-            assert!(
-                repeated.is_err(),
-                "late approval cannot revive a cancelled request"
-            );
-        } else {
-            assert_eq!(repeated.unwrap()["duplicate"], true);
-            assert!(
-                bridge
-                    .reply(
-                        "socket_a",
-                        answer(
-                            row["request"]["request_id"].as_str().unwrap(),
-                            &lease,
-                            ReplyDecision::Deny,
-                        )
-                    )
-                    .await
-                    .is_err(),
-                "conflicting replay cannot change the approved decision"
-            );
+        let repeated = repeated.unwrap();
+        assert_eq!(repeated["duplicate"], true);
+        assert_eq!(
+            repeated["decision"],
+            if cancelled { "deny" } else { "allow" }
+        );
+        if !cancelled {
+            let opposing = bridge
+                .reply(
+                    "socket_a",
+                    answer(
+                        row["request"]["request_id"].as_str().unwrap(),
+                        &lease,
+                        ReplyDecision::Deny,
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(opposing["decision"], "allow");
+            assert_eq!(opposing["duplicate"], true);
         }
         assert_eq!(count.load(Ordering::SeqCst), if cancelled { 0 } else { 1 });
         session.close().await.unwrap();

@@ -26,12 +26,39 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
+#[path = "interactions.rs"]
+mod interactions;
+
+#[cfg(test)]
+#[path = "child_secret_tests.rs"]
+mod child_secret_tests;
+
+#[cfg(test)]
+#[path = "admission_fault_tests.rs"]
+mod admission_fault_tests;
+
+#[cfg(test)]
+#[path = "private_pipeline_tests.rs"]
+mod private_pipeline_tests;
+
+#[cfg(test)]
+#[path = "private_read_tests.rs"]
+mod private_read_tests;
+
+#[cfg(test)]
+#[path = "private_interaction_tests.rs"]
+mod private_interaction_tests;
+
 #[cfg(test)]
 #[path = "settlement_tests.rs"]
 mod settlement_tests;
 
 struct Lease {
     socket: String,
+    client: String,
+    id: String,
+}
+struct Participant {
     client: String,
     id: String,
 }
@@ -42,9 +69,17 @@ struct DeferredCompletion {
 struct State {
     durable: Durable,
     lease: Option<Lease>,
+    participants: HashMap<String, Participant>,
     waiters: HashMap<String, oneshot::Sender<CallRecord>>,
     anchors: HashMap<String, Option<String>>,
     contexts: HashMap<String, ToolContext>,
+    secret_states: HashMap<String, (String, microcrab_session::State)>,
+    cancellations: HashMap<String, tokio_util::sync::CancellationToken>,
+    private_arguments: HashMap<String, Value>,
+    interaction_workers: HashMap<String, tokio::task::JoinHandle<()>>,
+    redactions: HashMap<String, microcrab_session::runtime::execution::InvocationRedaction>,
+    redaction_streams:
+        HashMap<String, microcrab_session::runtime::execution::InvocationRedactionStream>,
     buffered: HashMap<String, oneshot::Sender<ToolOutput>>,
     writers: HashMap<String, OutputWriter>,
     failures: HashMap<String, ToolFailure>,
@@ -54,6 +89,7 @@ struct State {
 pub(crate) struct ClientTools {
     parent_session_id: String,
     store: Store,
+    decisions: super::decisions::DecisionStore,
     state: AsyncMutex<State>,
     #[expect(
         clippy::type_complexity,
@@ -61,6 +97,7 @@ pub(crate) struct ClientTools {
     )]
     observer: Mutex<Option<Arc<dyn Fn(ClientToolEvent) + Send + Sync>>>,
     executor_changes: tokio::sync::watch::Sender<Option<(String, String)>>,
+    membership_changes: tokio::sync::watch::Sender<u64>,
     invocation_changes: tokio::sync::watch::Sender<Option<ClientToolEvent>>,
 }
 impl ClientTools {
@@ -81,6 +118,27 @@ impl ClientTools {
         if durable.calls.len() > MAX_CALLS {
             return Err(invalid("too many durable client tool calls"));
         }
+        if durable.secret_operations.len() > MAX_CALLS {
+            return Err(invalid("secret operation retention limit exceeded"));
+        }
+        let mut operations = HashSet::new();
+        for operation in &durable.secret_operations {
+            let id = uuid::Uuid::parse_str(&operation.operation_id)
+                .map_err(|_| invalid("invalid retained secret operation identity"))?;
+            if id.to_string() != operation.operation_id
+                || !operations.insert(&operation.operation_id)
+                || !matches!(
+                    operation.status.as_str(),
+                    "committing" | "completed" | "failed" | "interrupted"
+                )
+                || !durable
+                    .calls
+                    .iter()
+                    .any(|call| call.invocation_id == operation.invocation_id)
+            {
+                return Err(invalid("invalid retained secret operation receipt"));
+            }
+        }
         let mut changed = false;
         for call in &mut durable.calls {
             if call.parent_session_id != parent_session_id {
@@ -96,18 +154,34 @@ impl ClientTools {
                 changed = true;
             }
         }
+        for operation in &mut durable.secret_operations {
+            if operation.status == "committing" {
+                operation.status = "interrupted".into();
+                changed = true;
+            }
+        }
         if changed {
             store.commit(&durable)?;
         }
         Ok(Arc::new(Self {
             parent_session_id: parent_session_id.into(),
+            decisions: super::decisions::DecisionStore::open(
+                &data_dir.join("sessions").join(parent_session_id),
+            )?,
             store,
             state: AsyncMutex::new(State {
                 durable,
                 lease: None,
+                participants: HashMap::new(),
                 waiters: HashMap::new(),
                 anchors: HashMap::new(),
                 contexts: HashMap::new(),
+                secret_states: HashMap::new(),
+                cancellations: HashMap::new(),
+                private_arguments: HashMap::new(),
+                interaction_workers: HashMap::new(),
+                redactions: HashMap::new(),
+                redaction_streams: HashMap::new(),
                 buffered: HashMap::new(),
                 writers: HashMap::new(),
                 failures: HashMap::new(),
@@ -116,8 +190,22 @@ impl ClientTools {
             }),
             observer: Mutex::new(None),
             executor_changes: tokio::sync::watch::channel(None).0,
+            membership_changes: tokio::sync::watch::channel(0).0,
             invocation_changes: tokio::sync::watch::channel(None).0,
         }))
+    }
+    #[cfg(test)]
+    pub(super) async fn use_unlinked_receipt_fixture(&self) {
+        let mut state = self.state.lock().await;
+        for call in &mut state.durable.calls {
+            call.execution_id = None;
+        }
+    }
+    pub(crate) fn record_decision(&self, kind: &str, id: &str, value: &Value) -> Result<(), Error> {
+        self.decisions.record(kind, id, value)
+    }
+    pub(crate) fn decision(&self, kind: &str, id: &str) -> Option<Value> {
+        self.decisions.get(kind, id)
     }
     /// The callback is synchronous and must not reenter ClientTools. Holding the
     /// lease lock through approval settlement prevents detach/rebind races.
@@ -132,6 +220,35 @@ impl ClientTools {
                 .as_ref()
                 .map(|lease| (lease.socket.as_str(), lease.id.as_str())),
         )
+    }
+    /// Manager authenticates the Principal and exact parent Session before binding.
+    /// Hold membership through a synchronous decision transition, never an await.
+    pub(crate) async fn with_participant<R>(
+        &self,
+        socket: &str,
+        callback: impl FnOnce(bool) -> R,
+    ) -> R {
+        let state = self.state.lock().await;
+        callback(state.participants.contains_key(socket))
+    }
+    pub(crate) async fn with_interaction_audience<R>(&self, callback: impl FnOnce(bool) -> R) -> R {
+        let state = self.state.lock().await;
+        callback(!state.participants.is_empty())
+    }
+    pub(crate) async fn with_execution_idle<R>(&self, callback: impl FnOnce(bool) -> R) -> R {
+        let state = self.state.lock().await;
+        callback(
+            !state
+                .durable
+                .calls
+                .iter()
+                .any(|call| call.status.unsettled())
+                && state.writers.is_empty()
+                && state.contexts.is_empty(),
+        )
+    }
+    pub(crate) fn membership_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.membership_changes.subscribe()
     }
     pub(crate) fn executor_changes(
         &self,
@@ -151,7 +268,15 @@ impl ClientTools {
         lease_id: &str,
     ) -> Option<CallRecord> {
         let state = self.state.lock().await;
-        if state.lease.as_ref()?.id != lease_id {
+        if !state
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.id == lease_id)
+            && !state
+                .participants
+                .values()
+                .any(|member| member.id == lease_id)
+        {
             return None;
         }
         let call = state
@@ -616,15 +741,33 @@ impl ClientTools {
         if request.catalog_digest != current.digest {
             return Err(invalid("client tool catalog digest mismatch"));
         }
+        if state.participants.len() >= 128 && !state.participants.contains_key(socket_id) {
+            return Err(invalid("client participant limit reached"));
+        }
+        state
+            .participants
+            .entry(socket_id.into())
+            .or_insert_with(|| Participant {
+                client: request.client_id.clone(),
+                id: uuid::Uuid::new_v4().to_string(),
+            });
+        self.membership_changes
+            .send_modify(|revision| *revision = revision.saturating_add(1));
         if let Some(lease) = &state.lease {
             if lease.socket == socket_id && lease.client == request.client_id {
-                return Ok(snapshot(
+                return Ok(participant_snapshot(
                     &state,
+                    socket_id,
                     ClientRole::Executor,
                     Some(lease.id.clone()),
                 ));
             }
-            return Ok(snapshot(&state, ClientRole::Observer, None));
+            return Ok(participant_snapshot(
+                &state,
+                socket_id,
+                ClientRole::Participant,
+                None,
+            ));
         }
         let lease_id = uuid::Uuid::new_v4().to_string();
         state.lease = Some(Lease {
@@ -634,7 +777,69 @@ impl ClientTools {
         });
         self.executor_changes
             .send_replace(Some((socket_id.to_owned(), lease_id.clone())));
-        Ok(snapshot(&state, ClientRole::Executor, Some(lease_id)))
+        Ok(participant_snapshot(
+            &state,
+            socket_id,
+            ClientRole::Executor,
+            Some(lease_id),
+        ))
+    }
+    pub async fn takeover_idle(
+        &self,
+        socket_id: &str,
+        request: &BindRequest,
+    ) -> Result<BindSnapshot, Error> {
+        identifier(socket_id)?;
+        identifier(&request.client_id)?;
+        let mut state = self.state.lock().await;
+        if state
+            .participants
+            .get(socket_id)
+            .is_none_or(|member| member.client != request.client_id)
+            || state
+                .durable
+                .catalogs
+                .last()
+                .is_none_or(|catalog| catalog.digest != request.catalog_digest)
+        {
+            return Err(invalid("bound participant and exact catalog required"));
+        }
+        if let Some(lease) = &state.lease {
+            if lease.socket == socket_id && lease.client == request.client_id {
+                return Ok(participant_snapshot(
+                    &state,
+                    socket_id,
+                    ClientRole::Executor,
+                    Some(lease.id.clone()),
+                ));
+            }
+            if state
+                .durable
+                .calls
+                .iter()
+                .any(|call| call.status.unsettled())
+                || !state.writers.is_empty()
+                || !state.contexts.is_empty()
+            {
+                return Err(invalid(
+                    "client tool executor is busy; takeover requires idle execution",
+                ));
+            }
+        }
+        let lease_id = uuid::Uuid::new_v4().to_string();
+        state.lease = Some(Lease {
+            socket: socket_id.into(),
+            client: request.client_id.clone(),
+            id: lease_id.clone(),
+        });
+        self.executor_changes
+            .send_replace(Some((socket_id.into(), lease_id.clone())));
+        Ok(participant_snapshot(
+            &state,
+            socket_id,
+            ClientRole::Executor,
+            Some(lease_id),
+        ))
     }
     pub async fn result(
         &self,
@@ -653,20 +858,72 @@ impl ClientTools {
             ));
         }
         let mut state = self.state.lock().await;
-        let lease = state
-            .lease
-            .as_ref()
-            .ok_or_else(|| invalid("client tool executor is detached"))?;
-        if lease.socket != socket_id || lease.id != request.lease_id {
-            return Err(invalid("stale client tool executor lease"));
-        }
         let index = state
             .durable
             .calls
             .iter()
             .position(|call| call.invocation_id == request.invocation_id)
             .ok_or_else(|| invalid("unknown client tool invocation"))?;
+        let call = state
+            .durable
+            .calls
+            .get(index)
+            .ok_or_else(|| invalid("unknown client tool invocation"))?;
+        let participant_interaction = state.participants.contains_key(socket_id)
+            && request.lease_id.is_empty()
+            && state
+                .durable
+                .catalogs
+                .iter()
+                .filter(|catalog| catalog.digest == call.catalog_digest)
+                .flat_map(|catalog| &catalog.definitions)
+                .find(|entry| entry.definition.name == call.tool)
+                .is_some_and(|entry| entry.interaction.is_some())
+            && (!state.writers.contains_key(&request.invocation_id)
+                || state.implicit_buffers.contains(&request.invocation_id));
+        if !participant_interaction
+            && !state
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.socket == socket_id && lease.id == request.lease_id)
+        {
+            return Err(invalid("stale client tool executor lease"));
+        }
+        if state
+            .cancellations
+            .get(&request.invocation_id)
+            .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(Error::Cancelled);
+        }
         let current = &state.durable.calls[index];
+        if state
+            .durable
+            .secret_operations
+            .iter()
+            .any(|row| row.invocation_id == request.invocation_id && row.status == "committing")
+        {
+            return Err(invalid(
+                "secret interaction is claimed; observe its operation",
+            ));
+        }
+        let secret = state
+            .durable
+            .catalogs
+            .iter()
+            .filter(|catalog| catalog.digest == current.catalog_digest)
+            .flat_map(|catalog| &catalog.definitions)
+            .find(|entry| entry.definition.name == current.tool)
+            .and_then(|entry| entry.interaction.as_ref())
+            .is_some_and(|interaction| interaction.secret_writes.is_some());
+        if secret
+            && request.error.is_none()
+            && request.result.as_ref() != Some(&serde_json::json!({"status":"declined"}))
+        {
+            return Err(invalid(
+                "private secret interaction accepts only decline through generic result",
+            ));
+        }
         if state.writers.contains_key(&request.invocation_id)
             && !state.implicit_buffers.contains(&request.invocation_id)
         {
@@ -675,6 +932,9 @@ impl ClientTools {
             ));
         }
         if !current.status.unsettled() {
+            if participant_interaction {
+                return Ok(current.clone());
+            }
             if matches!(current.status, CallStatus::Completed | CallStatus::Failed)
                 && current.result == request.result
                 && current.error == request.error
@@ -688,14 +948,22 @@ impl ClientTools {
         } else {
             CallStatus::Completed
         };
-        self.commit_finish(
+        let previous_responder = state.durable.calls[index].responder_socket.clone();
+        if state.durable.calls[index].interaction || participant_interaction || secret {
+            state.durable.calls[index].responder_socket = Some(socket_id.into());
+        }
+        let outcome = self.commit_finish(
             &mut state,
             index,
             status,
             request.result.clone(),
             request.error.clone(),
             false,
-        )
+        );
+        if outcome.is_err() {
+            state.durable.calls[index].responder_socket = previous_responder;
+        }
+        outcome
     }
     /// The client computes and validates its own complete fallback. The server
     /// stores opaque JSON only; preparation cannot change mode or wait budget.
@@ -704,14 +972,13 @@ impl ClientTools {
         socket_id: &str,
         request: &PrepareRequest,
     ) -> Result<CallRecord, Error> {
+        if request.lease_id.len() > 128 {
+            return Err(invalid("legacy interaction lease witness exceeds limit"));
+        }
         bounded(&request.timeout_result, MAX_JSON_BYTES)?;
         let mut state = self.state.lock().await;
-        let lease = state
-            .lease
-            .as_ref()
-            .ok_or_else(|| invalid("client tool executor is detached"))?;
-        if lease.socket != socket_id || lease.id != request.lease_id {
-            return Err(invalid("stale client tool executor lease"));
+        if !state.participants.contains_key(socket_id) {
+            return Err(invalid("a bound owner participant is required"));
         }
         let index = state
             .durable
@@ -720,8 +987,33 @@ impl ClientTools {
             .position(|call| call.invocation_id == request.invocation_id)
             .ok_or_else(|| invalid("unknown client tool invocation"))?;
         let call = &state.durable.calls[index];
-        if call.blocking_mode.is_none() {
-            return Err(invalid("client tool is not an interaction"));
+        if call.blocking_mode.is_none()
+            || (state.writers.contains_key(&request.invocation_id)
+                && !state.implicit_buffers.contains(&request.invocation_id))
+        {
+            return Err(invalid("client tool is not a human interaction"));
+        }
+        let private_write = state
+            .durable
+            .catalogs
+            .iter()
+            .filter(|catalog| catalog.digest == call.catalog_digest)
+            .flat_map(|catalog| &catalog.definitions)
+            .find(|entry| entry.definition.name == call.tool)
+            .and_then(|entry| entry.interaction.as_ref())
+            .is_some_and(|interaction| interaction.secret_writes.is_some());
+        if private_write && request.timeout_result.is_some() {
+            return Err(invalid(
+                "private interactions cannot prepare a supplied result",
+            ));
+        }
+        if state
+            .durable
+            .secret_operations
+            .iter()
+            .any(|row| row.invocation_id == request.invocation_id && row.status == "committing")
+        {
+            return Err(invalid("private interaction already claimed"));
         }
         if call.prepared {
             if call.timeout_result != request.timeout_result {
@@ -742,7 +1034,18 @@ impl ClientTools {
         }
         let mut durable = state.durable.clone();
         durable.calls[index].prepared = true;
-        durable.calls[index].timeout_result = request.timeout_result.clone();
+        durable.calls[index].timeout_result = request
+            .timeout_result
+            .as_ref()
+            .map(|value| {
+                state
+                    .redactions
+                    .get(&request.invocation_id)
+                    .cloned()
+                    .unwrap_or_default()
+                    .try_redact_value(value)
+            })
+            .transpose()?;
         self.store.commit(&durable)?;
         state.durable = durable;
         self.emit(
@@ -889,6 +1192,10 @@ impl ClientTools {
     }
     fn complete_producer(&self, state: &mut State, call: &CallRecord) {
         state.contexts.remove(&call.invocation_id);
+        state.private_arguments.remove(&call.invocation_id);
+        state.cancellations.remove(&call.invocation_id);
+        state.redaction_streams.remove(&call.invocation_id);
+        state.redactions.remove(&call.invocation_id);
         if state
             .deferred_completions
             .get(&call.invocation_id)
@@ -967,6 +1274,14 @@ impl ClientTools {
         {
             return Err(invalid("stale client tool executor lease"));
         }
+        if !matches!(&request.event, ProducerEvent::Finish { .. })
+            && state
+                .cancellations
+                .get(&request.invocation_id)
+                .is_some_and(|token| token.is_cancelled())
+        {
+            return Err(Error::Cancelled);
+        }
         let index = state
             .durable
             .calls
@@ -976,7 +1291,58 @@ impl ClientTools {
         if !state.durable.calls[index].status.unsettled() {
             return Err(invalid("client tool invocation already settled"));
         }
-        match &request.event {
+        let call = &state.durable.calls[index];
+        if state
+            .durable
+            .catalogs
+            .iter()
+            .filter(|catalog| catalog.digest == call.catalog_digest)
+            .flat_map(|catalog| &catalog.definitions)
+            .find(|entry| entry.definition.name == call.tool)
+            .and_then(|entry| entry.interaction.as_ref())
+            .is_some_and(|interaction| interaction.secret_writes.is_some())
+        {
+            return Err(invalid(
+                "private interactions cannot publish arbitrary producer output",
+            ));
+        }
+        let redaction = state
+            .redactions
+            .get(&request.invocation_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut event = request.event.clone();
+        match &mut event {
+            ProducerEvent::Final { content, failure } => {
+                *content = redaction.redact_text(content);
+                if let Some(failure) = failure {
+                    failure.message = redaction.redact_text(&failure.message);
+                    failure.code = redaction.redact_text(&failure.code);
+                }
+            }
+            ProducerEvent::Chunk { channel, .. } => {
+                if channel
+                    .as_ref()
+                    .is_some_and(|value| redaction.redact_text(value) != *value)
+                {
+                    return Err(invalid("producer channel label contains a protected value"));
+                }
+            }
+            ProducerEvent::Finish { failure } => {
+                if let Some(failure) = failure {
+                    failure.message = redaction.redact_text(&failure.message);
+                    failure.code = redaction.redact_text(&failure.code);
+                }
+            }
+            ProducerEvent::Buffered { channels, .. } => {
+                for channel in channels {
+                    if redaction.redact_text(channel) != *channel {
+                        return Err(invalid("producer channel label contains a protected value"));
+                    }
+                }
+            }
+        }
+        match &event {
             ProducerEvent::Buffered {
                 channels,
                 initial_output,
@@ -1016,11 +1382,20 @@ impl ClientTools {
                 if content.len() > MAX_JSON_BYTES {
                     return Err(invalid("producer chunk exceeds limit"));
                 }
-                state
-                    .writers
-                    .get(&request.invocation_id)
-                    .ok_or_else(|| invalid("producer not opened"))?
-                    .append(channel.as_deref(), content)?;
+                let safe = state
+                    .redaction_streams
+                    .get_mut(&request.invocation_id)
+                    .ok_or_else(|| invalid("producer redaction scope unavailable"))?
+                    .push_ordered(channel.as_deref(), content)?;
+                for (safe_channel, safe_text) in safe {
+                    if !safe_text.is_empty() {
+                        state
+                            .writers
+                            .get(&request.invocation_id)
+                            .ok_or_else(|| invalid("producer not opened"))?
+                            .append(safe_channel.as_deref(), &safe_text)?;
+                    }
+                }
             }
             ProducerEvent::Final { content, failure } => {
                 if state.writers.contains_key(&request.invocation_id) {
@@ -1052,6 +1427,20 @@ impl ClientTools {
                 );
             }
             ProducerEvent::Finish { failure } => {
+                let tails = state
+                    .redaction_streams
+                    .get_mut(&request.invocation_id)
+                    .ok_or_else(|| invalid("producer redaction scope unavailable"))?
+                    .finish_all()?;
+                for (channel, tail) in tails {
+                    if !tail.is_empty() {
+                        state
+                            .writers
+                            .get(&request.invocation_id)
+                            .ok_or_else(|| invalid("producer not opened"))?
+                            .append(channel.as_deref(), &tail)?;
+                    }
+                }
                 if !state.writers.contains_key(&request.invocation_id) {
                     return Err(invalid("producer not opened"));
                 }
@@ -1132,6 +1521,11 @@ impl ClientTools {
         if !state.lease.as_ref().is_some_and(|lease| {
             lease.socket == socket_id && lease_id.is_none_or(|id| id == lease.id)
         }) {
+            if lease_id.is_none() {
+                state.participants.remove(socket_id);
+                self.membership_changes
+                    .send_modify(|revision| *revision = revision.saturating_add(1));
+            }
             return Ok(false);
         }
         let indices: Vec<_> = state
@@ -1154,14 +1548,30 @@ impl ClientTools {
             "client tool executor disconnected",
         )?;
         state.lease = None;
+        state.participants.remove(socket_id);
+        self.membership_changes
+            .send_modify(|revision| *revision = revision.saturating_add(1));
         self.executor_changes.send_replace(None);
         Ok(true)
     }
     pub async fn settle_all(&self, reason: &str) -> Result<(), Error> {
+        let workers = {
+            let mut state = self.state.lock().await;
+            for context in state.contexts.values() {
+                context.cancellation.cancel();
+            }
+            std::mem::take(&mut state.interaction_workers)
+        };
+        for (_, worker) in workers {
+            worker.await.map_err(|_| {
+                invalid("private interaction worker ended without cleanup acknowledgement")
+            })?;
+        }
         if reason.len() > 16 * 1024 {
             return Err(invalid("client tool settlement reason too long"));
         }
         let mut state = self.state.lock().await;
+        state.secret_states.clear();
         let indices: Vec<_> = state
             .durable
             .calls
@@ -1182,7 +1592,13 @@ impl ClientTools {
     ) -> Result<Vec<CallRecord>, Error> {
         let mut durable = state.durable.clone();
         for &index in indices {
-            finish(&mut durable.calls[index], status, None, Some(reason.into()));
+            let safe_reason = state
+                .redactions
+                .get(&durable.calls[index].invocation_id)
+                .cloned()
+                .unwrap_or_default()
+                .redact_text(reason);
+            finish(&mut durable.calls[index], status, None, Some(safe_reason));
             if state
                 .implicit_buffers
                 .contains(&durable.calls[index].invocation_id)
@@ -1214,6 +1630,29 @@ impl ClientTools {
         error: Option<String>,
         timeout_applied: bool,
     ) -> Result<CallRecord, Error> {
+        let redaction = state
+            .redactions
+            .get(&state.durable.calls[index].invocation_id)
+            .cloned()
+            .unwrap_or_default();
+        let call = &state.durable.calls[index];
+        let canonical_private_result = state
+            .durable
+            .catalogs
+            .iter()
+            .filter(|catalog| catalog.digest == call.catalog_digest)
+            .flat_map(|catalog| &catalog.definitions)
+            .find(|entry| entry.definition.name == call.tool)
+            .and_then(|entry| entry.interaction.as_ref())
+            .is_some_and(|interaction| interaction.secret_writes.is_some());
+        let result = if canonical_private_result {
+            result
+        } else {
+            result
+                .map(|value| redaction.try_redact_value(&value))
+                .transpose()?
+        };
+        let error = error.map(|value| redaction.redact_text(&value));
         let mut durable = state.durable.clone();
         finish(&mut durable.calls[index], status, result, error);
         durable.calls[index].timeout_applied = timeout_applied;
@@ -1272,6 +1711,15 @@ impl ClientTools {
         }
         let created_at_ms = now_ms();
         let blocking_mode = entry.interaction_mode(&arguments)?;
+        if entry
+            .interaction
+            .as_ref()
+            .is_some_and(|interaction| interaction.secret_writes.is_some())
+            && blocking_mode != Some(InteractionMode::Blocking)
+        {
+            return Err(invalid("private write interaction must be blocking"));
+        }
+
         let timeout_ms = entry
             .interaction
             .as_ref()
@@ -1292,7 +1740,7 @@ impl ClientTools {
         };
         let invocation_id = uuid::Uuid::new_v4().to_string();
         let mut state = self.state.lock().await;
-        if state.lease.is_none() {
+        if state.lease.is_none() && (entry.interaction.is_none() || state.participants.is_empty()) {
             return Err(invalid("client tool executor unavailable"));
         }
         if state
@@ -1321,6 +1769,10 @@ impl ClientTools {
         }) {
             return Err(invalid("duplicate client tool invocation"));
         }
+        let recorded_arguments = context
+            .recorded_arguments()
+            .map_err(|error| Error::Denied(error.public_reason().into()))?
+            .clone();
         let record = CallRecord {
             invocation_id: invocation_id.clone(),
             parent_session_id: self.parent_session_id.clone(),
@@ -1328,7 +1780,7 @@ impl ClientTools {
             call_id: context.call_id.clone(),
             execution_id: context.execution_id.map(|id| id.0),
             tool: entry.definition.name.clone(),
-            arguments,
+            arguments: recorded_arguments,
             epoch,
             turn_id: context.turn_id,
             round_id: context.round_id,
@@ -1346,6 +1798,8 @@ impl ClientTools {
             error: None,
             failure: None,
             reclaimable: entry.reclaimable,
+            interaction: entry.interaction.is_some(),
+            responder_socket: None,
             blocking_mode,
             prepared: false,
             timeout_result: None,
@@ -1366,6 +1820,18 @@ impl ClientTools {
         )?;
         self.store.commit(&durable)?;
         state.durable = durable;
+        state
+            .cancellations
+            .insert(invocation_id.clone(), context.cancellation.clone());
+        state
+            .private_arguments
+            .insert(invocation_id.clone(), arguments);
+        state
+            .redaction_streams
+            .insert(invocation_id.clone(), context.redaction_handle().stream());
+        state
+            .redactions
+            .insert(invocation_id.clone(), context.redaction_handle());
         let (sender, receiver) = oneshot::channel();
         state.waiters.insert(invocation_id.clone(), sender);
         let (buffered_sender, mut buffered_receiver) = oneshot::channel();
@@ -1494,6 +1960,13 @@ impl Tool for Adapter {
     fn definition(&self) -> ToolDefinition {
         self.entry.definition.clone()
     }
+    fn secret_delivery(&self) -> microcrab_session::runtime::tool::SecretDelivery {
+        if self.entry.interaction.is_some() {
+            microcrab_session::runtime::tool::SecretDelivery::ForwardPlaceholders
+        } else {
+            microcrab_session::runtime::tool::SecretDelivery::Resolve
+        }
+    }
     fn permission_defaults(&self) -> Vec<Permission> {
         self.entry.permissions.clone()
     }
@@ -1528,10 +2001,25 @@ impl Drop for PendingGuard {
         }
     }
 }
+fn participant_snapshot(
+    state: &State,
+    socket: &str,
+    role: ClientRole,
+    lease: Option<String>,
+) -> BindSnapshot {
+    let mut result = snapshot(state, role, lease);
+    result.participation_id = state
+        .participants
+        .get(socket)
+        .map(|member| member.id.clone());
+    result
+}
 fn snapshot(state: &State, role: ClientRole, lease_id: Option<String>) -> BindSnapshot {
     let catalog = state.durable.catalogs.last();
     let mut snapshot = BindSnapshot {
         role,
+        can_interact: matches!(role, ClientRole::Executor | ClientRole::Participant),
+        participation_id: None,
         lease_id,
         catalog_digest: catalog
             .map(|catalog| catalog.digest.clone())

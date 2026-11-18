@@ -87,11 +87,20 @@
     "timeout_ms": 60000,
     // Response safety ceiling in bytes, NOT a generation/token budget (1 GiB).
     "max_response_bytes": 1073741824,
+    // Default false. Set true only for this exact Google model/route after
+    // verifying native functionResponse.parts support; other protocols reject true.
+    "google_function_response_media": false,
   },
   // Advanced existing alternative: replace the ENTIRE provider object with
   // {"config_file":"/private/providers.toml","name":"provider_id"}.
   // That optional catalog is TOML; the Server startup configuration stays JSONC.
   // A single catalog entry can omit name. Do not mix reference and inline fields.
+  // Google catalog opt-in belongs to an exact configured model, for example:
+  // [provider.google.models.verified]
+  // id = "EXACT_VERIFIED_GOOGLE_MODEL_ID"
+  // google_function_response_media = true
+  // Omission and discovery always keep this capability false. Owner Provider UI
+  // does not expose it; configured native Data is used, with no public URL upload.
 
   // Optional display/capacity metadata for the inline model. provider_id must be
   // "configured" and id must match provider.model. This does not add model routes.

@@ -1,5 +1,5 @@
 //! Pending question image authorization is independent of assistant citations.
-//! The canonical browser invocation and its exact executor lease own eligibility;
+//! The canonical invocation and exact live participant reader token own eligibility;
 //! the existing immutable Session Host pin remains filesystem authority.
 use super::{Manager, citations, client_tools::CallRecord, now, safe};
 use crate::auth::Principal;
@@ -156,7 +156,7 @@ impl Manager {
         let record = self.record(owner, root).await?;
         let bridge = self.client_tools(root).await.map_err(safe)?;
         let mut changes = bridge.invocation_changes();
-        let mut executor = bridge.executor_changes();
+        let mut membership = bridge.membership_changes();
         let call = bridge
             .leased_pending_call(invocation, lease)
             .await
@@ -174,8 +174,8 @@ impl Manager {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err(WireError::new("cancelled", "Question image read cancelled")),
-                changed = executor.changed() => {
-                    if changed.is_err() || !executor.borrow().as_ref().is_some_and(|(_, id)| id == lease) {
+                changed = membership.changed() => {
+                    if changed.is_err() || bridge.leased_pending_call(invocation, lease).await.is_none() {
                         return Err(denied());
                     }
                 },

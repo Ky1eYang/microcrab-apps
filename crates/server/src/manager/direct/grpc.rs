@@ -37,11 +37,9 @@ fn status_error(action: &str, status: tonic::Status) -> WireError {
     ))
 }
 
-pub(super) async fn dial(
+pub(super) async fn connect(
     url: &str,
-    origin: &str,
-    handshake: &HostFrame,
-) -> Result<(Link, HostFrame), WireError> {
+) -> Result<HostBridgeClient<tonic::transport::Channel>, WireError> {
     let endpoint = tonic::transport::Endpoint::from_shared(url.to_owned())
         .map_err(|error| failure(format!("gRPC host address is invalid: {error}")))?
         .connect_timeout(Duration::from_secs(10))
@@ -51,9 +49,46 @@ pub(super) async fn dial(
         .await
         .map_err(|_| failure("gRPC host dial exceeded 10 seconds"))?
         .map_err(|error| failure(format!("gRPC host connection failed: {error}")))?;
-    let mut client = HostBridgeClient::new(channel)
+    Ok(HostBridgeClient::new(channel)
         .max_decoding_message_size(MAX_FRAME_BYTES)
-        .max_encoding_message_size(MAX_FRAME_BYTES);
+        .max_encoding_message_size(MAX_FRAME_BYTES))
+}
+pub(super) async fn inspect(
+    client: &mut HostBridgeClient<tonic::transport::Channel>,
+    origin: &str,
+    frame: &HostFrame,
+) -> Result<HostFrame, WireError> {
+    let mut request = tonic::Request::new(
+        frame_to_proto(frame).map_err(|_| failure("Cannot encode Host inspection"))?,
+    );
+    request.metadata_mut().insert(
+        "origin",
+        MetadataValue::try_from(origin)
+            .map_err(|_| failure("Server origin is not valid gRPC metadata"))?,
+    );
+    let response = tokio::time::timeout(Duration::from_secs(10), client.inspect(request))
+        .await
+        .map_err(|_| failure("gRPC Host inspection exceeded 10 seconds; pairing was not sent"))?
+        .map_err(|status| {
+            if status.code() == tonic::Code::Unimplemented {
+                return super::preflight::rejection(microcrab_host_protocol::WireError::new(
+                    microcrab_host_protocol::ErrorCode::Unsupported,
+                    "Native Host does not support authenticated inspection; pairing was not sent",
+                ));
+            }
+            status_error(
+                "gRPC Host inspection rejected; pairing was not sent",
+                status,
+            )
+        })?;
+    frame_from_proto(response.into_inner())
+        .map_err(|_| failure("gRPC Host inspection reply is invalid"))
+}
+pub(super) async fn dial(
+    mut client: HostBridgeClient<tonic::transport::Channel>,
+    origin: &str,
+    handshake: &HostFrame,
+) -> Result<(Link, HostFrame), WireError> {
     let (control, control_rx) = mpsc::channel(32);
     let mut request = tonic::Request::new(ReceiverStream::new(control_rx));
     request.metadata_mut().insert(
@@ -71,13 +106,11 @@ pub(super) async fn dial(
         .await
         .map_err(|_| failure("gRPC host control stream exceeded 10 seconds"))?
         .map_err(|status| status_error("gRPC host control stream rejected", status))?;
-    let mut execute_token = response
+    let execute_token = response
         .metadata()
         .get(GRPC_EXECUTE_TOKEN_HEADER)
         .filter(|value| value.to_str().is_ok_and(|text| !text.is_empty()))
-        .cloned()
-        .ok_or_else(|| failure("Authenticated gRPC Control omitted its Execute capability"))?;
-    execute_token.set_sensitive(true);
+        .cloned();
     let mut inbound = response.into_inner();
     let hello = tokio::time::timeout(Duration::from_secs(10), inbound.message())
         .await
@@ -90,6 +123,12 @@ pub(super) async fn dial(
             error.message
         ))
     })?;
+    if let HostFrame::HandshakeRejected { error } = hello {
+        return Err(super::preflight::rejection(error));
+    }
+    let mut execute_token = execute_token
+        .ok_or_else(|| failure("Authenticated gRPC Control omitted its Execute capability"))?;
+    execute_token.set_sensitive(true);
     Ok((
         Link {
             client,
@@ -207,6 +246,10 @@ async fn execute(
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The gRPC worker preserves explicit owner, Project, socket and generation fences with independent transport cleanup"
+)]
 pub(super) fn spawn_worker(
     link: Link,
     mut outgoing: mpsc::Receiver<HostFrame>,
@@ -249,10 +292,10 @@ pub(super) fn spawn_worker(
                                 Ok((id, result)) => (id, result),
                                 Err(error) => (error.id(), Err(format!("gRPC Host Execute task stopped: {error}"))),
                             };
-                            if let Some((request, operation, _)) = calls.remove(&id) {
-                                if let Err(message) = result {
-                                    writer_route.fail(&request, &operation, message).await;
-                                }
+                            if let Some((request, operation, _)) = calls.remove(&id)
+                                && let Err(message) = result
+                            {
+                                writer_route.fail(&request, &operation, message).await;
                             }
                         }
                     }

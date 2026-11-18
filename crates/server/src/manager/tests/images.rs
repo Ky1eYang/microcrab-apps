@@ -14,8 +14,46 @@ fn image_png(bytes: usize) -> Vec<u8> {
 }
 
 #[test]
+fn tool_image_projection_exposes_only_canonical_authenticated_references() {
+    let item = microcrab_session::context::ContentItem::Tool {
+        call_id: "read-image".into(),
+        content: "image result".into(),
+        parts: vec![
+            InputPart::Text {
+                text: "typed annotation".into(),
+            },
+            InputPart::Image {
+                source: ImageSource::Data {
+                    media_type: "image/png".into(),
+                    data: image_png(1024),
+                },
+            },
+            InputPart::Image {
+                source: ImageSource::Url {
+                    url: "https://user:secret@example.invalid/private".into(),
+                },
+            },
+        ],
+    };
+    let id = images::message_id("session", 3, 0, &item);
+    let messages = view::messages(vec![item], 3, "session");
+    assert_eq!(messages[0]["role"], "tool");
+    assert_eq!(
+        messages[0]["parts"][0]["source"]["url"],
+        format!("/api/v1/sessions/session/images/{id}/1")
+    );
+    assert_eq!(messages[0]["parts"][1]["source_omitted"], true);
+    assert_eq!(messages[0]["images_omitted"], true);
+    let serialized = serde_json::to_string(&messages).unwrap();
+    assert!(!serialized.contains("secret"));
+    assert!(!serialized.contains("media_type"));
+    assert!(!serialized.contains("typed annotation"));
+}
+
+#[test]
 fn image_projection_preserves_identity_part_indices_and_large_message_references() {
     let item = microcrab_session::context::ContentItem::User {
+        envelope: None,
         source: None,
         parts: vec![
             InputPart::Text {
