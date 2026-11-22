@@ -49,10 +49,35 @@ pub struct Bridge {
     pub(crate) processes: processes::Processes,
     _workspace_lock: std::fs::File,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PairingMode {
+    Tokenless,
+    Generated,
+    Custom,
+}
+impl PairingMode {
+    fn configure(require_token: bool, custom_token: Option<String>) -> (Self, Option<String>) {
+        match (require_token, custom_token) {
+            (false, _) => (Self::Tokenless, None),
+            (true, None) => (Self::Generated, Some(Uuid::new_v4().to_string())),
+            (true, Some(token)) => (Self::Custom, Some(token)),
+        }
+    }
+
+    fn requires_token(self) -> bool {
+        self != Self::Tokenless
+    }
+
+    fn consume(self, token: &mut Option<String>) {
+        if self == Self::Generated {
+            *token = None;
+        }
+    }
+}
+
 pub(crate) struct Authority {
     token: Option<String>,
-    require_token: bool,
-    pair_deadline: Instant,
+    pairing_mode: PairingMode,
     credential: Option<String>,
     /// Current capability/lease ownership only; backend owns durable registration.
     scope: Option<BindingScope>,
@@ -88,6 +113,16 @@ impl Bridge {
         custom_token: Option<String>,
         policy: BridgePolicy,
     ) -> Result<(Arc<Self>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+        let (pairing_mode, token) = PairingMode::configure(require_token, custom_token);
+        let bridge = Self::open_with_pairing(root, pairing_mode, token.clone(), policy)?;
+        Ok((bridge, token))
+    }
+    fn open_with_pairing(
+        root: &Path,
+        pairing_mode: PairingMode,
+        token: Option<String>,
+        policy: BridgePolicy,
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error + Send + Sync>> {
         let root = std::fs::canonicalize(root)?;
         let state_dir = root.join(".microcrab").join("host-bridge");
         // Refuse symlink/reparse private storage rather than redirect credentials/receipts.
@@ -226,48 +261,33 @@ impl Bridge {
             descriptor_digest: String::new(),
         };
         descriptor.descriptor_digest = descriptor_fingerprint(&descriptor)?;
-        let has_custom = custom_token.is_some();
-        let token = if require_token {
-            Some(custom_token.unwrap_or_else(|| Uuid::new_v4().to_string()))
-        } else {
-            None
-        };
-        let pair_deadline = if has_custom || !require_token {
-            Instant::now() + Duration::from_secs(315360000)
-        } else {
-            Instant::now() + Duration::from_secs(120)
-        };
         let receipts = receipts::ReceiptStore::open(&state_dir, &descriptor.workspace_id)?;
         // Backend owns Project -> Host/workspace registration. Older releases
         // persisted binding.json and binding-host.json here; leave those files
         // untouched, but never treat their stale Project IDs as authorization.
-        Ok((
-            Arc::new(Self {
-                descriptor,
-                host,
-                policy,
-                legacy_host_id: identity.host_id,
-                state_dir,
-                authority: Mutex::new(Authority {
-                    token: token.clone(),
-                    require_token,
-                    pair_deadline,
-                    credential: None,
-                    scope: None,
-                    bound_host_id: None,
-                    generation: 0,
-                    lease_deadline: Instant::now(),
-                    credential_deadline: Instant::now() + Duration::from_secs(43200),
-                }),
-                executing: std::sync::Mutex::new(HashMap::new()),
-                admission: Mutex::new(()),
-                egress: Mutex::new(()),
-                receipts: Mutex::new(receipts),
-                processes: processes::Processes::default(),
-                _workspace_lock: workspace_lock,
+        Ok(Arc::new(Self {
+            descriptor,
+            host,
+            policy,
+            legacy_host_id: identity.host_id,
+            state_dir,
+            authority: Mutex::new(Authority {
+                token,
+                pairing_mode,
+                credential: None,
+                scope: None,
+                bound_host_id: None,
+                generation: 0,
+                lease_deadline: Instant::now(),
+                credential_deadline: Instant::now() + Duration::from_secs(43200),
             }),
-            token,
-        ))
+            executing: std::sync::Mutex::new(HashMap::new()),
+            admission: Mutex::new(()),
+            egress: Mutex::new(()),
+            receipts: Mutex::new(receipts),
+            processes: processes::Processes::default(),
+            _workspace_lock: workspace_lock,
+        }))
     }
     pub async fn authenticate(&self, frame: WireFrame) -> Result<WireFrame, WireError> {
         self.authenticate_mode(frame, None).await
@@ -284,20 +304,14 @@ impl Bridge {
             ));
         }
         match frame {
-            WireFrame::Pair { token, .. } if auth.require_token => {
-                if auth.token.as_ref() != Some(token) {
-                    return Err(WireError::new(ErrorCode::PairingDenied, "pairing denied"));
-                }
-                if Instant::now() >= auth.pair_deadline {
-                    return Err(WireError::new(
-                        ErrorCode::Timeout,
-                        "pairing capability expired; obtain a fresh local capability",
-                    ));
-                }
+            WireFrame::Pair { token, .. }
+                if auth.pairing_mode.requires_token() && auth.token.as_ref() != Some(token) =>
+            {
+                return Err(WireError::new(ErrorCode::PairingDenied, "pairing denied"));
             }
             WireFrame::Resume {
                 credential, scope, ..
-            } if auth.require_token
+            } if auth.pairing_mode.requires_token()
                 && (auth.credential.as_ref() != Some(credential)
                     || auth.scope.as_ref() != Some(scope)
                     || Instant::now() >= auth.credential_deadline) =>
@@ -390,11 +404,7 @@ impl Bridge {
             .ok_or_else(|| WireError::new(ErrorCode::Limit, "lease generations exhausted"))?;
         match frame {
             WireFrame::Pair { scope, .. } => {
-                if auth.require_token
-                    && auth.pair_deadline < Instant::now() + Duration::from_secs(3600)
-                {
-                    auth.token = None;
-                }
+                auth.pairing_mode.consume(&mut auth.token);
                 auth.credential = Some(Uuid::new_v4().to_string());
                 auth.credential_deadline = Instant::now() + Duration::from_secs(43200);
                 auth.scope = Some(scope);
@@ -403,7 +413,7 @@ impl Bridge {
             WireFrame::Resume {
                 credential, scope, ..
             } => {
-                if !auth.require_token {
+                if !auth.pairing_mode.requires_token() {
                     auth.credential = Some(credential);
                     auth.scope = Some(scope);
                     auth.bound_host_id = Some(descriptor.host_id.clone());

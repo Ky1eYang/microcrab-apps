@@ -234,14 +234,14 @@ pub(super) async fn connection(
                     if send(&sender, ServerFrame::result(request_id, result), &cancellation).await.is_err() { log.reason = "delivery_failed"; break; }
                     continue;
                 }
-                let (task_state, task_principal) = (state.clone(), principal.clone());
+                let (task_state, task_principal, sender_socket) = (state.clone(), principal.clone(), socket_id.clone());
                 requests.spawn(async move {
                     let started = std::time::Instant::now();
                     tracing::info!("WS command started");
                     let result = if task_state.auth.check_active(&task_principal).is_err() {
                         Err(WireError::new("unauthenticated", "Authentication unavailable"))
                     } else {
-                        task_state.manager.command(&task_principal, &command).await
+                        task_state.manager.command_with_sender(&task_principal, &command, Some(sender_socket)).await
                     };
                     command_completed(&result, started);
                     Completed::Command { request_id, result }

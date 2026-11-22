@@ -83,6 +83,19 @@ impl microcrab_session::Client for Admission {
             .await;
         }
     }
+    async fn observe_tool_result_admitted(
+        &self,
+        epoch: u64,
+        items: &[microcrab_transport::ContentItem],
+        assistant_index: usize,
+        call_index: usize,
+        execution_id: u64,
+        terminal_status: Option<&str>,
+    ) {
+        self.client
+            .observe_tool_result_admitted(epoch, items, assistant_index, call_index, execution_id, terminal_status)
+            .await;
+    }
     async fn complete(
         &self,
         content: &microcrab_transport::Content,
@@ -114,6 +127,21 @@ impl microcrab_session::Client for Admission {
         cancellation: CancellationToken,
         events: Option<tokio::sync::mpsc::Sender<microcrab_transport::ModelEvent>>,
     ) -> Result<microcrab_protocol::Response, microcrab_transport::Error> {
+        let managed = self
+            .managed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .upgrade();
+        if let Some(managed) = managed {
+            // Core applies pending native mode changes after the admitted batch.
+            // Observe the live mode before sending the next provider request.
+            // Serialize with manual replies and asynchronous snapshot publication.
+            let _record = managed.record.lock().await;
+            if !managed.closing.load(Ordering::Acquire) {
+                let state = managed.session.state();
+                managed.hub.applied_mode(state.selected_mode.as_deref());
+            }
+        }
         self.client
             .stream_admitted(content, auditor, variables, cancellation, events)
             .await

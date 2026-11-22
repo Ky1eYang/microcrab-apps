@@ -23,7 +23,11 @@ async fn host_inspection_and_provisional_cleanup_are_owner_scoped_http_resources
     assert_eq!(state["connected"], false);
     assert_eq!(state["ready"], false);
     assert_eq!(state["reconciling"], false);
+    assert_eq!(state["carrier_mode"], "detached");
+    assert_eq!(state["descriptor"], Value::Null);
+    assert_eq!(state["connection_generation"], Value::Null);
     assert_eq!(state["scope"], Value::Null);
+
     let operations = fixture
         .request("GET", "/api/v1/projects/draft/operations?limit=100", None)
         .await;

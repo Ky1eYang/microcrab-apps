@@ -1,23 +1,73 @@
 //! Owner-scoped inspection never exposes original request bodies or completed values.
-use super::{Manager, safe, unavailable};
+use super::{
+    Manager,
+    bindings::{ProjectCarrier, ProjectCarrierMode, Route},
+    safe, unavailable,
+};
 use crate::auth::Principal;
+use microcrab_host_protocol::{BindingScope, HostDescriptor};
 use microcrab_protocol::application::WireError;
 use serde_json::{Value, json};
+
+/// Apply the Manager's admission gate even if the RemoteHost is already ready.
+fn project_host_view(
+    project: &str,
+    embedded: bool,
+    route: Option<&Route<ProjectCarrier>>,
+    readiness: Option<&Value>,
+    scope: Option<BindingScope>,
+) -> Value {
+    let connected = readiness.is_some_and(|state| state["connected"] == true);
+    let carrier = route.filter(|_| connected).map(|route| &route.carrier);
+    let mode = if embedded {
+        json!("embedded")
+    } else if let Some(carrier) = carrier {
+        json!(carrier.mode)
+    } else {
+        json!("detached")
+    };
+    let descriptor = carrier.map(|carrier| {
+        let HostDescriptor {
+            host_id,
+            workspace_id,
+            workspace_root,
+            platform,
+            tool_capabilities,
+            supported_primitives,
+            ..
+        } = &carrier.descriptor;
+        json!({"host_id":host_id,"workspace_id":workspace_id,"workspace_root":workspace_root,
+            "platform":platform,"tool_capabilities":tool_capabilities,
+            "supported_primitives":supported_primitives})
+    });
+    json!({
+        "project_id": project,
+        "connection_generation": route.map(|r| r.generation.to_string()),
+        "carrier_mode": mode,
+        "descriptor": descriptor,
+        "connected": embedded || connected,
+        "reconciling": connected && readiness.is_some_and(|state| state["reconciling"] == true),
+        "ready": embedded || connected && route.is_some_and(|r| r.ready)
+            && readiness.is_some_and(|state| state["ready"] == true),
+        "scope": scope,
+        "reconciliation_error": readiness.map(|state| &state["cause"]),
+        "readiness": readiness,
+        "diagnostics": route.map(|r| r.remote.diagnostics(64)).unwrap_or_default(),
+    })
+}
 
 impl Manager {
     async fn inspect_project_owner(
         &self,
         principal: &Principal,
         project: &str,
-    ) -> Result<(), WireError> {
+    ) -> Result<Option<BindingScope>, WireError> {
         if !self.allows_project(principal, project) {
             return Err(unavailable());
         }
-        if self
-            .pins
-            .grant(project)
-            .await
-            .map_err(safe)?
+        let grant = self.pins.grant(project).await.map_err(safe)?;
+        if grant
+            .as_ref()
             .is_some_and(|grant| grant.owner != principal.owner)
             || self
                 .pins
@@ -28,30 +78,61 @@ impl Manager {
         {
             return Err(unavailable());
         }
-        Ok(())
+        Ok(grant.map(|grant| {
+            BindingScope::project(grant.backend_id, grant.binding_id, grant.project_id)
+        }))
     }
     pub(super) async fn host_state(
         &self,
         principal: &Principal,
         project: &str,
     ) -> Result<Value, WireError> {
-        self.inspect_project_owner(principal, project).await?;
-        let grant = self.pins.grant(project).await.map_err(safe)?;
+        let _identity = self.identity_gate.lock().await;
+        let scope = self.inspect_project_owner(principal, project).await?;
         let routes = self.routes.lock().await;
+        if !self.allows_project(principal, project) {
+            return Err(unavailable());
+        }
         let route = routes
             .get(project)
-            .filter(|route| route.owner == principal.owner);
+            .filter(|route| !self.embedded && route.owner == principal.owner);
         let readiness = route.map(|route| route.remote.readiness());
-        Ok(
-            json!({"project_id":project,"connection_generation":route.map(|r| r.generation.to_string()),
-            "connected":self.embedded || readiness.as_ref().is_some_and(|state| state["connected"] == true),
-            "reconciling":readiness.as_ref().is_some_and(|state| state["reconciling"] == true),
-            "ready":self.embedded || route.is_some_and(|r| r.ready) && readiness.as_ref().is_some_and(|state| state["ready"] == true),
-            "scope":grant.map(|g| microcrab_host_protocol::BindingScope::project(g.backend_id,g.binding_id,g.project_id)),
-            "reconciliation_error":readiness.as_ref().map(|state| &state["cause"]),
-            "readiness":readiness,
-            "diagnostics":route.map(|r| r.remote.diagnostics(64)).unwrap_or_default()}),
-        )
+        Ok(project_host_view(
+            project,
+            self.embedded,
+            route,
+            readiness.as_ref(),
+            scope,
+        ))
+    }
+
+    /// Keep the existing connect response shape, using the same route sample for
+    /// the full accepted descriptor, legacy transport label and readiness.
+    pub(super) async fn observe_direct_route(
+        &self,
+        principal: &Principal,
+        project: &str,
+    ) -> Result<Option<Value>, WireError> {
+        let _identity = self.identity_gate.lock().await;
+        let scope = self.inspect_project_owner(principal, project).await?;
+        let routes = self.routes.lock().await;
+        if !self.allows_project(principal, project) {
+            return Err(unavailable());
+        }
+        let Some(route) = routes.get(project).filter(|route| {
+            route.owner == principal.owner && route.carrier.mode != ProjectCarrierMode::BrowserRelay
+        }) else {
+            return Ok(None);
+        };
+        let readiness = route.remote.readiness();
+        if readiness["connected"] != true {
+            return Ok(None);
+        }
+        let mut view = project_host_view(project, false, Some(route), Some(&readiness), scope);
+        view["descriptor"] = json!(route.carrier.descriptor);
+        view["transport"] = json!(route.carrier.mode.transport());
+        view["observed_existing"] = json!(true);
+        Ok(Some(view))
     }
     pub(super) async fn host_operations(
         &self,

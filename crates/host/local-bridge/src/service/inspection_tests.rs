@@ -1,5 +1,6 @@
 //! Inspection authenticates availability without acquiring controller authority.
 use super::*;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 type AuthoritySnapshot = (
@@ -8,7 +9,6 @@ type AuthoritySnapshot = (
     Option<BindingScope>,
     Option<String>,
     u64,
-    Instant,
     Instant,
     Instant,
 );
@@ -22,7 +22,6 @@ async fn authority(bridge: &Bridge) -> AuthoritySnapshot {
         auth.generation,
         auth.lease_deadline,
         auth.credential_deadline,
-        auth.pair_deadline,
     )
 }
 fn pair(token: &str, project: &str) -> WireFrame {

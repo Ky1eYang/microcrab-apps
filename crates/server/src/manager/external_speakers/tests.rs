@@ -49,6 +49,7 @@ fn session_override_disable_add_and_keep_are_sparse_and_fail_closed() {
         "override".into(),
         SessionLayer {
             project_id: Some("project".into()),
+            inherited_rebinds: Default::default(),
             speakers: layer(
                 json!({
                     "monitor":{"action":"set","key":{"kind":"custom","value":key('b')}},
@@ -63,6 +64,7 @@ fn session_override_disable_add_and_keep_are_sparse_and_fail_closed() {
         "disabled".into(),
         SessionLayer {
             project_id: Some("project".into()),
+            inherited_rebinds: Default::default(),
             speakers: layer(json!({"monitor":{"action":"disable"}}), true, None),
         },
     );
@@ -132,6 +134,7 @@ fn duplicate_key_origins_and_ambiguous_effective_sets_reject_atomically() {
         "one".into(),
         SessionLayer {
             project_id: Some("project".into()),
+            inherited_rebinds: Default::default(),
             speakers: layer(
                 json!({"different":{"action":"set","key":{"kind":"custom","value":key('a')}}}),
                 true,
@@ -147,6 +150,7 @@ fn duplicate_key_origins_and_ambiguous_effective_sets_reject_atomically() {
             session.into(),
             SessionLayer {
                 project_id: Some("project".into()),
+                inherited_rebinds: Default::default(),
                 speakers: layer(
                     json!({"local":{"action":"set","key":{"kind":"custom","value":key('b')}}}),
                     true,

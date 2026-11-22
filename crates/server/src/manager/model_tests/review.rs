@@ -43,15 +43,15 @@ fn assert_review_wire(
     model: &str,
     credential: &str,
     variant: Option<&str>,
-    expected_reviews: usize,
+    expected_inputs: &[&str],
 ) {
     let requests = provider.wire.requests.lock().unwrap();
     let reviews = requests
         .iter()
         .filter(|(_, body)| body.get("tools").is_none())
         .collect::<Vec<_>>();
-    assert_eq!(reviews.len(), expected_reviews);
-    for (authorization, body) in reviews {
+    assert_eq!(reviews.len(), expected_inputs.len());
+    for ((authorization, body), input) in reviews.into_iter().zip(expected_inputs) {
         assert_eq!(authorization, credential);
         assert_eq!(body["model"], model);
         assert_eq!(
@@ -64,18 +64,15 @@ fn assert_review_wire(
         let prompt = messages[0]["content"].as_str().unwrap();
         assert!(prompt.contains("# system\n"));
         assert!(prompt.contains("# tool\n"));
-        assert!(prompt.contains("# user\n"));
+        assert!(prompt.contains("Operation kind: tool"));
         assert!(prompt.contains("<untrusted_tool_name>\nsleep\n</untrusted_tool_name>"));
-        let request = prompt
-            .split_once("<untrusted_permission_request>\n")
-            .unwrap()
-            .1
-            .split_once("\n</untrusted_permission_request>")
-            .unwrap()
-            .0;
-        let request: Value = serde_json::from_str(request).unwrap();
-        assert_eq!(request["tool"], "sleep");
-        assert!(!prompt.contains("private conversation seed"));
+        assert!(prompt.contains("<untrusted_tool_arguments>\n{\"time_ms\":1}\n"));
+        assert!(prompt.contains(&format!(
+            "<untrusted_user_input>\n{input}\n</untrusted_user_input>"
+        )));
+        assert_eq!(prompt.matches("private conversation seed").count(), 1);
+        assert!(prompt.contains("<untrusted_mode_prompt>"));
+        assert!(!prompt.contains("sleep-call-"));
         assert_eq!(messages[1], json!({"role":"user", "content":"begin"}));
     }
 }
@@ -135,7 +132,13 @@ async fn default_review_uses_current_wire_model_after_selection_and_restore() {
     .unwrap();
     submit(&manager, &managed, "private conversation seed first").await;
     assert!(!managed.session.has_continuation());
-    assert_review_wire(&a, "model-a", "Bearer test-a", None, 1);
+    assert_review_wire(
+        &a,
+        "model-a",
+        "Bearer test-a",
+        None,
+        &["private conversation seed first"],
+    );
     let revision = managed.record.lock().await.revision;
     select(
         &manager,
@@ -147,7 +150,13 @@ async fn default_review_uses_current_wire_model_after_selection_and_restore() {
     .unwrap();
     submit(&manager, &managed, "private conversation seed second").await;
     assert!(!managed.session.has_continuation());
-    assert_review_wire(&b, "model-b", "Bearer test-b", Some("high"), 1);
+    assert_review_wire(
+        &b,
+        "model-b",
+        "Bearer test-b",
+        Some("high"),
+        &["private conversation seed second"],
+    );
     assert!(managed.session.messages().iter().all(|message| {
         !serde_json::to_string(message)
             .unwrap()
@@ -174,7 +183,22 @@ async fn default_review_uses_current_wire_model_after_selection_and_restore() {
     )
     .await;
     assert!(!restored.session.has_continuation());
-    assert_review_wire(&a, "model-a", "Bearer test-a", None, 1);
-    assert_review_wire(&b, "model-b", "Bearer test-b", Some("high"), 2);
+    assert_review_wire(
+        &a,
+        "model-a",
+        "Bearer test-a",
+        None,
+        &["private conversation seed first"],
+    );
+    assert_review_wire(
+        &b,
+        "model-b",
+        "Bearer test-b",
+        Some("high"),
+        &[
+            "private conversation seed second",
+            "private conversation seed after restore",
+        ],
+    );
     reopened.close().await.unwrap();
 }

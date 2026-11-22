@@ -36,6 +36,10 @@ fn parse_client_calls_query(uri: &axum::http::Uri) -> Result<Value, super::error
     parse_query::<ClientCallsQuery>(uri)
 }
 
+fn parse_executions_query(uri: &axum::http::Uri) -> Result<Value, super::error::Error> {
+    parse_query::<crate::manager::execution_history::Query>(uri)
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ExecutionContentQuery {
@@ -65,7 +69,7 @@ pub(crate) const ENDPOINTS: &[Endpoint] = &[
         "/api/v1/sessions/{session_id}/executions",
         commands::EXECUTIONS_LIST,
     )
-    .with_query(parse_client_calls_query),
+    .with_query(parse_executions_query),
     Endpoint::get(
         "/api/v1/sessions/{session_id}/executions/{execution_id}/content",
         commands::EXECUTIONS_CONTENT,

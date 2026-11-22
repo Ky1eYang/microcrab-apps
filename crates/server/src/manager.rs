@@ -19,7 +19,8 @@ mod deletion;
 mod detached;
 pub(crate) mod direct;
 mod display;
-mod external_inbox;
+pub(crate) mod execution_history;
+pub(crate) mod external_inbox;
 pub(crate) mod external_speakers;
 mod fork;
 mod host_inspection;
@@ -39,6 +40,7 @@ mod naming;
 mod observation;
 mod permission_ask;
 mod prompt_defaults;
+pub(crate) mod prompt_history;
 mod providers;
 pub(crate) mod question_images;
 mod round_limit;
@@ -88,7 +90,7 @@ pub struct Manager {
     embedded: bool,
     pins: microcrab_storage::execution::ExecutionPins,
     conversation_flavors: Arc<conversation_flavors::Flavors>,
-    routes: AsyncMutex<HashMap<String, bindings::Route>>,
+    routes: AsyncMutex<HashMap<String, bindings::Route<bindings::ProjectCarrier>>>,
     direct_hosts: direct::Hosts,
     conversation_routes: AsyncMutex<HashMap<String, bindings::Route>>,
     // Serialize canonical identity lookup, immutable pin publication and metadata finalization.
@@ -118,6 +120,8 @@ pub struct Manager {
     self_ref: std::sync::Weak<Manager>,
     client_override: Option<Arc<dyn microcrab_session::Client>>,
     citation_admission: Arc<Semaphore>,
+    external_reply_admission: Arc<Semaphore>,
+    external_reply_stop: tokio_util::sync::CancellationToken,
     admission: Arc<Semaphore>,
     control_admission: Arc<Semaphore>,
     tasks: Mutex<JoinSet<()>>,
@@ -329,7 +333,7 @@ impl Manager {
         command: &Command,
     ) -> Result<Value, WireError> {
         let id = command.session_id.as_deref().ok_or_else(unavailable)?;
-        self.record(&principal.owner, id).await?;
+        let record = self.record(&principal.owner, id).await?;
         let tools = self.client_tools(id).await.map_err(safe)?;
         match command.method.as_str() {
             "client_tools.decision" => {
@@ -368,13 +372,23 @@ impl Manager {
             }
             "client_tools.takeover" => {
                 let params = commands::parse::<client_tools::BindRequest>(command)?;
-                serde_json::to_value(
-                    tools
-                        .takeover_idle(socket_id, &params)
-                        .await
-                        .map_err(safe)?,
-                )
-                .map_err(|_| unavailable())
+                // Compatibility for older frontends. This explicit command may
+                // not replace the executor selected by an active input owner.
+                let slot = self.registry.lock().unwrap_or_else(|error| error.into_inner()).get(&record.id).cloned();
+                let active = match slot {
+                    Some(slot) => slot.active.lock().await.clone(),
+                    None => None,
+                };
+                let _gate = match active.as_ref() {
+                    Some(managed) => {
+                        let gate = managed.commands.lock().await;
+                        commands::idle(managed)?;
+                        Some(gate)
+                    }
+                    None => None,
+                };
+                serde_json::to_value(tools.takeover_idle(socket_id, &params).await.map_err(safe)?)
+                    .map_err(|_| unavailable())
             }
             "client_tools.arguments" => {
                 #[derive(serde::Deserialize)]
@@ -616,6 +630,8 @@ impl Manager {
             self_ref: weak.clone(),
             client_override,
             citation_admission: Arc::new(Semaphore::new(4)),
+            external_reply_admission: Arc::new(Semaphore::new(32)),
+            external_reply_stop: tokio_util::sync::CancellationToken::new(),
             admission: Arc::new(Semaphore::new(128)),
             control_admission: Arc::new(Semaphore::new(16)),
             tasks: Mutex::new(JoinSet::new()),
@@ -673,6 +689,16 @@ impl Manager {
         principal: &Principal,
         command: &Command,
     ) -> Result<Value, WireError> {
+        self.command_with_sender(principal, command, None).await
+    }
+
+    /// Socket identity comes from the authenticated connection, never parameters.
+    pub(crate) async fn command_with_sender(
+        &self,
+        principal: &Principal,
+        command: &Command,
+        sender_socket: Option<String>,
+    ) -> Result<Value, WireError> {
         command.validate()?;
         if principal.expires_at <= now() / 1000 {
             return Err(WireError::new("unauthenticated", "Authentication expired"));
@@ -694,7 +720,7 @@ impl Manager {
         let command = command.clone();
         self.track(async move {
             let _permit = permit;
-            commands::execute(&manager, &principal, &command).await
+            commands::execute_with_sender(&manager, &principal, &command, sender_socket).await
         })?
         .await
         .map_err(|_| WireError::new("operation_failed", "Command owner failed"))?
@@ -725,7 +751,7 @@ impl Manager {
         &self,
         record: SessionRecord,
         restore: bool,
-        fork_source: Option<(Session, microcrab_storage::ModelSelection)>,
+        fork_source: Option<fork::Source>,
         allow_blocked_init: bool,
     ) -> Result<Arc<Managed>, WireError> {
         let record = self.selected_record(record).await?;
@@ -847,9 +873,7 @@ impl Manager {
                 let speaker_project = record.project_id.clone();
                 let speaker_session = record.id.clone();
                 let managed = match fork_source.as_ref() {
-                    Some(source) => {
-                        assembly::create_from(&manager, record, restore, Some((&source.0, &source.1))).await
-                    }
+                    Some(source) => assembly::create_from(&manager, record, restore, Some(source)).await,
                     None => assembly::create(&manager, record, restore).await,
                 }
                 .map_err(safe)?;
@@ -1025,15 +1049,24 @@ impl Manager {
         if managed.host_flavor == Some(conversation_flavors::HostFlavor::ChatOnly) {
             return Ok(0);
         }
-        let (routes, key) = if let Some(project) = record.project_id.as_ref() {
-            (self.routes.lock().await, project)
+        fn ready_generation<C>(route: &bindings::Route<C>, owner: &str) -> Option<u64> {
+            (route.owner == owner && route.ready && route.remote.is_ready())
+                .then_some(route.generation)
+        }
+        let generation = if let Some(project) = record.project_id.as_ref() {
+            self.routes
+                .lock()
+                .await
+                .get(project)
+                .and_then(|route| ready_generation(route, &record.owner))
         } else {
-            (self.conversation_routes.lock().await, &record.id)
+            self.conversation_routes
+                .lock()
+                .await
+                .get(&record.id)
+                .and_then(|route| ready_generation(route, &record.owner))
         };
-        routes
-            .get(key)
-            .filter(|route| route.owner == record.owner && route.ready && route.remote.is_ready())
-            .map(|route| route.generation)
+        generation
             .ok_or_else(|| CleanupDetail::known("host_not_ready", "Cleanup Host is not ready"))
     }
     async fn close_managed_owned(
@@ -1196,6 +1229,7 @@ impl Manager {
             .map_err(|_| Error::Protocol("shutdown owner failed".into()))?
     }
     async fn shutdown_inner(&self) -> Result<(), Error> {
+        self.stop_external_reply_reads();
         let _shutdown = self.shutdown.lock().await;
         if let Some(result) = self
             .shutdown_result

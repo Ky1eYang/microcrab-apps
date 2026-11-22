@@ -47,6 +47,7 @@ async fn websocket_address_is_a_client_relay_and_is_not_dialed() {
                 token: Some("native-pair".into()),
                 directory: None,
                 allow_legacy_binding: true,
+                only_if_unattached: false,
             },
         )
         .await
@@ -93,6 +94,7 @@ async fn canonical_credential_directory_requires_exact_owned_project_pin() {
         token: None,
         directory,
         allow_legacy_binding: false,
+        only_if_unattached: false,
     };
     let canonical = parameters("a", Some(descriptor.workspace_root.clone()));
     assert!(
@@ -188,7 +190,7 @@ async fn canonical_credential_directory_requires_exact_owned_project_pin() {
     manager.close().await.unwrap();
 }
 
-async fn attach_relay_fixture(
+pub(super) async fn attach_relay_fixture(
     manager: &Arc<Manager>,
     socket: &str,
 ) -> (
@@ -266,6 +268,7 @@ async fn attach_relay_fixture(
                 token: None,
                 directory: None,
                 allow_legacy_binding: true,
+                only_if_unattached: false,
             },
             outbound,
             inbound,
@@ -284,6 +287,7 @@ async fn attach_relay_fixture(
 }
 #[tokio::test]
 async fn stale_relay_cleanup_cannot_stop_another_socket_or_attachment() {
+    use super::super::direct::Connect;
     let (capture, _subscriber) = capture_host_logs();
     let root = tempfile::tempdir().unwrap();
     let manager = Manager::new(config(root.path())).await.unwrap();
@@ -291,6 +295,43 @@ async fn stale_relay_cleanup_cannot_stop_another_socket_or_attachment() {
     let (new_release, new_task) = attach_relay_fixture(&manager, "browser-b").await;
     let old_id = old_release.relay_id;
     let new_id = new_release.relay_id;
+    let principal = Principal::for_test("owner");
+    let view = manager.host_state(&principal, "a").await.unwrap();
+    assert_eq!(view["carrier_mode"], "browser_relay");
+    assert_eq!(view["connection_generation"], new_release.relay_generation);
+    assert_eq!(
+        view["readiness"]["connection_generation"],
+        new_release.relay_generation
+    );
+    assert_eq!(view["ready"], true);
+    assert!(!view.to_string().contains(&new_id.to_string()));
+    let (outbound, mut bridge) = tokio::sync::mpsc::channel(1);
+    let (_reply, inbound) = tokio::sync::mpsc::channel(1);
+    let relay = Arc::new(std::sync::Mutex::new(None));
+    let error = manager
+        .attach_client_relay(
+            &principal,
+            "browser-c",
+            Connect {
+                project_id: "a".into(),
+                url: "ws://127.0.0.1:8788/host".into(),
+                token: None,
+                directory: None,
+                allow_legacy_binding: false,
+                only_if_unattached: true,
+            },
+            outbound,
+            inbound,
+            relay,
+            uuid::Uuid::new_v4(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "host_route_observation_changed");
+    assert!(
+        bridge.recv().await.is_none(),
+        "automatic resume must not send Inspect or Pair"
+    );
     let host = manager.routes.lock().await.get("a").unwrap().remote.clone();
     let generation = manager.routes.lock().await.get("a").unwrap().generation;
     for witness in [
@@ -453,6 +494,7 @@ async fn cancelled_relay_publication_keeps_exact_cleanup_witness() {
                             token: None,
                             directory: None,
                             allow_legacy_binding: true,
+                            only_if_unattached: false,
                         },
                         outbound,
                         inbound,
@@ -510,6 +552,7 @@ async fn grpc_address_requires_the_grpc_carrier() {
                 token: Some("native-pair".into()),
                 directory: None,
                 allow_legacy_binding: true,
+                only_if_unattached: false,
             },
         )
         .await
@@ -764,6 +807,7 @@ async fn direct_host_survives_ui_disconnect_transfers_and_resumes_after_restart(
         token,
         directory: Some(native_descriptor().workspace_root),
         allow_legacy_binding: true,
+        only_if_unattached: false,
     };
     let mut initial = parameters(Some("native-pair".into()));
     initial.directory = Some(".".into());
@@ -777,7 +821,31 @@ async fn direct_host_survives_ui_disconnect_transfers_and_resumes_after_restart(
         .unwrap();
     assert_eq!(connected["ready"], true);
     assert_eq!(connected["transport"], "grpc");
+    assert!(connected.get("observed_existing").is_none());
+    let view = manager.host_state(&owner, "a").await.unwrap();
+    assert_eq!(view["carrier_mode"], "server_direct_grpc");
+    assert!(view.get("observed_existing").is_none());
+    assert_eq!(
+        view["connection_generation"],
+        connected["connection_generation"]
+    );
+    assert_eq!(
+        view["descriptor"]["workspace_id"],
+        connected["descriptor"]["workspace_id"]
+    );
+    assert!(view["descriptor"].get("bridge_instance_id").is_none());
+    assert!(view.get("relay_release").is_none());
     assert!(!connected.to_string().contains("private-native-resume"));
+    assert!(!view.to_string().contains("private-native-resume"));
+    let mut automatic = parameters(None);
+    automatic.allow_legacy_binding = false;
+    automatic.only_if_unattached = true;
+    let rejected = manager
+        .connect_direct_host(&owner, automatic)
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code, "host_route_observation_changed");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
     let stale = manager
         .disconnect_direct_host(
             &owner,
@@ -810,6 +878,8 @@ async fn direct_host_survives_ui_disconnect_transfers_and_resumes_after_restart(
         .connect_direct_host(&owner, parameters(None))
         .await
         .unwrap();
+    assert_eq!(same["observed_existing"], true);
+    assert!(same.get("relay_release").is_none());
     assert!(
         std::fs::read(&credential_path).unwrap() == saved_before_observation,
         "canonical observation must not rewrite the saved relative directory"

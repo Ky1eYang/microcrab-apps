@@ -466,6 +466,7 @@ async fn attach_fixture(
             },
             sender,
             generation,
+            super::bindings::ProjectCarrierMode::BrowserRelay,
         ),
     )
     .await
@@ -564,6 +565,7 @@ async fn project_binding_refuses_second_owner_host_root_and_stale_socket() {
                 },
                 sender,
                 generation,
+                super::bindings::ProjectCarrierMode::BrowserRelay,
             )
             .await
             .unwrap_err();
@@ -589,6 +591,7 @@ async fn project_binding_refuses_second_owner_host_root_and_stale_socket() {
             },
             sender,
             generation,
+            super::bindings::ProjectCarrierMode::BrowserRelay,
         )
         .await
         .unwrap_err();
@@ -734,11 +737,11 @@ async fn restore_refuses_pinned_component_and_project_root_mismatch() {
     assert!(remote.session_host(&record).await.is_ok());
     match super::assembly::create(&remote, record.clone(), true).await {
         Err(Error::Config(message)) => {
-            assert!(
-                message
-                    .to_string()
-                    .contains("pinned agent component unavailable")
-            )
+            let message = message.to_string();
+            assert!(message.contains("pinned agent component unavailable"));
+            assert!(message.contains(&format!("SHA-256 {}", "b".repeat(64))));
+            assert!(message.contains("Restore the exact Agent component"));
+            assert!(message.contains("start a new Session"));
         }
         _ => panic!("restore accepted unavailable component identity"),
     }
@@ -783,6 +786,10 @@ async fn route_loss_returns_before_contended_activation_and_never_skips_suspensi
             generation: 1,
             remote: microcrab_host_remote::RemoteHost::new(descriptor("host")).unwrap(),
             ready: true,
+            carrier: super::bindings::ProjectCarrier {
+                mode: super::bindings::ProjectCarrierMode::BrowserRelay,
+                descriptor: descriptor("host"),
+            },
             diagnostics: None,
         },
     );

@@ -19,6 +19,7 @@ fn connect() -> Connect {
         token: Some("one-use-token".into()),
         directory: None,
         allow_legacy_binding: true,
+        only_if_unattached: false,
     }
 }
 fn params(start: &serde_json::Value) -> AttemptParams {
@@ -171,6 +172,41 @@ async fn explicit_disconnect_fences_late_outbound_attempt_before_pair() {
     server.abort();
     manager.close().await.unwrap();
 }
+#[tokio::test]
+async fn automatic_outbound_cannot_replace_a_relay_published_after_the_offer() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = Manager::new(config(root.path())).await.unwrap();
+    let owner = Principal::for_test("owner");
+    let mut automatic = connect();
+    automatic.token = None;
+    automatic.allow_legacy_binding = false;
+    automatic.only_if_unattached = true;
+    let offer = manager
+        .start_outbound_host(&owner, automatic)
+        .await
+        .unwrap();
+    let (release, relay) = super::direct::attach_relay_fixture(&manager, "winning-relay").await;
+    let (mut socket, server) = socket(manager.clone(), &offer).await;
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+        .await
+        .unwrap();
+    assert!(!matches!(first, Some(Ok(Message::Binary(_)))));
+    let error = manager
+        .finish_outbound_host(&owner, params(&offer))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "host_route_observation_changed");
+    let state = manager.host_state(&owner, "a").await.unwrap();
+    assert_eq!(state["carrier_mode"], "browser_relay");
+    assert_eq!(state["connection_generation"], release.relay_generation);
+    assert_eq!(state["ready"], true);
+    manager.close().await.unwrap();
+    server.abort();
+    let _ = server.await;
+    relay.abort();
+    let _ = relay.await;
+}
+
 #[tokio::test]
 async fn cancellation_after_pair_does_not_wait_for_the_project_authentication_gate() {
     let root = tempfile::tempdir().unwrap();
@@ -341,7 +377,25 @@ async fn authenticated_native_route_survives_observation_and_stale_attempt_cance
     .unwrap();
     assert_eq!(finish["transport"], "outbound_wss");
     assert_eq!(finish["ready"], true);
+    assert!(finish.get("observed_existing").is_none());
     let generation = manager.routes.lock().await.get("a").unwrap().generation;
+    let view = manager.host_state(&owner, "a").await.unwrap();
+    assert_eq!(view["carrier_mode"], "server_direct_outbound");
+    assert_eq!(view["connection_generation"], generation.to_string());
+    assert_eq!(
+        view["descriptor"]["host_id"],
+        finish["descriptor"]["host_id"]
+    );
+    assert!(view.get("capability").is_none());
+    let mut automatic = connect();
+    automatic.token = None;
+    automatic.allow_legacy_binding = false;
+    automatic.only_if_unattached = true;
+    let conflict = manager
+        .start_outbound_host(&owner, automatic)
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.code, "host_route_observation_changed");
     let mut observation = connect();
     observation.token = None;
     let observed = manager
@@ -349,6 +403,12 @@ async fn authenticated_native_route_survives_observation_and_stale_attempt_cance
         .await
         .unwrap();
     assert!(observed.get("attempt_id").is_none());
+    assert_eq!(observed["observed_existing"], true);
+    assert!(observed.get("relay_release").is_none());
+    assert_eq!(
+        observed["connection_generation"],
+        finish["connection_generation"]
+    );
     assert_eq!(observed["transport"], "outbound_wss");
     assert!(observed.get("descriptor").is_some());
     manager

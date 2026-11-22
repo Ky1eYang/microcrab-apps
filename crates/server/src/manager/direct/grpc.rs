@@ -74,7 +74,7 @@ pub(super) async fn inspect(
                 return super::preflight::rejection(microcrab_host_protocol::WireError::new(
                     microcrab_host_protocol::ErrorCode::Unsupported,
                     "Native Host does not support authenticated inspection; pairing was not sent",
-                ));
+                ), false);
             }
             status_error(
                 "gRPC Host inspection rejected; pairing was not sent",
@@ -124,7 +124,10 @@ pub(super) async fn dial(
         ))
     })?;
     if let HostFrame::HandshakeRejected { error } = hello {
-        return Err(super::preflight::rejection(error));
+        return Err(super::preflight::rejection(
+            error,
+            matches!(handshake, HostFrame::Resume { .. }),
+        ));
     }
     let mut execute_token = execute_token
         .ok_or_else(|| failure("Authenticated gRPC Control omitted its Execute capability"))?;

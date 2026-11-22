@@ -7,6 +7,8 @@ mod gateway;
 mod retry;
 mod review;
 mod settings;
+mod switch_mode;
+mod zig_coding_acceptance;
 use super::*;
 use axum::{Json, Router, extract::State as HttpState, http::HeaderMap, routing::post};
 use microcrab_protocol::application::Command;
@@ -30,6 +32,15 @@ impl Drop for ProviderMock {
     }
 }
 async fn provider(permits: usize) -> ProviderMock {
+    scripted_provider(permits, vec![]).await
+}
+async fn scripted_provider(permits: usize, replies: Vec<Value>) -> ProviderMock {
+    indexed_provider(permits, move |index| replies.get(index).cloned()).await
+}
+async fn indexed_provider<F>(permits: usize, reply: F) -> ProviderMock
+where
+    F: Fn(usize) -> Option<Value> + Send + Sync + 'static,
+{
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/chat/completions", listener.local_addr().unwrap());
     let wire = Arc::new(Wire {
@@ -37,13 +48,18 @@ async fn provider(permits: usize) -> ProviderMock {
         entered: Semaphore::new(0),
         release: Semaphore::new(permits),
     });
-    let router = Router::new().route("/chat/completions", post(|HttpState(wire): HttpState<Arc<Wire>>, headers: HeaderMap, Json(body): Json<Value>| async move {
+    let router = Router::new().route("/chat/completions", post(|HttpState((wire, reply)): HttpState<(Arc<Wire>, Arc<F>)>, headers: HeaderMap, Json(body): Json<Value>| async move {
         let authorization = headers.get("authorization").unwrap().to_str().unwrap().to_owned();
-        wire.requests.lock().unwrap().push((authorization, body));
+        let index = {
+            let mut requests = wire.requests.lock().unwrap();
+            let index = requests.len();
+            requests.push((authorization, body));
+            index
+        };
         wire.entered.add_permits(1);
         wire.release.acquire().await.unwrap().forget();
-        Json(json!({"choices":[{"message":{"role":"assistant","content":"Wire answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}))
-    })).with_state(wire.clone());
+        Json(reply(index).unwrap_or_else(|| json!({"choices":[{"message":{"role":"assistant","content":"Wire answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}})))
+    })).with_state((wire.clone(), Arc::new(reply)));
     let worker = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });

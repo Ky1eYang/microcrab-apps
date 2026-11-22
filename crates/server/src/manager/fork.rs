@@ -2,10 +2,16 @@
 //! Source admission stays locked through capture; durable receipts precede effects.
 use super::{Manager, commands, now, safe, unavailable, view};
 use microcrab_protocol::application::{Command, WireError};
-use microcrab_storage::{OperationRecord, RECORD_VERSION};
+use microcrab_storage::{ModelSelection, OperationRecord, RECORD_VERSION};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::atomic::Ordering;
+
+pub(super) struct Source {
+    pub(super) session: microcrab_session::Session,
+    pub(super) route: ModelSelection,
+    pub(super) selected_mode: Option<String>,
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -126,21 +132,48 @@ pub(super) async fn execute(
     // Verify existing immutable execution pins and live route; never select current defaults.
     manager.session_host(&source_record).await.map_err(safe)?;
     if !manager.embedded {
-        let routes = if source_record.project_id.is_some() {
-            manager.routes.lock().await
+        fn settled<C>(route: &super::bindings::Route<C>) -> bool {
+            route.remote.unresolved_operations().is_empty()
+        }
+        let settled = if let Some(project) = source_record.project_id.as_deref() {
+            manager
+                .routes
+                .lock()
+                .await
+                .get(project)
+                .is_some_and(settled)
         } else {
-            manager.conversation_routes.lock().await
+            manager
+                .conversation_routes
+                .lock()
+                .await
+                .get(&source_record.id)
+                .is_some_and(settled)
         };
-        let route_id = source_record
-            .project_id
-            .as_deref()
-            .unwrap_or(&source_record.id);
-        if routes
-            .get(route_id)
-            .is_none_or(|route| !route.remote.unresolved_operations().is_empty())
-        {
+        if !settled {
             return Err(busy());
         }
+    }
+    // Directory mode is mutable even when the selected conversation has not
+    // changed. Read the exact Journal selection while the source command is fenced.
+    let selected_mode = source
+        .journal
+        .head_recover()
+        .await
+        .map_err(safe)?
+        .ok_or_else(|| {
+            WireError::new(
+                "history_unavailable",
+                "Fork requires selected Session history",
+            )
+        })?
+        .state
+        .selected_mode;
+    if selected_mode.is_none() && source.session.state().selected_mode.is_some() {
+        return Err(WireError::new(
+            "history_unavailable",
+            "Selected history does not record a mode for this Agent",
+        ));
     }
     let context = source.session.context_snapshot().map_err(safe)?;
     let catalog = source
@@ -280,12 +313,17 @@ pub(super) async fn execute(
             .activate(
                 destination,
                 false,
-                Some((source.session.clone(), source.routing.selection())),
+                Some(Source {
+                    session: source.session.clone(),
+                    route: source.routing.selection(),
+                    selected_mode,
+                }),
                 false,
             )
             .await?;
         let record = managed.record.lock().await.clone();
         let mut value = view::session(manager, &record, &manager.config.provider.model, "idle");
+        view::project_live_session(&mut value, &managed.session).map_err(safe)?;
         value["component"] = json!(managed.component);
         if let Some(error) = display_error {
             managed.hub.display_failed(error.message.clone());

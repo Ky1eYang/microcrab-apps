@@ -64,13 +64,18 @@ impl Auditor for ObservedAuditor {
                     .unwrap_or_else(|e| e.into_inner())
                     .as_ref()
                     .and_then(Weak::upgrade);
-                let execution = registry.and_then(|registry| {
-                    registry
-                        .snapshot()
-                        .into_iter()
-                        .rev()
-                        .find(|row| row.call_id == *call)
+                let execution = body.tool_execution_id.and_then(|id| {
+                    registry?
+                        .get(microcrab_session::runtime::execution::ExecutionId(id))
+                        .ok()
+                        .filter(|row| row.call_id == *call)
                 });
+                let phase = match execution.as_ref().map(|row| row.status) {
+                    Some(microcrab_session::runtime::execution::ExecutionStatus::Failed) => "failed",
+                    Some(microcrab_session::runtime::execution::ExecutionStatus::Cancelled) => "cancelled",
+                    Some(microcrab_session::runtime::execution::ExecutionStatus::Interrupted) => "interrupted",
+                    _ => phase,
+                };
                 self.hub.publish(super::SessionRuntimeEvent::Tool(json!({
                     "operation_id": operation,
                     "epoch": body.epoch,
@@ -79,7 +84,7 @@ impl Auditor for ObservedAuditor {
                     "call_id": call,
                     "name": name,
                     "phase": phase,
-                    "execution_id": execution.as_ref().map(|row| row.execution_id),
+                    "execution_id": body.tool_execution_id.filter(|id| *id > 0),
                     "started_at_unix_ms": execution.as_ref().and_then(|row| row.started_at_unix_ms)
                         .or(body.started_at_unix_ms),
                     "elapsed_ms": execution.as_ref().and_then(|row| row.elapsed_ms).or(body.elapsed_ms),

@@ -7,7 +7,7 @@ use microcrab_host_protocol::{HostDescriptor, HostFrame};
 use microcrab_host_remote::RemoteHost;
 use microcrab_protocol::application::WireError;
 use microcrab_storage::execution::ProjectBinding;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, atomic::Ordering};
 use tokio::sync::mpsc;
@@ -90,12 +90,39 @@ pub(super) fn is_reply(frame: &HostFrame) -> bool {
             | HostFrame::Pong { .. }
     )
 }
-pub(super) struct Route {
+/// Authenticated native carrier family, not a browser-relative ownership claim.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProjectCarrierMode {
+    ServerDirectGrpc,
+    ServerDirectOutbound,
+    BrowserRelay,
+}
+
+impl ProjectCarrierMode {
+    pub(super) fn transport(self) -> &'static str {
+        match self {
+            Self::ServerDirectGrpc => "grpc",
+            Self::ServerDirectOutbound => "outbound_wss",
+            Self::BrowserRelay => "relay",
+        }
+    }
+}
+
+pub(super) struct ProjectCarrier {
+    pub(super) mode: ProjectCarrierMode,
+    // Exact accepted Hello for this generation. RemoteHost can survive Bridge
+    // restarts and retains the immutable descriptor used to construct it.
+    pub(super) descriptor: HostDescriptor,
+}
+
+pub(super) struct Route<C = ()> {
     pub owner: String,
     pub socket: String,
     pub generation: u64,
     pub remote: Arc<RemoteHost>,
     pub ready: bool,
+    pub carrier: C,
     // Last authenticated carrier witness; never consulted for authorization.
     pub diagnostics: Option<super::direct::Correlation>,
 }
@@ -240,13 +267,14 @@ impl Manager {
             grant.project_id,
         ))
     }
-    pub(crate) async fn attach_project(
+    pub(super) async fn attach_project(
         &self,
         principal: &Principal,
         socket: &str,
         params: Attach,
         outbound: mpsc::Sender<HostFrame>,
         generation: u64,
+        mode: ProjectCarrierMode,
     ) -> Result<Value, WireError> {
         if self.embedded {
             return Err(WireError::new(
@@ -428,7 +456,7 @@ impl Manager {
                     outbound,
                     generation,
                     params.lease_generation,
-                    params.descriptor.bridge_instance_id,
+                    params.descriptor.bridge_instance_id.clone(),
                 )
                 .map_err(|_| WireError::new("host_detached", "Host route attachment failed"))?;
             routes.insert(
@@ -439,6 +467,10 @@ impl Manager {
                     generation,
                     remote: remote.clone(),
                     ready: false,
+                    carrier: ProjectCarrier {
+                        mode,
+                        descriptor: params.descriptor,
+                    },
                     diagnostics: Some(diagnostics.clone()),
                 },
             );

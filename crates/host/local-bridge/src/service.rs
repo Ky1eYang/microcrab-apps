@@ -1,6 +1,7 @@
 //! Device service selects canonical workspaces before opening private state.
-use crate::{Bridge, BridgePolicy};
+use crate::{Bridge, BridgePolicy, PairingMode};
 use microcrab_host_protocol::*;
+#[cfg(target_os = "macos")]
 use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
@@ -13,14 +14,12 @@ pub struct BridgeService {
     pub default: Arc<Bridge>,
     roots: Vec<PathBuf>,
     workspaces: Mutex<HashMap<PathBuf, Arc<Bridge>>>,
-    require_token: bool,
-    token: Option<String>,
+    directory_selection: bool,
     pairing: Option<Mutex<ServicePairing>>,
 }
 struct ServicePairing {
+    mode: PairingMode,
     token: Option<String>,
-    deadline: Instant,
-    reusable: bool,
 }
 impl BridgeService {
     pub fn open(
@@ -53,23 +52,19 @@ impl BridgeService {
             }
             roots.push(allowed);
         }
-        let reusable = custom_token.is_some();
-        let (default, token) =
-            Bridge::open_with_policy(&root, require_token, custom_token, policy)?;
+        let (mode, token) = PairingMode::configure(require_token, custom_token);
+        let default = Bridge::open_with_pairing(&root, mode, token.clone(), policy)?;
         let root = PathBuf::from(&default.descriptor.workspace_root);
-        let deadline = Instant::now() + Duration::from_secs(if reusable { 315360000 } else { 120 });
         Ok((
             Arc::new(Self {
                 default: default.clone(),
                 roots,
                 workspaces: Mutex::new(HashMap::from([(root, default)])),
-                require_token,
-                token: token.clone(),
-                pairing: require_token.then(|| {
+                directory_selection: true,
+                pairing: mode.requires_token().then(|| {
                     Mutex::new(ServicePairing {
+                        mode,
                         token: token.clone(),
-                        deadline,
-                        reusable,
                     })
                 }),
             }),
@@ -82,8 +77,7 @@ impl BridgeService {
             default: default.clone(),
             roots: vec![root.clone()],
             workspaces: Mutex::new(HashMap::from([(root, default)])),
-            require_token: true,
-            token: None,
+            directory_selection: false,
             pairing: None,
         })
     }
@@ -145,19 +139,16 @@ impl BridgeService {
                 "invalid binding scope",
             ));
         }
-        // One service capability retains its original expiry and one-use policy;
-        // passing it into a child workspace never turns it into a static token.
+        // Hold the service capability through authentication so one generated
+        // token can authorize only one successful Pair across all workspaces.
         let mut capability = match &self.pairing {
             Some(pairing) => Some(pairing.lock().await),
             None => None,
         };
-        if let (Some(capability), WireFrame::Pair { token, .. }) = (capability.as_ref(), &frame) {
-            if capability.token.as_ref() != Some(token) {
-                return Err(WireError::new(ErrorCode::PairingDenied, "pairing denied"));
-            }
-            if Instant::now() >= capability.deadline {
-                return Err(WireError::new(ErrorCode::Timeout, "pairing expired"));
-            }
+        if let (Some(capability), WireFrame::Pair { token, .. }) = (capability.as_ref(), &frame)
+            && capability.token.as_ref() != Some(token)
+        {
+            return Err(WireError::new(ErrorCode::PairingDenied, "pairing denied"));
         }
         if inspection.is_some()
             && self.pairing.is_none()
@@ -243,22 +234,15 @@ impl BridgeService {
             }
         }
         let mut workspaces = self.workspaces.lock().await;
-        if !workspaces.contains_key(&root) {
-            if self.token.is_none() && self.require_token {
+        let workspace = if let Some(workspace) = workspaces.get(&root) {
+            workspace.clone()
+        } else {
+            if !self.directory_selection {
                 return Err(WireError::new(
                     ErrorCode::WorkspaceDenied,
                     "directory selection requires configured service",
                 ));
             }
-            if self.require_token
-                && !matches!(&frame, WireFrame::Pair { token, .. } if self.token.as_ref() == Some(token))
-            {
-                return Err(WireError::new(ErrorCode::PairingDenied, "pairing denied"));
-            }
-        }
-        let workspace = if let Some(workspace) = workspaces.get(&root) {
-            workspace.clone()
-        } else {
             // Reject unknown workspace pins before creating any state in a requested directory.
             if expected_workspace.is_some() {
                 let path = root.join(".microcrab/host-bridge/identity.json");
@@ -278,21 +262,18 @@ impl BridgeService {
                     "workspace capacity reached",
                 ));
             }
-            let (workspace, _) = Bridge::open_with_policy(
-                &root,
-                self.require_token,
-                self.token.clone(),
-                self.default.policy,
-            )
-            .map_err(|error| {
-                WireError::new(
-                    ErrorCode::WorkspaceDenied,
-                    format!("workspace initialization failed: {error}"),
-                )
-            })?;
-            if let Some(capability) = &capability {
-                workspace.authority.lock().await.pair_deadline = capability.deadline;
-            }
+            let (mode, token) = capability
+                .as_ref()
+                .map_or((PairingMode::Tokenless, None), |cap| {
+                    (cap.mode, cap.token.clone())
+                });
+            let workspace = Bridge::open_with_pairing(&root, mode, token, self.default.policy)
+                .map_err(|error| {
+                    WireError::new(
+                        ErrorCode::WorkspaceDenied,
+                        format!("workspace initialization failed: {error}"),
+                    )
+                })?;
             // Nested allowed roots may overlap. Protect each workspace's private
             // state from every other typed filesystem view in this service.
             for existing in workspaces.values() {
@@ -321,9 +302,8 @@ impl BridgeService {
         if pairing_request
             && matches!(&hello, WireFrame::Hello { .. })
             && let Some(capability) = capability.as_mut()
-            && !capability.reusable
         {
-            capability.token = None;
+            capability.mode.consume(&mut capability.token);
         }
         Ok((workspace, hello))
     }
@@ -427,37 +407,41 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn inherited_generated_token_keeps_service_expiry_and_single_use() {
+    async fn generated_token_is_consumed_by_the_selected_workspace_and_service() {
         let dir = tempfile::tempdir().unwrap();
         let child = dir.path().join("child");
+        let sibling = dir.path().join("sibling");
         std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(&sibling).unwrap();
         let (service, token) = BridgeService::open(dir.path(), &[], true, None).unwrap();
         let token = token.unwrap();
-        service.pairing.as_ref().unwrap().lock().await.deadline = Instant::now();
-        assert!(matches!(
-            service
-                .authenticate(pair(&token, Some(child.to_string_lossy().into())))
-                .await,
-            Err(WireError {
-                code: ErrorCode::Timeout,
-                ..
-            })
-        ));
-        assert!(!child.join(".microcrab").exists());
-        drop(service);
-        let (service, token) = BridgeService::open(dir.path(), &[], true, None).unwrap();
-        let token = token.unwrap();
-        service.authenticate(pair(&token, None)).await.unwrap();
-        assert!(matches!(
-            service
-                .authenticate(pair(&token, Some(child.to_string_lossy().into())))
-                .await,
-            Err(WireError {
-                code: ErrorCode::PairingDenied,
-                ..
-            })
-        ));
-        assert!(!child.join(".microcrab").exists());
+        let (workspace, hello) = service
+            .authenticate(pair(&token, Some("child".into())))
+            .await
+            .unwrap();
+        assert!(matches!(hello, WireFrame::Hello { .. }));
+        assert_ne!(
+            workspace.descriptor.workspace_id,
+            service.default.descriptor.workspace_id
+        );
+        assert_eq!(
+            workspace
+                .authenticate(pair(&token, None))
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::PairingDenied
+        );
+        for directory in [None, Some("child".into()), Some("sibling".into())] {
+            assert!(matches!(
+                service.authenticate(pair(&token, directory)).await,
+                Err(WireError {
+                    code: ErrorCode::PairingDenied,
+                    ..
+                })
+            ));
+        }
+        assert!(!sibling.join(".microcrab").exists());
     }
     #[tokio::test]
     async fn static_token_selects_child_but_wrong_token_or_private_root_cannot_create_state() {

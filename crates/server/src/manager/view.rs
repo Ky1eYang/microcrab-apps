@@ -103,7 +103,7 @@ pub(super) fn session(
         && let Ok(active) = slot.active.try_lock()
         && let Some(managed) = active.as_ref()
     {
-        let _ = communication_session(&mut value, &managed.session, None);
+        let _ = project_live_session(&mut value, &managed.session);
     }
     if record.project_id.is_none()
         && let Some(flavor) = manager.conversation_flavors.get(&record.owner, &record.id)
@@ -134,13 +134,20 @@ pub(super) fn communication_session(
     value["accepts_user_input"] = json!(targeted.unwrap_or_else(|| session.accepts_user_input()));
     Ok(())
 }
+pub(super) fn project_live_session(
+    value: &mut Value,
+    session: &microcrab_session::Session,
+) -> Result<(), Error> {
+    value["mode"] = json!(session.state().selected_mode);
+    communication_session(value, session, None)
+}
 fn base_session(record: &SessionRecord, legacy_model: &str, status: &str) -> Value {
     let model = record
         .model_selection
         .as_ref()
         .map(|selection| selection.model.as_str())
         .unwrap_or(legacy_model);
-    json!({"id":record.id,"title":record.title,"project_id":record.project_id,"status":status,"agent":record.agent,"mode":record.mode,"model":model,"model_selection":record.model_selection,"created_at_ms":record.created_at_ms,"updated_at_ms":record.updated_at_ms,"revision":record.revision,"archived":record.archived})
+    json!({"id":record.id,"title":record.title,"project_id":record.project_id,"status":status,"agent":record.agent,"mode":null,"configured_mode":record.mode,"model":model,"model_selection":record.model_selection,"created_at_ms":record.created_at_ms,"updated_at_ms":record.updated_at_ms,"revision":record.revision,"archived":record.archived})
 }
 /// Internal display evidence travels with the exact selected compaction contexts.
 /// Audit anchors never become user message fields or frozen Context content.
@@ -492,7 +499,7 @@ pub(super) async fn snapshot(
         retry_operation.as_deref(),
     );
     let mut projection = base_session(record, model, status);
-    communication_session(&mut projection, &managed.session, None)?;
+    project_live_session(&mut projection, &managed.session)?;
     if let Some(flavor) = managed.host_flavor {
         projection["host_flavor"] = json!(flavor);
     }

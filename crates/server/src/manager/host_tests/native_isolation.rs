@@ -88,6 +88,7 @@ async fn relay_attempt_with_legacy_binding(
                 token: Some("fixture-token".into()),
                 directory: None,
                 allow_legacy_binding,
+                only_if_unattached: false,
             },
             outbound,
             inbound,
@@ -379,6 +380,7 @@ async fn grpc_old_peer_unimplemented_inspection_never_receives_control() {
                 token: Some("one-use".into()),
                 directory: None,
                 allow_legacy_binding: true,
+                only_if_unattached: false,
             },
         )
         .await

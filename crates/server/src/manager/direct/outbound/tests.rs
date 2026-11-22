@@ -11,6 +11,7 @@ fn attempt() -> Attempt {
             token: Some("one-use".into()),
             directory: None,
             allow_legacy_binding: false,
+            only_if_unattached: false,
         },
         deadline: Instant::now() + TTL,
         capability: Mutex::new(Some("a".repeat(64))),

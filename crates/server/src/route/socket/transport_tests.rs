@@ -546,6 +546,171 @@ async fn closing_executor_releases_lease_and_observer_or_stale_lease_cannot_revo
 }
 
 #[tokio::test]
+async fn browser_sender_selects_plugin_executor_and_important_at_admission() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/v1/chat/completions",
+        listener.local_addr().unwrap()
+    );
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let gate = release.clone();
+    let provider = axum::Router::new().route("/v1/chat/completions", axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+        let tx = tx.clone();
+        let gate = gate.clone();
+        async move {
+            tx.send(body).await.unwrap();
+            gate.acquire().await.unwrap().forget();
+            ([("content-type", "text/event-stream")], concat!(
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"fixture answer\"}}]}\n\n",
+                "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n"
+            ))
+        }
+    }));
+    let provider_task = tokio::spawn(async move {
+        axum::serve(listener, provider).await.unwrap();
+    });
+    let fixture = Fixture::with_endpoint(&endpoint).await;
+    let session = fixture
+        .create_session_with_tools(json!([{
+            "name":"plugin", "description":"Executor fixture", "parameters":{"type":"object"}
+        }]))
+        .await;
+    let path = format!("/api/v1/sessions/{session}/ws");
+    let mut a = fixture.socket(&path, &fixture.token).await;
+    let barrier = frame(&mut a).await;
+    let digest = &barrier["meta"]["client_tools"]["catalog_digest"];
+    let bind_client = |client: &str| json!({"client_id":client,"catalog_digest":digest});
+    let a_seed = rpc(&mut a, "client_tools.bind", bind_client("browser-a")).await;
+    assert_eq!(a_seed["role"], "executor");
+    let mut b = fixture.socket(&path, &fixture.token).await;
+    assert_eq!(frame(&mut b).await["type"], "subscribed");
+    assert_eq!(
+        rpc(&mut b, "client_tools.bind", bind_client("browser-b")).await["role"],
+        "participant"
+    );
+    let input = |text: &str, plugin: &str, activate: bool| {
+        json!({
+            "operation_id":uuid::Uuid::new_v4().to_string(),"activate_if_idle":activate,
+            "input":{"parts":[{"type":"text","text":text}],"variables":{"scoped_set":[{
+                "name":"plugins","value":[{"id":plugin,"name":plugin,"version":"1.0.0","artifact":"0123456789abcdef","description":"fixture"}],
+                "visibility":"visible","persistence":"persisted","editors":["client"]
+            }]}}
+        })
+    };
+    let read_request = |body: Value| {
+        let messages = body["messages"].as_array().unwrap();
+        let value = messages.iter().rev().find(|m| m["role"] == "user").unwrap()["content"].clone();
+        if let Some(text) = value.as_str() {
+            text.to_owned()
+        } else {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect::<String>()
+        }
+    };
+    let receive = |mut rx: tokio::sync::mpsc::Receiver<Value>| async move {
+        let body = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        (rx, body)
+    };
+    rpc(&mut a, "turn.queue", input("A-start", "plugin-a", true)).await;
+    let (next, body) = receive(rx).await;
+    rx = next;
+    let rendered = read_request(body);
+    assert!(
+        rendered.contains("plugin-a") && rendered.contains("A-start"),
+        "{rendered}"
+    );
+    assert_eq!(
+        rpc(&mut a, "client_tools.bind", bind_client("browser-a")).await["lease_id"],
+        a_seed["lease_id"]
+    );
+    rpc(&mut b, "turn.queue", input("B-queued", "plugin-b", false)).await;
+    rpc(
+        &mut b,
+        "turn.steer",
+        input("B-steer", "plugin-steer", false),
+    )
+    .await;
+    assert_eq!(
+        rpc(&mut b, "client_tools.bind", bind_client("browser-b")).await["role"],
+        "participant"
+    );
+    release.add_permits(1);
+    let (next, body) = receive(rx).await;
+    rx = next;
+    let rendered = read_request(body);
+    assert!(
+        rendered.contains("B-steer") && !rendered.contains("plugin-steer"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("<important>"),
+        "unchanged active environment: {rendered}"
+    );
+    assert_eq!(
+        rpc(&mut a, "client_tools.bind", bind_client("browser-a")).await["role"],
+        "executor"
+    );
+    release.add_permits(1);
+    let (next, body) = receive(rx).await;
+    rx = next;
+    let rendered = read_request(body);
+    assert!(
+        rendered.contains("plugin-b") && rendered.contains("B-queued"),
+        "{rendered}"
+    );
+    let state = rendered.find("</state>").unwrap();
+    let important = rendered.find("<important>").unwrap();
+    let user = rendered.find("<user>").unwrap();
+    assert!(state < important && important < user, "{rendered}");
+    assert!(rendered[important..user].contains("describe"), "{rendered}");
+    assert_eq!(
+        rpc(&mut b, "client_tools.bind", bind_client("browser-b")).await["role"],
+        "executor"
+    );
+    assert_eq!(
+        rpc(&mut a, "client_tools.bind", bind_client("browser-a")).await["role"],
+        "participant"
+    );
+    // The queued sender can leave before consumption. The next request must
+    // use the still-live B inventory, never the now-disconnected A's payload.
+    rpc(
+        &mut a,
+        "turn.queue",
+        input("A-offline", "plugin-offline", false),
+    )
+    .await;
+    close_client(&mut a).await;
+    release.add_permits(1);
+    let (_, body) = receive(rx).await;
+    let rendered = read_request(body);
+    assert!(
+        rendered.contains("A-offline") && !rendered.contains("plugin-offline"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("<important>"),
+        "unchanged active environment: {rendered}"
+    );
+    assert_eq!(
+        rpc(&mut b, "client_tools.bind", bind_client("browser-b")).await["role"],
+        "executor"
+    );
+    release.add_permits(1);
+    close_client(&mut b).await;
+    fixture.close().await;
+    provider_task.abort();
+}
+
+#[tokio::test]
 async fn foreign_and_missing_session_subscriptions_send_error_then_close() {
     let fixture = Fixture::new().await;
     let session = fixture.create_session().await;

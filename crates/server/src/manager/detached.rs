@@ -30,16 +30,21 @@ pub(super) struct Dormant {
     historical_heads: Vec<(u64, Option<String>)>,
     history_available: std::sync::OnceLock<microcrab_storage::history::HistoryAvailable>,
 }
+/// History page identity for a non-active Session, based on the published head.
+pub(super) fn detached_lineage(
+    instance: &impl std::fmt::Display,
+    history: Option<&microcrab_storage::JournalCursor>,
+) -> String {
+    format!(
+        "detached:{}:{}",
+        instance,
+        history.map_or("empty", |cursor| cursor.checkpoint_id.as_str())
+    )
+}
+
 impl Dormant {
     fn lineage(&self, instance: &impl std::fmt::Display) -> String {
-        format!(
-            "detached:{}:{}",
-            instance,
-            self.history
-                .as_ref()
-                .map(|cursor| cursor.checkpoint_id.as_str())
-                .unwrap_or("empty")
-        )
+        detached_lineage(instance, self.history.as_ref())
     }
     fn display(&self) -> view::DisplayMessages {
         view::DisplayMessages {
@@ -327,45 +332,6 @@ impl Manager {
             }
         });
     }
-    pub(super) async fn inspect_executions(
-        &self,
-        record: &SessionRecord,
-    ) -> Result<Vec<microcrab_session::runtime::execution::ExecutionSnapshot>, WireError> {
-        let _journal_open = self.journal_open_gate(&record.id).lock_owned().await;
-        let slot = self
-            .registry
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&record.id)
-            .cloned();
-        let active = match slot {
-            Some(slot) => slot.active.lock().await.clone(),
-            None => None,
-        };
-        if let Some(managed) = active.as_ref() {
-            return Ok(managed.session.execution_snapshots());
-        }
-        let dormant = self.dormant(record, false).await.map_err(safe)?;
-        Ok(dormant
-            .recover
-            .as_ref()
-            .map(|recover| {
-                recover
-                    .state
-                    .executions
-                    .iter()
-                    .map(|row| {
-                        let mut row = row.metadata();
-                        if row.status.is_pending() {
-                            row.status =
-                                microcrab_session::runtime::execution::ExecutionStatus::Interrupted;
-                        }
-                        row
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
     /// Test-only owner-scoped full inspection (the retired `session.get`).
     #[cfg(test)]
     pub(crate) async fn inspect_owned(&self, owner: &str, id: &str) -> Result<Value, WireError> {
@@ -466,6 +432,7 @@ impl Manager {
             &self.config.provider.model,
             if record.archived { "closed" } else { "idle" },
         );
+        session["mode"] = json!(recover.and_then(|recover| recover.state.selected_mode.as_deref()));
         view::communication_identity(
             &mut session,
             recover
@@ -605,6 +572,42 @@ impl Manager {
         )
         .map_err(safe)
     }
+    /// Inspect a selected head without opening or creating a journal. Callers
+    /// hold journal-open admission and verify the checkpoint's Session identity.
+    pub(super) async fn inspect_detached_head(
+        &self,
+        id: &str,
+    ) -> Result<Option<microcrab_storage::history::RestorePoint>, Error> {
+        match self.config.storage {
+            Storage::File => {
+                #[cfg(feature = "storage-file")]
+                {
+                    let directory = self.config.data_dir.join("sessions").join(id);
+                    // Owner records without a journal directory are valid and
+                    // don't authorize constructing one on a history read.
+                    if !tokio::fs::try_exists(&directory).await? {
+                        return Ok(None);
+                    }
+                    microcrab_storage::history::FileJournal::inspect_head(directory).await
+                }
+                #[cfg(not(feature = "storage-file"))]
+                Err(Error::config("File storage is not compiled"))
+            }
+            Storage::Sqlite => {
+                #[cfg(feature = "storage-sqlite")]
+                {
+                    microcrab_storage::history::SqliteJournal::inspect_head(
+                        self.config.data_dir.join("storage.sqlite"),
+                        id.to_owned(),
+                    )
+                    .await
+                }
+                #[cfg(not(feature = "storage-sqlite"))]
+                Err(Error::config("SQLite storage is not compiled"))
+            }
+        }
+    }
+
     /// Both callers retain journal-open admission until the returned Journal is
     /// closed. This helper must not be used by unguarded transport handlers.
     pub(super) async fn inspect_journal(

@@ -276,6 +276,30 @@ impl Client for RoutedClient {
             anchors.observe(epoch, items, producer).await;
         }
     }
+    async fn observe_tool_result_admitted(
+        &self,
+        epoch: u64,
+        items: &[microcrab_transport::ContentItem],
+        assistant_index: usize,
+        call_index: usize,
+        execution_id: u64,
+        terminal_status: Option<&str>,
+    ) {
+        let anchors = if self.main {
+            self.routing
+                .anchors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        } else {
+            self.anchors.clone()
+        };
+        if let Some(anchors) = anchors {
+            anchors
+                .observe_tool_result(epoch, items, assistant_index, call_index, execution_id, terminal_status)
+                .await;
+        }
+    }
     async fn stream_admitted(
         &self,
         content: &Content,
@@ -563,6 +587,7 @@ pub(super) async fn select(
     };
     let mut session =
         super::view::session(manager, &record, &manager.config.provider.model, status);
+    super::view::project_live_session(&mut session, &managed.session).map_err(super::safe)?;
     project_route(managed, &record, &mut session);
     snapshot["session"] = session.clone();
     managed.hub.session(session);

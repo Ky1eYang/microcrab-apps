@@ -211,12 +211,13 @@ async fn expired_capabilities_and_restarted_binding_remain_scoped() {
     assert!(!restarted.state_dir.join("binding-host.json").exists());
 }
 #[tokio::test]
-async fn expired_pairing_has_explicit_timeout_without_accepting_wrong_tokens() {
-    let dir = tempfile::tempdir().unwrap();
-    let (bridge, token) = Bridge::open(dir.path()).unwrap();
-    bridge.authority.lock().await.pair_deadline = Instant::now();
-    let expired = bridge
-        .authenticate(WireFrame::Pair {
+async fn pairing_requires_the_exact_token_and_consumes_only_generated_tokens() {
+    for custom_token in [None, Some("custom token".to_owned())] {
+        let dir = tempfile::tempdir().unwrap();
+        let (bridge, token) =
+            Bridge::open_with_options(dir.path(), true, custom_token.clone()).unwrap();
+        let token = token.unwrap();
+        let request = |token| WireFrame::Pair {
             directory: None,
             expected_host_id: None,
             expected_workspace_id: None,
@@ -224,24 +225,29 @@ async fn expired_pairing_has_explicit_timeout_without_accepting_wrong_tokens() {
             expected_workspace_root: None,
             token,
             scope: scope(),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(expired.code, ErrorCode::Timeout);
-    let wrong = bridge
-        .authenticate(WireFrame::Pair {
-            directory: None,
-            expected_host_id: None,
-            expected_workspace_id: None,
-            expected_descriptor_digest: None,
-            expected_workspace_root: None,
-            token: "incorrect".into(),
-            scope: scope(),
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(wrong.code, ErrorCode::PairingDenied);
-    assert!(bridge.authority.lock().await.credential.is_none());
+        };
+        for wrong in [String::new(), format!("{token} ")] {
+            assert_eq!(
+                bridge.authenticate(request(wrong)).await.unwrap_err().code,
+                ErrorCode::PairingDenied
+            );
+        }
+        assert!(bridge.authority.lock().await.credential.is_none());
+
+        let (credential, first) = pair(&bridge, token.clone()).await;
+        if custom_token.is_some() {
+            let (next_credential, second) = pair(&bridge, token).await;
+            assert_ne!(credential, next_credential);
+            assert!(bridge.check_lease(&first).await.is_err());
+            assert_eq!(bridge.check_lease(&second).await.unwrap(), scope());
+        } else {
+            assert_eq!(
+                bridge.authenticate(request(token)).await.unwrap_err().code,
+                ErrorCode::PairingDenied
+            );
+            assert_eq!(bridge.check_lease(&first).await.unwrap(), scope());
+        }
+    }
 }
 #[tokio::test]
 async fn durable_unknown_blocks_new_mutations() {

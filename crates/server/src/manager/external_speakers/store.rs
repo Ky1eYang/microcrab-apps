@@ -65,6 +65,15 @@ pub(super) async fn save(
     config: &Configuration,
     operation_id: &str,
 ) -> Result<u64, WireError> {
+    let value = configuration_value(config)?;
+    Ok(storage
+        .compare_exchange(owner, KIND, TARGET, revision, Some(value))
+        .await
+        .map_err(|source| publication_error(source, operation_id))?
+        .revision)
+}
+
+fn configuration_value(config: &Configuration) -> Result<serde_json::Value, WireError> {
     let value = serde_json::to_value(config).map_err(|_| {
         WireError::new(
             "serialization_error",
@@ -81,9 +90,39 @@ pub(super) async fn save(
             "External speaker configuration and retained receipts exceed the 1 MiB durable resource budget",
         ));
     }
-    Ok(storage
-        .compare_exchange(owner, KIND, TARGET, revision, Some(value))
-        .await
-        .map_err(|source| publication_error(source, operation_id))?
-        .revision)
+    Ok(value)
+}
+
+/// Caller holds the owner speaker gate and has resolved the exact Session/project.
+/// Return only a witnessed credential that was already stored or whose CAS succeeded.
+/// On a cross-manager conflict or uncertain publication, fail closed for this call;
+/// fresh authentication must reload durable state before making another decision.
+pub(super) async fn authenticate_witnessed(
+    storage: &dyn Storage,
+    owner: &str,
+    project: Option<&str>,
+    session: &str,
+    bearer: &str,
+    allow_migration: bool,
+) -> Result<Option<super::model::SpeakerCredential>, WireError> {
+    let (revision, mut config) = load(storage, owner).await?;
+    let Some((credential, migrated)) =
+        config.authenticate_witnessed(project, session, bearer, allow_migration)?
+    else {
+        return Ok(None);
+    };
+    if migrated {
+        config.validate()?;
+        let value = configuration_value(&config)?;
+        storage
+            .compare_exchange(owner, KIND, TARGET, revision, Some(value))
+            .await
+            .map_err(|_| {
+                WireError::new(
+                    "storage_unavailable",
+                    "Cannot confirm durable external speaker credential migration",
+                )
+            })?;
+    }
+    Ok(Some(credential))
 }

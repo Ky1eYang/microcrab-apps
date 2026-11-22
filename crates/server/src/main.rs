@@ -105,8 +105,10 @@ async fn run(flush: &mut Option<logging::FlushGuard>) -> Result<(), Box<dyn std:
     let address = listener.local_addr()?;
     let (router, state) = application_at(config, address).await?;
     tracing::info!(%address,"microcrab server listening");
-    let service = axum::serve(listener, router).with_graceful_shutdown(async {
+    let relay = state.manager.clone();
+    let service = axum::serve(listener, router).with_graceful_shutdown(async move {
         let _ = tokio::signal::ctrl_c().await;
+        relay.stop_external_reply_reads();
     });
     let result = service.await;
     let cleanup = state.manager.close().await;

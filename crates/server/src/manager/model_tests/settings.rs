@@ -227,13 +227,13 @@ async fn settings_reset_while_busy_defers_without_changing_admitted_route() {
     manager.close().await.unwrap();
 }
 
-async fn mode_manager(
+pub(super) async fn mode_manager(
     root: &std::path::Path,
     a: &ProviderMock,
     b: &ProviderMock,
     default: Option<&str>,
 ) -> Arc<Manager> {
-    let catalog = r#"[{"name":"fixed","modes":[{"name":"child-only","role":"sub_agent"},{"name":"a","role":"main_agent"},{"name":"b","role":"both"}],"variables":{},"tools":[]},{"name":"other","modes":[{"name":"other-mode","role":"main_agent"}],"variables":{},"tools":[]}]"#;
+    let catalog = r#"[{"name":"fixed","modes":[{"name":"child-only","role":"sub_agent"},{"name":"a","role":"main_agent","prompt":"Mode A instruction"},{"name":"b","role":"both","prompt":"Mode B instruction"}],"variables":{},"tools":[]},{"name":"other","modes":[{"name":"other-mode","role":"main_agent"}],"variables":{},"tools":[]}]"#;
     let path = root.join("mode-fixture.wasm");
     std::fs::write(
         &path,
@@ -255,7 +255,7 @@ async fn mode_manager(
         .unwrap()
 }
 
-async fn create_mode(manager: &Arc<Manager>) -> Arc<Managed> {
+pub(super) async fn create_mode(manager: &Arc<Manager>) -> Arc<Managed> {
     let created = commands::create(
         manager,
         "owner",

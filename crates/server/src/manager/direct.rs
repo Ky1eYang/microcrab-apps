@@ -11,7 +11,10 @@ use diagnostics::StopReason;
 use tracing::{Instrument, instrument::WithSubscriber};
 #[cfg(feature = "grpc")]
 mod grpc;
-use super::{Manager, bindings};
+use super::{
+    Manager,
+    bindings::{self, ProjectCarrierMode},
+};
 use crate::auth::Principal;
 use microcrab_host_protocol::{
     HostDescriptor, HostFrame, MAX_FRAME_BYTES, decode_frame, encode_frame,
@@ -84,6 +87,9 @@ pub(crate) struct Connect {
     pub directory: Option<String>,
     #[serde(default)]
     pub allow_legacy_binding: bool,
+    /// An automatic resume observes a vacant route, never replaces a live one.
+    #[serde(default)]
+    pub only_if_unattached: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,6 +107,12 @@ pub(crate) struct Disconnect {
 pub(crate) struct RelayRelease {
     pub relay_id: uuid::Uuid,
     pub relay_generation: String,
+}
+pub(crate) fn route_observation_changed() -> WireError {
+    WireError::new(
+        "host_route_observation_changed",
+        "A Host route is already connected; refresh Project Host state before taking another action",
+    )
 }
 fn failure(message: impl Into<String>) -> WireError {
     WireError::new("host_transport_unavailable", message)
@@ -227,9 +239,13 @@ fn accept_hello(
     hello: HostFrame,
     pin: Option<&microcrab_storage::execution::ProjectBinding>,
     inspected: &HostDescriptor,
+    handshake: &HostFrame,
 ) -> Result<AcceptedHello, WireError> {
     if let HostFrame::HandshakeRejected { error } = hello {
-        return Err(preflight::rejection(error));
+        return Err(preflight::rejection(
+            error,
+            matches!(handshake, HostFrame::Resume { .. }),
+        ));
     }
     let HostFrame::Hello {
         descriptor,
@@ -423,6 +439,38 @@ fn spawn_relay_worker(
 }
 
 impl Manager {
+    /// The Project's direct_hosts entry is held from this check through Pair
+    /// and publication by every automatic carrier. Outbound repeats the check
+    /// when its later authenticated socket reacquires that entry.
+    async fn require_unattached_route(
+        &self,
+        principal: &Principal,
+        params: &Connect,
+    ) -> Result<(), WireError> {
+        if !params.only_if_unattached {
+            return Ok(());
+        }
+        if params.token.as_ref().is_some_and(|token| !token.is_empty())
+            || params.allow_legacy_binding
+        {
+            return Err(WireError::new(
+                "invalid_request",
+                "Automatic Host resume cannot pair or authorize compatibility binding",
+            ));
+        }
+        if self.embedded
+            || self
+                .routes
+                .lock()
+                .await
+                .get(&params.project_id)
+                .is_some_and(|route| route.owner == principal.owner && route.remote.is_connected())
+        {
+            return Err(route_observation_changed());
+        }
+        Ok(())
+    }
+
     pub(crate) async fn connect_direct_host(
         &self,
         principal: &Principal,
@@ -443,6 +491,7 @@ impl Manager {
         force: bool,
     ) -> Result<Value, WireError> {
         let carrier = classify(&params.url)?;
+        self.require_unattached_route(principal, &params).await?;
         connection.pending_outbound = None;
         match carrier {
             Carrier::Relay(_) => Err(failure(
@@ -477,21 +526,10 @@ impl Manager {
         if !force
             && params.token.as_ref().is_none_or(|token| token.is_empty())
             && saved.is_some()
-            && let Some(mut state) = self
+            && let Some(state) = self
                 .observe_direct_route(principal, &params.project_id)
                 .await?
         {
-            state["transport"] = json!(if self
-                .routes
-                .lock()
-                .await
-                .get(&params.project_id)
-                .is_some_and(|route| route.socket.starts_with("direct:wss:"))
-            {
-                "outbound_wss"
-            } else {
-                "grpc"
-            });
             if let Some(diagnostics) = &connection.diagnostics {
                 diagnostics.connect("observe_existing", false, force);
             }
@@ -502,7 +540,7 @@ impl Manager {
         let mut client = grpc::connect(&url).await?;
         let (request_id, inspect) = preflight::inspect(&handshake)?;
         let reply = grpc::inspect(&mut client, &origin, &inspect).await?;
-        let descriptor = preflight::accept(reply, &request_id, pin.as_ref())?;
+        let descriptor = preflight::accept(reply, &request_id, pin.as_ref(), &handshake)?;
         let _workspace = self
             .direct_hosts
             .admit_workspace(&principal.owner, &descriptor)
@@ -515,7 +553,7 @@ impl Manager {
         }
         preflight::guard(&mut handshake, &descriptor)?;
         let (link, hello) = grpc::dial(client, &origin, &handshake).await?;
-        let accepted = accept_hello(hello, pin.as_ref(), &descriptor)?;
+        let accepted = accept_hello(hello, pin.as_ref(), &descriptor, &handshake)?;
         self.save_direct_credential(
             &params.project_id,
             Some(Credential {
@@ -556,8 +594,16 @@ impl Manager {
             diagnostics,
         );
         self.publish_carrier(
-            principal, connection, params, accepted, outbound, stop, worker, generation, socket_id,
-            "grpc",
+            principal,
+            connection,
+            params,
+            accepted,
+            outbound,
+            stop,
+            worker,
+            generation,
+            socket_id,
+            ProjectCarrierMode::ServerDirectGrpc,
         )
         .await
     }
@@ -591,13 +637,14 @@ impl Manager {
             .await?;
         let entry = self.direct_hosts.entry(&params.project_id);
         let mut connection = entry.lock().await;
+        self.require_unattached_route(principal, &params).await?;
         connection.pending_outbound = None;
         let saved = self.matching_credential(principal, &params, &url).await?;
         let (mut handshake, pin) = self.handshake(principal, &params, saved.as_ref()).await?;
         let (request_id, inspect) = preflight::inspect(&handshake)?;
         let reply =
             preflight::relay_exchange(&outbound_bytes, &mut inbound_bytes, &inspect).await?;
-        let descriptor = preflight::accept(reply, &request_id, pin.as_ref())?;
+        let descriptor = preflight::accept(reply, &request_id, pin.as_ref(), &handshake)?;
         let _workspace = self
             .direct_hosts
             .admit_workspace(&principal.owner, &descriptor)
@@ -611,7 +658,7 @@ impl Manager {
         preflight::guard(&mut handshake, &descriptor)?;
         let hello =
             preflight::relay_exchange(&outbound_bytes, &mut inbound_bytes, &handshake).await?;
-        let accepted = accept_hello(hello, pin.as_ref(), &descriptor)?;
+        let accepted = accept_hello(hello, pin.as_ref(), &descriptor, &handshake)?;
         self.save_direct_credential(
             &params.project_id,
             Some(Credential {
@@ -669,7 +716,7 @@ impl Manager {
                 worker,
                 generation,
                 socket_id,
-                "relay",
+                ProjectCarrierMode::BrowserRelay,
             )
             .await?;
         if published["status"] != "existing_project" {
@@ -743,29 +790,6 @@ impl Manager {
             Ok(None)
         }
     }
-    async fn observe_direct_route(
-        &self,
-        principal: &Principal,
-        project: &str,
-    ) -> Result<Option<Value>, WireError> {
-        let descriptor = {
-            let routes = self.routes.lock().await;
-            routes
-                .get(project)
-                .filter(|route| {
-                    route.owner == principal.owner
-                        && route.socket.starts_with("direct:")
-                        && route.remote.is_connected()
-                })
-                .map(|route| route.remote.descriptor().clone())
-        };
-        let Some(descriptor) = descriptor else {
-            return Ok(None);
-        };
-        let mut state = self.host_state(principal, project).await?;
-        state["descriptor"] = json!(descriptor);
-        Ok(Some(state))
-    }
     async fn handshake(
         &self,
         principal: &Principal,
@@ -837,7 +861,7 @@ impl Manager {
         worker: tokio::task::JoinHandle<()>,
         generation: u64,
         socket_id: String,
-        transport: &str,
+        mode: ProjectCarrierMode,
     ) -> Result<Value, WireError> {
         connection.stop = Some(stop);
         connection.worker = Some(worker);
@@ -854,12 +878,13 @@ impl Manager {
                 },
                 outbound,
                 generation,
+                mode,
             )
             .await;
         match result {
             Ok(mut result) if result["status"] != "existing_project" => {
                 result["descriptor"] = json!(accepted.descriptor);
-                result["transport"] = json!(transport);
+                result["transport"] = json!(mode.transport());
                 Ok(result)
             }
             result => {
@@ -993,6 +1018,7 @@ impl Manager {
                         token: None,
                         directory,
                         allow_legacy_binding: false,
+                        only_if_unattached: false,
                     },
                     &mut connection,
                     true,

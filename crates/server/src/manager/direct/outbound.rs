@@ -162,26 +162,16 @@ impl Manager {
         url.set_path("/api/v1/host/outbound");
         let entry = self.direct_hosts.entry(&params.project_id);
         let mut connection = entry.lock().await;
+        self.require_unattached_route(principal, &params).await?;
         if params.token.as_ref().is_none_or(|token| token.is_empty())
             && self
                 .matching_credential(principal, &params, &locator)
                 .await?
                 .is_some()
-            && let Some(mut state) = self
+            && let Some(state) = self
                 .observe_direct_route(principal, &params.project_id)
                 .await?
         {
-            state["transport"] = json!(if self
-                .routes
-                .lock()
-                .await
-                .get(&params.project_id)
-                .is_some_and(|route| route.socket.starts_with("direct:wss:"))
-            {
-                "outbound_wss"
-            } else {
-                "grpc"
-            });
             return Ok(state);
         }
         let mut attempts = self
@@ -343,7 +333,8 @@ impl Manager {
         let mut connection = entry.lock().await;
         if attempt.stop.is_cancelled()
             || Instant::now() >= attempt.deadline
-            || connection.pending_outbound != Some(attempt.id)
+            || (!attempt.params.only_if_unattached
+                && connection.pending_outbound != Some(attempt.id))
         {
             return Err(attempt.failure(
                 "Outbound attempt cancelled, expired or superseded by another connection intent",
@@ -351,6 +342,11 @@ impl Manager {
         }
         self.editable_project(&attempt.principal.owner, &attempt.params.project_id)
             .await?;
+        self.require_unattached_route(&attempt.principal, &attempt.params)
+            .await?;
+        if connection.pending_outbound != Some(attempt.id) {
+            return Err(attempt.failure("Outbound attempt superseded by another connection intent"));
+        }
         let Carrier::Relay(url) = classify(&attempt.params.url)? else {
             return Err(unavailable("Invalid outbound locator"));
         };
@@ -380,7 +376,7 @@ impl Manager {
             _ = attempt.stop.cancelled() => return Err(unavailable("Outbound inspection cancelled before pairing")),
             reply = tokio::time::timeout(Duration::from_secs(10), probe) => reply.map_err(|_| unavailable("Outbound inspection exceeded 10 seconds"))??,
         };
-        let descriptor = preflight::accept(reply, &request_id, pin.as_ref())?;
+        let descriptor = preflight::accept(reply, &request_id, pin.as_ref(), &handshake)?;
         let _workspace = self
             .direct_hosts
             .admit_workspace(&attempt.principal.owner, &descriptor)
@@ -408,7 +404,7 @@ impl Manager {
             }
         };
         let hello = tokio::select! { _ = attempt.stop.cancelled() => return Err(unknown()), result = tokio::time::timeout(Duration::from_secs(10), exchange) => result.map_err(|_| unknown())?? };
-        let accepted = accept_hello(hello, pin.as_ref(), &descriptor)?;
+        let accepted = accept_hello(hello, pin.as_ref(), &descriptor, &handshake)?;
         attempt.begin_commit()?;
         self.save_direct_credential(
             &attempt.params.project_id,
@@ -497,6 +493,7 @@ impl Manager {
             token: None,
             directory: attempt.params.directory.clone(),
             allow_legacy_binding: attempt.params.allow_legacy_binding,
+            only_if_unattached: attempt.params.only_if_unattached,
         };
         let result = self
             .publish_carrier(
@@ -509,7 +506,7 @@ impl Manager {
                 worker,
                 generation,
                 socket_id,
-                "outbound_wss",
+                ProjectCarrierMode::ServerDirectOutbound,
             )
             .await;
         attempt.complete(result.clone());

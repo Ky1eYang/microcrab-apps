@@ -1,5 +1,9 @@
 //! Raw upload route admission and the complete upload/reference/turn/history path.
 use super::*;
+use crate::manager::SessionRuntimeEvent;
+use microcrab_protocol::{ImageSource, InputPart};
+use microcrab_transport::ContentItem;
+
 struct AttachmentClient;
 #[async_trait::async_trait]
 impl microcrab_session::Client for AttachmentClient {
@@ -10,7 +14,20 @@ impl microcrab_session::Client for AttachmentClient {
         _: &dyn microcrab_auditor::VariableView,
         _: tokio_util::sync::CancellationToken,
     ) -> Result<microcrab_protocol::Response, microcrab_transport::Error> {
-        assert!(content.items.iter().any(|item| matches!(item, microcrab_transport::ContentItem::User {parts,..} if parts.iter().any(|part| matches!(part, microcrab_protocol::InputPart::Image { source: microcrab_protocol::ImageSource::Data {data,..} } if data.len() == 128 * 1024)))));
+        let expected = png();
+        assert!(
+            content.items.iter().any(|item| {
+                let ContentItem::User { parts, .. } = item else {
+                    return false;
+                };
+                parts.iter().any(|part| {
+                    matches!(part, InputPart::Image {
+                        source: ImageSource::Data { media_type, data },
+                    } if media_type == "image/png" && data.as_slice() == expected.as_slice())
+                })
+            }),
+            "the model should receive the exact uploaded PNG bytes"
+        );
         Ok(microcrab_protocol::Response {
             provider_metadata: None,
             content: "attachment resolved".into(),
@@ -21,11 +38,10 @@ impl microcrab_session::Client for AttachmentClient {
 }
 fn png() -> Vec<u8> {
     use base64::Engine as _;
-    let mut data = base64::engine::general_purpose::STANDARD
+    // Keep the successful fixture small; upload size limits are exercised separately.
+    base64::engine::general_purpose::STANDARD
         .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j7S8AAAAASUVORK5CYII=")
-        .unwrap();
-    data.resize(128 * 1024, 0);
-    data
+        .unwrap()
 }
 async fn raw(
     fixture: &Fixture,
@@ -146,19 +162,20 @@ async fn raw_upload_auth_byte_limits_scope_and_turn_resolution() {
         .status(),
         StatusCode::PAYLOAD_TOO_LARGE
     );
+    let image = png();
     let response = raw(
         &fixture,
         id,
         Some(&fixture.token),
         true,
         "image/png",
-        png(),
+        image.clone(),
         None,
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let uploaded = body(response).await;
-    assert_eq!(uploaded["bytes"], 128 * 1024);
+    assert_eq!(uploaded["bytes"].as_u64(), Some(image.len() as u64));
     assert_eq!(uploaded["width"], 1);
     let attachment_id = uploaded["attachment_id"].as_str().unwrap();
     let url = format!("/api/v1/sessions/{id}/attachments/{attachment_id}");
@@ -171,7 +188,7 @@ async fn raw_upload_auth_byte_limits_scope_and_turn_resolution() {
             .await
             .unwrap()
             .as_ref(),
-        png().as_slice()
+        image.as_slice()
     );
     let other = body(
         fixture
@@ -202,33 +219,56 @@ async fn raw_upload_auth_byte_limits_scope_and_turn_resolution() {
         .await
         .unwrap();
     let mut view = subscription.snapshot.clone();
-    let command = serde_json::from_value(json!({"v":1,"type":"command","request_id":uuid::Uuid::new_v4().to_string(),"method":"turn.submit","session_id":id,"params":{"operation_id":uuid::Uuid::new_v4().to_string(),"input":{"parts":[{"type":"image","source":{"type":"attachment","attachment_id":attachment_id}}]}}})).unwrap();
-    fixture
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let command = serde_json::from_value(json!({"v":1,"type":"command","request_id":uuid::Uuid::new_v4().to_string(),"method":"turn.submit","session_id":id,"params":{"operation_id":operation_id,"input":{"parts":[{"type":"image","source":{"type":"attachment","attachment_id":attachment_id}}]}}})).unwrap();
+    let accepted = fixture
         .state
         .manager
         .command(&principal, &command)
         .await
         .unwrap();
+    assert_eq!(accepted["id"].as_str(), Some(operation_id.as_str()));
+    assert_eq!(accepted["status"], "accepted", "submit receipt: {accepted}");
+
+    let mut completed = false;
+    let mut assistant_visible = false;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let event = subscription.receiver.recv().await.unwrap();
+            let event = subscription.receiver.recv().await.expect("turn subscription");
+            match &event.event {
+                SessionRuntimeEvent::Turn(receipt)
+                    if receipt["id"].as_str() == Some(operation_id.as_str()) =>
+                {
+                    assert_eq!(receipt["session_id"], id);
+                    assert_eq!(receipt["status"], "completed", "turn receipt: {receipt}");
+                    completed = true;
+                }
+                SessionRuntimeEvent::ResyncRequired(reason) => {
+                    panic!("turn subscription requires resync: {reason:?}");
+                }
+                _ => {}
+            }
             if crate::manager::publication::apply(
                 &mut view,
                 event.event.name(),
                 event.event.payload(),
-            ) && view["session"]["status"] == "idle"
-                && view["messages"].as_array().is_some_and(|messages| {
+            ) {
+                assistant_visible = view["messages"].as_array().is_some_and(|messages| {
                     messages
                         .iter()
-                        .any(|message| message["text"] == "attachment resolved")
-                })
-            {
+                        .any(|message| message["role"] == "assistant" && message["text"] == "attachment resolved")
+                });
+            }
+            if completed && assistant_visible && view["session"]["status"] == "idle" {
                 break;
             }
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| panic!(
+        "attachment turn did not settle: completed={completed}, assistant_visible={assistant_visible}, session_status={}",
+        view["session"]["status"],
+    ));
     let blocks = serde_json::from_value(json!({"v":1,"type":"command","request_id":uuid::Uuid::new_v4().to_string(),"method":"session.blocks","session_id":id,"params":{}})).unwrap();
     let page = fixture
         .state
@@ -250,7 +290,7 @@ async fn raw_upload_auth_byte_limits_scope_and_turn_resolution() {
             .await
             .unwrap()
             .as_ref(),
-        png().as_slice()
+        image.as_slice()
     );
     fixture.state.manager.close().await.unwrap();
 }

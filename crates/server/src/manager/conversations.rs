@@ -476,6 +476,7 @@ impl Manager {
                         generation,
                         remote: remote.clone(),
                         ready: false,
+                        carrier: (),
                         diagnostics: None,
                     },
                 );

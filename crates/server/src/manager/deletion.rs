@@ -12,6 +12,11 @@ pub(super) async fn archived_view(
     let mut value = view::session(manager, record, &manager.config.provider.model, "closed");
     let path = manager.config.data_dir.join("sessions").join(&record.id);
     let point = manager.child_checkpoint(&path, &record.id).await?;
+    value["mode"] = json!(
+        point
+            .as_ref()
+            .and_then(|point| point.checkpoint.recover.state.selected_mode.as_deref())
+    );
     view::communication_identity(
         &mut value,
         point

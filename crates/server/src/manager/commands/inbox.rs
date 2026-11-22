@@ -5,8 +5,9 @@ pub(super) async fn insert(
     manager: &Manager,
     managed: Arc<Managed>,
     command: &Command,
+    sender_socket: Option<String>,
 ) -> Result<Value, WireError> {
-    let params: Submit = parse(command)?;
+    let mut params: Submit = parse(command)?;
     if params.activate_if_idle && command.method != TURN_QUEUE {
         return Err(WireError::new(
             "invalid_request",
@@ -25,6 +26,9 @@ pub(super) async fn insert(
     {
         return replay(reconcile(manager, operation).await?, command, &digest);
     }
+    let resolver = sender_socket
+        .map(|socket| browser_input_resolver(&managed, socket, &mut params.input))
+        .transpose()?;
     let timestamp = now();
     let mut operation = manager
         .directory
@@ -47,12 +51,21 @@ pub(super) async fn insert(
     // A process loss before durable terminal publication is interrupted/unknown,
     // never a reason to replay this insertion automatically.
     let naming_input = params.input.clone();
-    let result = managed.session.queue_submission(
-        params.input,
-        operation.id.clone(),
-        command.method == TURN_STEER,
-        params.activate_if_idle,
-    );
+    let result = match resolver {
+        Some(resolver) => managed.session.queue_submission_with_important(
+            params.input,
+            operation.id.clone(),
+            command.method == TURN_STEER,
+            params.activate_if_idle,
+            resolver,
+        ),
+        None => managed.session.queue_submission(
+            params.input,
+            operation.id.clone(),
+            command.method == TURN_STEER,
+            params.activate_if_idle,
+        ),
+    };
     operation.status = if result.is_ok() {
         "completed"
     } else {
@@ -206,7 +219,10 @@ pub(super) async fn mutate(
     // The Session mutex is the only mutation authority. No await or copied queue
     // separates its compare-and-swap from capturing the exact removed/updated item.
     let result = if command.method == INBOX_UPDATE {
-        let params: Update = parse(command)?;
+        let mut params: Update = parse(command)?;
+        if let Some(input) = params.input.as_mut() {
+            super::super::client_tools::ClientTools::strip_browser_input_plugins(input);
+        }
         managed
             .session
             .update_pending_input(

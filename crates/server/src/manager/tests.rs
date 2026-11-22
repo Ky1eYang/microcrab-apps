@@ -12,6 +12,7 @@ mod configuration;
 mod context_budget;
 mod deletion;
 mod errors;
+mod execution_history;
 mod external_speakers;
 mod fork;
 mod history;
@@ -20,6 +21,8 @@ mod inbox;
 mod inbox_mutations;
 mod live_attach;
 mod permission_review;
+#[cfg(feature = "storage-file")]
+mod prompt_history;
 mod prompt_templates;
 mod question_images;
 mod retry;

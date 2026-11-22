@@ -4,7 +4,10 @@ use microcrab_protocol::{InputPart, ToolCall};
 use microcrab_storage::display::DisplayScope;
 
 fn source(directory: &std::path::Path) -> DisplaySource {
-    let scope = DisplayScope::new("owner", "session", "session");
+    scoped_source(directory, "session")
+}
+fn scoped_source(directory: &std::path::Path, session_id: &str) -> DisplaySource {
+    let scope = DisplayScope::new("owner", "session", session_id);
     #[cfg(feature = "storage-sqlite")]
     {
         DisplaySource::Sqlite {
@@ -238,6 +241,213 @@ async fn tool_only_admission_binds_exact_producer_and_result_gets_its_own_row() 
             .len(),
         1
     );
+    recorder.close().await.unwrap();
+}
+
+fn call(id: &str) -> ToolCall {
+    ToolCall {
+        id: id.into(),
+        name: "read".into(),
+        arguments: json!({}),
+        provider_metadata: None,
+    }
+}
+
+fn result(id: &str) -> ContentItem {
+    ContentItem::Tool {
+        call_id: id.into(),
+        content: "result".into(),
+        parts: vec![],
+    }
+}
+
+#[tokio::test]
+async fn executions_follow_exact_call_slots_and_survive_dormant_projection() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = source(directory.path());
+    let recorder = open_recorder(source.clone()).await;
+    let anchors = Anchors::new("session".into(), source.clone(), recorder.clone());
+    let mut items = vec![user(), assistant("", vec![call("reused"), call("other")])];
+    anchors.record(0, &items, None).await.unwrap();
+    items.push(result("other"));
+    anchors
+        .observe_tool_result(0, &items, 1, 1, 71, Some("failed"))
+        .await;
+    items.push(result("reused"));
+    anchors
+        .observe_tool_result(0, &items, 1, 0, 72, Some("waiting"))
+        .await;
+    let high = source.revision().unwrap();
+    anchors
+        .observe_tool_result(0, &items, 1, 0, 72, Some("waiting"))
+        .await;
+    assert_eq!(
+        source.revision().unwrap(),
+        high,
+        "no extra record per result"
+    );
+    items.push(assistant("", vec![call("reused")]));
+    anchors.record(0, &items, None).await.unwrap();
+    items.push(result("reused"));
+    let frozen = serde_json::to_vec(&items).unwrap();
+    anchors
+        .observe_tool_result(0, &items, 4, 0, 73, Some("interrupted"))
+        .await;
+    assert_eq!(serde_json::to_vec(&items).unwrap(), frozen);
+    let raw = source.query(0, None, 128).unwrap().unwrap();
+    let last = &raw.records.last().unwrap().event["content"]["message"];
+    assert_eq!(last["execution_id"], 73);
+    assert_eq!(last["execution_session_id"], "session");
+    assert_eq!(last["execution_call_index"], 0);
+    assert_eq!(last["execution_status"], "interrupted");
+    assert!(uuid::Uuid::parse_str(last["execution_call_source_id"].as_str().unwrap()).is_ok());
+    recorder.close().await.unwrap();
+
+    let mut messages = super::super::super::view::messages(items, 0, "session");
+    annotate_messages(source, &mut messages).await.unwrap();
+    assert_eq!(messages[1]["tool_calls"][0]["execution_id"], 72);
+    assert_eq!(messages[1]["tool_calls"][1]["execution_id"], 71);
+    assert_eq!(messages[2]["execution_id"], 71);
+    assert_eq!(messages[3]["execution_id"], 72);
+    assert_eq!(messages[4]["tool_calls"][0]["execution_id"], 73);
+    assert_eq!(messages[5]["execution_id"], 73);
+    assert!(
+        messages[1]["tool_calls"][0]
+            .get("execution_status")
+            .is_none()
+    );
+    assert!(messages[3].get("execution_status").is_none());
+    assert_eq!(messages[1]["tool_calls"][1]["execution_status"], "failed");
+    assert_eq!(messages[2]["execution_status"], "failed");
+    assert_eq!(
+        messages[4]["tool_calls"][0]["execution_status"],
+        "interrupted"
+    );
+    assert_eq!(messages[5]["execution_status"], "interrupted");
+    assert_eq!(
+        messages[5]["execution_call_source_id"],
+        messages[4]["canonical_source_id"]
+    );
+}
+
+#[tokio::test]
+async fn nonmatching_and_legacy_results_do_not_acquire_an_execution() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = source(directory.path());
+    let recorder = open_recorder(source.clone()).await;
+    let anchors = Anchors::new("session".into(), source.clone(), recorder.clone());
+    let mut items = vec![assistant("", vec![call("match"), call("different")])];
+    anchors.record(0, &items, None).await.unwrap();
+    items.push(result("match"));
+    anchors.observe_tool_result(0, &items, 0, 1, 7, None).await;
+    assert!(source.graph().unwrap().unwrap().projection_incomplete);
+    let high = source.revision().unwrap();
+    anchors.observe_tool_result(0, &items, 0, 0, 7, None).await;
+    assert_eq!(source.revision().unwrap(), high);
+    items.push(assistant("", vec![call("match")]));
+    anchors.record(0, &items, None).await.unwrap();
+    items.push(result("match"));
+    anchors.observe_tool_result(0, &items, 0, 0, 8, None).await;
+    let mut messages = super::super::super::view::messages(items, 0, "session");
+    anchors.annotate_messages(&mut messages).await.unwrap();
+    for (assistant, result) in [(0, 1), (2, 3)] {
+        assert!(
+            messages[assistant]["tool_calls"][0]
+                .get("execution_id")
+                .is_none()
+        );
+        assert!(messages[result].get("execution_id").is_none());
+        assert!(messages[result]["canonical_source_id"].is_string());
+    }
+    recorder.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn sibling_results_are_selected_by_graph_and_fork_remap_drops_actionable_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = source(directory.path());
+    let recorder = open_recorder(source.clone()).await;
+    let anchors = Anchors::new("session".into(), source.clone(), recorder.clone());
+    let mut items = vec![user()];
+    anchors.record(0, &items, None).await.unwrap();
+    let root = source.graph().unwrap().unwrap().selected_head;
+    items.push(assistant("", vec![call("same")]));
+    anchors.record(0, &items, None).await.unwrap();
+    items.push(result("same"));
+    anchors
+        .observe_tool_result(0, &items, 1, 0, 81, Some("cancelled"))
+        .await;
+    let first = source.graph().unwrap().unwrap().selected_head;
+    let mut messages = super::super::super::view::messages(items.clone(), 0, "session");
+    anchors.annotate_messages(&mut messages).await.unwrap();
+    let first_source = messages[1]["canonical_source_id"].clone();
+    assert_eq!(messages[2]["execution_id"], 81);
+
+    recorder.select_parent(root).await.unwrap();
+    anchors.annotate_messages(&mut messages).await.unwrap();
+    assert!(messages[1]["tool_calls"][0].get("execution_id").is_none());
+    assert!(messages[2].get("execution_id").is_none());
+    anchors.record(0, &items[..2], None).await.unwrap();
+    anchors.observe_tool_result(0, &items, 1, 0, 82, None).await;
+    anchors.annotate_messages(&mut messages).await.unwrap();
+    assert_ne!(messages[1]["canonical_source_id"], first_source);
+    assert_eq!(messages[2]["execution_id"], 82);
+    assert!(messages[2].get("execution_status").is_none());
+
+    recorder.select_parent(first).await.unwrap();
+    anchors.annotate_messages(&mut messages).await.unwrap();
+    assert_eq!(messages[1]["canonical_source_id"], first_source);
+    assert_eq!(messages[2]["execution_id"], 81);
+    assert_eq!(messages[2]["execution_status"], "cancelled");
+
+    let mut context =
+        microcrab_session::context::Context::new("system".into(), vec![], 1024 * 1024)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+    context.items = items.clone();
+    let remap = fork::remap(&selected(&source).unwrap(), "session", "fork", &context).unwrap();
+    assert!(
+        remap["mappings"][1]["message"]["tool_calls"][0]
+            .get("execution_id")
+            .is_none()
+    );
+    assert!(
+        remap["mappings"][2]["message"]
+            .get("execution_id")
+            .is_none()
+    );
+    let child_dir = tempfile::tempdir().unwrap();
+    let child = scoped_source(child_dir.path(), "fork");
+    let child_recorder = open_recorder(child.clone()).await;
+    child_recorder
+        .append(
+            "import".into(),
+            source.graph().unwrap().unwrap().import_event().unwrap(),
+        )
+        .await
+        .unwrap();
+    child_recorder
+        .append("fork-remap".into(), remap)
+        .await
+        .unwrap();
+    let child_anchors = Anchors::new("fork".into(), child.clone(), child_recorder.clone());
+    items.push(assistant("new", vec![call("same")]));
+    child_anchors.record(0, &items, None).await.unwrap();
+    items.push(result("same"));
+    child_anchors
+        .observe_tool_result(0, &items, 3, 0, 1, None)
+        .await;
+    let mut copies = super::super::super::view::messages(items, 0, "fork");
+    annotate_messages(child, &mut copies).await.unwrap();
+    assert_eq!(copies[1]["canonical_source_id"], first_source);
+    assert!(copies[1]["tool_calls"][0].get("execution_id").is_none());
+    assert!(copies[2].get("execution_id").is_none());
+    assert!(copies[1]["tool_calls"][0].get("execution_status").is_none());
+    assert!(copies[2].get("execution_status").is_none());
+    assert_eq!(copies[3]["tool_calls"][0]["execution_id"], 1);
+    assert_eq!(copies[4]["execution_session_id"], "fork");
+    child_recorder.close().await.unwrap();
     recorder.close().await.unwrap();
 }
 

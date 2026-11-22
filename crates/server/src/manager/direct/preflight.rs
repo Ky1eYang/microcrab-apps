@@ -21,7 +21,7 @@ fn mismatch(
     })));
     error
 }
-pub(super) fn rejection(error: microcrab_host_protocol::WireError) -> WireError {
+pub(super) fn rejection(error: microcrab_host_protocol::WireError, resume: bool) -> WireError {
     if error.code == ErrorCode::BindingMismatch {
         let mut wire = WireError::new("binding_mismatch", error.message);
         wire.details = Some(Box::new(json!({
@@ -31,6 +31,7 @@ pub(super) fn rejection(error: microcrab_host_protocol::WireError) -> WireError 
         return wire;
     }
     let code = match error.code {
+        ErrorCode::PairingDenied if resume => "resume_rejected",
         ErrorCode::PairingDenied => "pairing_denied",
         ErrorCode::WorkspaceDenied => "workspace_denied",
         ErrorCode::Timeout => "host_pairing_expired",
@@ -45,13 +46,15 @@ pub(super) fn rejection(error: microcrab_host_protocol::WireError) -> WireError 
 }
 pub(super) fn inspect(handshake: &HostFrame) -> Result<(String, HostFrame), WireError> {
     let id = uuid::Uuid::new_v4().to_string();
-    let request = InspectRequest::new(id.clone(), handshake).map_err(rejection)?;
+    let request =
+        InspectRequest::new(id.clone(), handshake).map_err(|error| rejection(error, false))?;
     Ok((id, HostFrame::Inspect { request }))
 }
 pub(super) fn accept(
     frame: HostFrame,
     expected: &str,
     pin: Option<&ProjectBinding>,
+    handshake: &HostFrame,
 ) -> Result<HostDescriptor, WireError> {
     let HostFrame::Inspected { request_id, result } = frame else {
         return Err(failure(
@@ -63,7 +66,8 @@ pub(super) fn accept(
             "Host inspection correlation differs; pairing was not sent",
         ));
     }
-    let descriptor = result.map_err(rejection)?;
+    let descriptor =
+        result.map_err(|error| rejection(error, matches!(handshake, HostFrame::Resume { .. })))?;
     validate(&descriptor, pin)?;
     Ok(descriptor)
 }

@@ -133,6 +133,48 @@ async fn observe_reopened(storage: &dyn Configuration, operation: &str, expected
 }
 #[cfg(feature = "storage-file")]
 #[tokio::test]
+async fn file_uncertain_migration_withholds_proof_until_durable_reload() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = microcrab_storage::configuration::FileConfiguration::open(root.path())
+        .await
+        .unwrap();
+    let key = "z".repeat(43);
+    storage
+        .compare_exchange(
+            "owner",
+            "external_speakers",
+            "resources",
+            0,
+            Some(json!({"projects":{"project":{"bot":{"action":"set","key":key}}},"sessions":{}})),
+        )
+        .await
+        .unwrap();
+    let wrapper = PublishedThenError::new(Arc::new(storage));
+    let failed =
+        store::authenticate_witnessed(&wrapper, "owner", Some("project"), "one", &key, true).await;
+    assert!(matches!(failed, Err(error) if error.code == "storage_unavailable"));
+    assert_eq!(wrapper.writes.load(Ordering::Acquire), 1);
+    wrapper.close().await.unwrap();
+    let reopened = microcrab_storage::configuration::FileConfiguration::open(root.path())
+        .await
+        .unwrap();
+    let observed =
+        store::authenticate_witnessed(&reopened, "owner", Some("project"), "one", &key, false)
+            .await
+            .unwrap()
+            .unwrap();
+    let admitted =
+        store::authenticate_witnessed(&reopened, "owner", Some("project"), "two", &key, true)
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(observed.witness() == admitted.witness());
+    assert_eq!(store::load(&reopened, "owner").await.unwrap().0, 2);
+    reopened.close().await.unwrap();
+}
+
+#[cfg(feature = "storage-file")]
+#[tokio::test]
 async fn file_published_error_is_unknown_until_read_only_same_uuid_recovery() {
     let root = tempfile::tempdir().unwrap();
     let operation = uuid::Uuid::new_v4().to_string();

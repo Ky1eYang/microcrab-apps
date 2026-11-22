@@ -174,6 +174,11 @@ pub(super) async fn connection(
                             let _guard = gate.lock().await;
                             let previous = cleanup.lock().unwrap_or_else(|error| error.into_inner()).clone();
                             if let Some((previous, previous_id)) = previous {
+                                if attach.only_if_unattached && slot.lock().unwrap_or_else(|error| error.into_inner()).as_ref().is_some_and(|relay| relay.id == previous_id) {
+                                    let result = Err(crate::manager::direct::route_observation_changed());
+                                    command_completed(&result, started);
+                                    return (request_id, result);
+                                }
                                 task_state.manager.stop_client_relay(&previous, &route_socket, previous_id).await;
                                 if previous != attach.project_id {
                                     task_state.manager.detach_socket_with_cause(&format!("relay:{route_socket}"), Some(&previous), microcrab_host_protocol::ErrorCode::Disconnected, "Browser replaced its native Host relay with another Project").await;

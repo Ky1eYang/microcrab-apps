@@ -1,22 +1,60 @@
 //! External inbox has its own bearer capability. Browser cookies never authorize this route.
 use super::{error::Error, external_speakers};
-use crate::Application;
+use crate::{Application, manager::external_inbox::ExternalInboxReceipt};
 use axum::{
     Json,
     body::to_bytes,
     extract::{Path, Request, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use microcrab_session::state::communication::inbox::{DeliveryStatus, MAX_BODY_BYTES};
-use serde::Deserialize;
+use microcrab_session::state::communication::inbox::{
+    DeliveryStatus, MAX_BODY_BYTES, QueuedReceipt,
+};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+mod origin;
+pub(super) mod reply;
+pub(super) use origin::{cors, inbox_preflight, observe_preflight};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Input {
     body: String,
 }
+
+/// HTTP-specific metadata: do not serialize Core's durable receipt or sender proof.
+#[derive(Serialize)]
+struct Receipt {
+    operation_id: String,
+    ordinal: u64,
+    status: DeliveryStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dialogue_id: Option<String>,
+}
+impl From<ExternalInboxReceipt> for Receipt {
+    fn from(value: ExternalInboxReceipt) -> Self {
+        let (receipt, dialogue_id) = match value {
+            ExternalInboxReceipt::Legacy(receipt) => (receipt, None),
+            ExternalInboxReceipt::Dialogue(dialogue) => {
+                (dialogue.receipt, Some(dialogue.dialogue_id))
+            }
+        };
+        let QueuedReceipt {
+            operation_id,
+            ordinal,
+            status,
+        } = receipt;
+        Self {
+            operation_id,
+            ordinal,
+            status,
+            dialogue_id,
+        }
+    }
+}
+
 fn unauthorized() -> Error {
     Error::new(
         StatusCode::UNAUTHORIZED,
@@ -87,15 +125,7 @@ pub(super) async fn enqueue(
         }
         // Explicit bearer authorization supports non-browser senders. If an Origin is supplied,
         // it still follows the application's existing exact browser-origin policy.
-        if request.headers().contains_key(header::ORIGIN) {
-            state.auth.check_origin(request.headers()).map_err(|_| {
-                Error::new(
-                    StatusCode::FORBIDDEN,
-                    "origin_not_allowed",
-                    "Origin is not allowed",
-                )
-            })?;
-        }
+        origin::check(&state, request.headers())?;
         let bytes = to_bytes(request.into_body(), MAX_BODY_BYTES * 6 + 1024)
             .await
             .map_err(|_| {
@@ -117,6 +147,7 @@ pub(super) async fn enqueue(
             .external_inbox(id, key, operation, Some(input.body))
             .await
             .map_err(Error::from)?;
+        let receipt = Receipt::from(receipt);
         let status = if receipt.status == DeliveryStatus::Queued {
             StatusCode::ACCEPTED
         } else {
@@ -135,21 +166,13 @@ pub(super) async fn observe(
     async {
         let key = bearer(&headers)?;
         let operation = operation(&operation_id)?;
-        if headers.contains_key(header::ORIGIN) {
-            state.auth.check_origin(&headers).map_err(|_| {
-                Error::new(
-                    StatusCode::FORBIDDEN,
-                    "origin_not_allowed",
-                    "Origin is not allowed",
-                )
-            })?;
-        }
+        origin::check(&state, &headers)?;
         let receipt = state
             .manager
             .external_inbox(id, key, operation, None)
             .await
             .map_err(Error::from)?;
-        Ok::<Response, Error>(Json(receipt).into_response())
+        Ok::<Response, Error>(Json(Receipt::from(receipt)).into_response())
     }
     .await
     .unwrap_or_else(IntoResponse::into_response)
@@ -157,6 +180,21 @@ pub(super) async fn observe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_receipt_preserves_wire_shape() {
+        let receipt = Receipt::from(ExternalInboxReceipt::Legacy(QueuedReceipt {
+            operation_id: "legacy".into(),
+            ordinal: 1,
+            status: DeliveryStatus::Consumed,
+        }));
+        assert_eq!(
+            serde_json::to_value(receipt).unwrap(),
+            serde_json::json!({
+                "operation_id":"legacy", "ordinal":1, "status":"consumed"
+            })
+        );
+    }
+
     #[test]
     fn strict_bearer_has_no_cookie_fallback_and_rejects_ambiguous_headers() {
         let mut headers = HeaderMap::new();

@@ -80,6 +80,15 @@ impl PublicationWitness {
         {
             return Ok(None);
         }
+        // Keep the record guard through publication: ordered mode patches use it
+        // too. Read only Core's applied mode, before the inbox fence; a full
+        // State snapshot would visit the Execution registry, whose notices take
+        // that inbox in the opposite direction.
+        if whole_snapshot
+            && value["session"]["mode"].as_str() != managed.session.selected_mode().as_deref()
+        {
+            return Ok(None);
+        }
         managed.session.with_context_measurement(|current| {
             let candidate = if whole_snapshot {
                 &value["statistics"]["context"]

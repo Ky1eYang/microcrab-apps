@@ -11,6 +11,7 @@ mod host;
 mod http;
 mod images;
 pub(crate) mod project;
+mod prompt_history;
 mod provenance;
 mod question_images;
 pub(crate) mod session;
@@ -28,7 +29,7 @@ use tower_http::services::{ServeDir, ServeFile};
 pub(crate) fn router(state: Arc<Application>, frontend: &Path) -> Router {
     #[cfg(feature = "dev")]
     let provider = auth::dev::router(state.auth.clone());
-    let api = http::router() // include /api/v1/*
+    let api = http::router(state.clone()) // include /api/v1/*
         .route("/api/v1/host/outbound", get(host::outbound))
         .route("/api/v1/ws", get(socket::global))
         .route("/api/v1/sessions/{session_id}/ws", get(socket::session))

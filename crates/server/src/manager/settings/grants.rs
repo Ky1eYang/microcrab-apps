@@ -105,6 +105,7 @@ impl FutureGrantPersistence for Grants {
                         "idle"
                     },
                 );
+                let _ = super::super::view::project_live_session(&mut session, &managed.session);
                 super::super::model::project_route(&managed, &cached, &mut session);
                 managed.hub.session(session);
             }

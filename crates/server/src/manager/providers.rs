@@ -92,10 +92,7 @@ fn invalid(message: impl Into<String>) -> WireError {
 }
 fn id(id: &str) -> Result<&str, WireError> {
     let Some(key) = id.strip_prefix("user:") else {
-        return Err(WireError::new(
-            "read_only",
-            "Administrator Providers are read-only; user Provider ids start with user:",
-        ));
+        return Err(invalid("Private Provider ids must start with user:"));
     };
     if key.is_empty()
         || key.len() > 128

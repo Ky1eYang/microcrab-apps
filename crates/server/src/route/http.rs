@@ -35,16 +35,25 @@ pub(crate) fn all_endpoints() -> impl Iterator<Item = &'static Endpoint> {
         .chain(super::external_speakers::ENDPOINTS.iter())
 }
 
-pub(super) fn router() -> Router<Arc<Application>> {
-    let mut router = Router::new()
+pub(super) fn router(state: Arc<Application>) -> Router<Arc<Application>> {
+    use super::external_inbox as inbox;
+    let bearer_routes = Router::new()
         .route(
             "/api/v1/sessions/{session_id}/inbox",
-            axum::routing::post(super::external_inbox::enqueue),
+            axum::routing::post(inbox::enqueue)
+                .get(inbox::reply::by_header)
+                .options(inbox::inbox_preflight),
         )
         .route(
             "/api/v1/sessions/{session_id}/inbox/operations/{operation_id}",
-            get(super::external_inbox::observe),
+            get(inbox::observe).options(inbox::observe_preflight),
         )
+        .route(
+            "/api/v1/sessions/{session_id}/inbox/dialogues/{dialogue_id}/reply",
+            get(inbox::reply::by_path).options(inbox::observe_preflight),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(state, inbox::cors));
+    let mut router = bearer_routes
         .route(
             "/api/v1/sessions/{session_id}/attachments",
             axum::routing::post(super::attachment::upload),
@@ -54,6 +63,10 @@ pub(super) fn router() -> Router<Arc<Application>> {
             get(super::attachment::read),
         )
         .route("/api/v1/health", get(health))
+        .route(
+            "/api/v1/sessions/{session_id}/history/prompt",
+            get(super::prompt_history::read),
+        )
         .route(
             "/api/v1/sessions/{session_id}/files/{message_id}",
             get(super::citations::read),

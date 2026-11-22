@@ -215,9 +215,7 @@ async fn connection(bridge: Arc<BridgeService>, mut socket: WebSocket) {
                 },
             )
             .await;
-            let (code, reason) = if error.code == ErrorCode::Timeout {
-                (4408, "pairing_expired")
-            } else if error.code == ErrorCode::WorkspaceDenied {
+            let (code, reason) = if error.code == ErrorCode::WorkspaceDenied {
                 (4403, "workspace_denied")
             } else if error.code == ErrorCode::BindingMismatch {
                 (4403, "binding_mismatch")

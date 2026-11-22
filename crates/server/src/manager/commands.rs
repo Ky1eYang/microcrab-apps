@@ -1,5 +1,6 @@
 //! Strict native business commands; retries consult durable receipts before effects.
 //! A turn's owned driver keeps draining after the requesting socket disappears.
+mod build;
 mod history;
 mod inbox;
 #[cfg(test)]
@@ -700,10 +701,20 @@ pub(super) async fn list_item(
     item["host_connected"] = json!(manager.embedded || manager.record_host(&record).await.is_ok());
     Ok(Some(item))
 }
+#[cfg(test)]
 pub(super) async fn execute(
     manager: &Manager,
     principal: &Principal,
     command: &Command,
+) -> Result<Value, WireError> {
+    execute_with_sender(manager, principal, command, None).await
+}
+
+pub(super) async fn execute_with_sender(
+    manager: &Manager,
+    principal: &Principal,
+    command: &Command,
+    sender_socket: Option<String>,
 ) -> Result<Value, WireError> {
     if serde_json::to_vec(&command.params)
         .map_err(|_| serialization())?
@@ -759,11 +770,35 @@ pub(super) async fn execute(
         return super::settings::command(manager, owner, command).await;
     }
     match command.method.as_str() {
-        "server.capabilities" => {
+        SERVER_CAPABILITIES => {
             let _: Empty = parse(command)?;
-            return Ok(
-                json!({"protocol":1,"methods":METHODS,"features":{"round_limit_confirmation":true,"attachments":true,"model_observations":true,"interactive_ask":true,"remembered_grants":false,"auto_naming":manager.config.auto_rename,"history_pagination":true,"image_data":true,"image_path":false,"image_url":false,"process_execution":manager.host.tool_capabilities().iter().any(|capability| capability == "shell")},"limits":{"attachment_image_bytes":microcrab_session::admission::image::MAX_IMAGE_BYTES,"attachment_images":microcrab_session::admission::image::MAX_IMAGES_PER_INPUT,"attachment_message_bytes":microcrab_session::admission::image::MAX_INPUT_IMAGE_BYTES,"attachment_pixels":microcrab_session::admission::image::MAX_IMAGE_PIXELS,"attachment_max_side":microcrab_session::admission::image::MAX_IMAGE_DIMENSION,"command_bytes":microcrab_protocol::application::MAX_FRAME_BYTES}}),
-            );
+            let build = build::metadata().await;
+            return Ok(json!({
+                "protocol": 1,
+                "methods": METHODS,
+                "features": {
+                    "round_limit_confirmation": true,
+                    "attachments": true,
+                    "model_observations": true,
+                    "interactive_ask": true,
+                    "remembered_grants": false,
+                    "auto_naming": manager.config.auto_rename,
+                    "history_pagination": true,
+                    "image_data": true,
+                    "image_path": false,
+                    "image_url": false,
+                    "process_execution": manager.host.tool_capabilities().iter().any(|capability| capability == "shell"),
+                },
+                "limits": {
+                    "attachment_image_bytes": microcrab_session::admission::image::MAX_IMAGE_BYTES,
+                    "attachment_images": microcrab_session::admission::image::MAX_IMAGES_PER_INPUT,
+                    "attachment_message_bytes": microcrab_session::admission::image::MAX_INPUT_IMAGE_BYTES,
+                    "attachment_pixels": microcrab_session::admission::image::MAX_IMAGE_PIXELS,
+                    "attachment_max_side": microcrab_session::admission::image::MAX_IMAGE_DIMENSION,
+                    "command_bytes": microcrab_protocol::application::MAX_FRAME_BYTES,
+                },
+                "build": build,
+            }));
         }
         "identity.current" => {
             let _: Empty = parse(command)?;
@@ -1110,43 +1145,12 @@ pub(super) async fn execute(
         let expected_revision = parse::<Revision>(command)?.expected_revision;
         return super::deletion::delete_session(manager, owner, id, Some(expected_revision)).await;
     }
+    if command.method == EXECUTIONS_LIST {
+        let params = parse(command)?;
+        return super::execution_history::list(manager, owner, id, params).await;
+    }
     let record = manager.record(owner, id).await?;
     match command.method.as_str() {
-        EXECUTIONS_LIST => {
-            let params = parse::<crate::route::session::ClientCallsQuery>(command)?;
-            let cursor = params.cursor.unwrap_or(0);
-            let limit = params.limit.unwrap_or(64);
-            if limit == 0 || limit > 64 {
-                return Err(invalid("limit must be between 1 and 64"));
-            }
-            let all = manager.inspect_executions(&record).await?;
-            if cursor > all.len() {
-                return Err(invalid("cursor exceeds the retained execution count"));
-            }
-            let mut items = Vec::new();
-            let mut used = 256;
-            for row in all.iter().skip(cursor).take(limit) {
-                let size = serde_json::to_vec(row).map_err(|_| serialization())?.len();
-                if used + size > 64 * 1024 {
-                    if items.is_empty() {
-                        return Err(WireError::new(
-                            "execution_metadata_too_large",
-                            format!(
-                                "Retained execution {} metadata requires {size} bytes plus a 256-byte page envelope and exceeds the 65536-byte history page budget",
-                                row.execution_id.0
-                            ),
-                        ));
-                    }
-                    break;
-                }
-                used += size;
-                items.push(row.clone());
-            }
-            let next = cursor + items.len();
-            return Ok(
-                json!({"items":items,"next_cursor":if next < all.len() {Some(next)}else{None}}),
-            );
-        }
         EXECUTIONS_CANCEL => {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -1665,9 +1669,9 @@ pub(super) async fn execute(
             Ok(result)
         }
         "permission.set" => permission(manager, &managed, command).await,
-        TURN_QUEUE | TURN_STEER => inbox::insert(manager, managed.clone(), command).await,
+        TURN_QUEUE | TURN_STEER => inbox::insert(manager, managed.clone(), command, sender_socket).await,
         INBOX_UPDATE | INBOX_REMOVE => inbox::mutate(manager, managed.clone(), command).await,
-        TURN_SUBMIT | TURN_RETRY | INBOX_RESUME => submit(manager, managed.clone(), command).await,
+        TURN_SUBMIT | TURN_RETRY | INBOX_RESUME => submit_with_sender(manager, managed.clone(), command, sender_socket).await,
         "checkpoint.create" => {
             let _: Empty = parse(command)?;
             idle(&managed)?;
@@ -1805,6 +1809,9 @@ pub(super) async fn execute(
                 };
             let mut session =
                 view::session(manager, &record, &manager.config.provider.model, status);
+            // select_mode has returned successfully. Report the applied fact
+            // from this exact runtime, not the just-written Directory selection.
+            view::project_live_session(&mut session, &managed.session).map_err(safe)?;
             super::model::project_route(&managed, &record, &mut session);
             snapshot["session"] = session.clone();
             managed.hub.session(session);
@@ -1953,13 +1960,32 @@ async fn finish_session(
     }
     result
 }
-fn idle(managed: &Managed) -> Result<(), WireError> {
+pub(super) fn idle(managed: &Managed) -> Result<(), WireError> {
     if managed.hub.operation().is_some() || managed.session.inbox_snapshot().active {
         Err(WireError::new("busy", "Session is busy"))
     } else {
         Ok(())
     }
 }
+fn browser_input_resolver(
+    managed: &Managed,
+    socket: String,
+    input: &mut SessionInput,
+) -> Result<Arc<dyn microcrab_session::InputAdmissionResolver>, WireError> {
+    let hub = Arc::downgrade(&managed.hub);
+    managed.client_tools.browser_input_resolver(
+        Some(socket), input, managed.session.state_handle(), move || {
+            // Publish before the admitted provider request can create a client
+            // invocation; the frontend can start its existing bind buffer first.
+            if let Some(hub) = hub.upgrade() {
+                hub.publish(super::SessionRuntimeEvent::ClientToolsLeaseChanged(
+                    json!({"executor_connected": true}),
+                ));
+            }
+        },
+    ).map_err(safe)
+}
+
 pub(super) fn validate_input(input: &SessionInput) -> Result<(), WireError> {
     for part in &input.parts {
         if let InputPart::Image { source, .. } = part
@@ -2591,10 +2617,20 @@ pub(super) async fn permission(
     }
     permission_projection(managed)
 }
+#[cfg(test)]
 pub(super) async fn submit(
     manager: &Manager,
     managed: Arc<Managed>,
     command: &Command,
+) -> Result<Value, WireError> {
+    submit_with_sender(manager, managed, command, None).await
+}
+
+async fn submit_with_sender(
+    manager: &Manager,
+    managed: Arc<Managed>,
+    command: &Command,
+    sender_socket: Option<String>,
 ) -> Result<Value, WireError> {
     let resume = if command.method == INBOX_RESUME {
         let params: ResumePending = parse(command)?;
@@ -2603,7 +2639,7 @@ pub(super) async fn submit(
     } else {
         None
     };
-    let (operation, input, failed_operation_id) = if let Some(params) = &resume {
+    let (operation, mut input, failed_operation_id) = if let Some(params) = &resume {
         (params.operation_id.clone(), None, None)
     } else if command.method == TURN_RETRY {
         let params: Retry = parse(command)?;
@@ -2626,6 +2662,10 @@ pub(super) async fn submit(
         return replay(reconcile(manager, operation).await?, command, &digest);
     }
     idle(&managed)?;
+    let resolver = match (sender_socket, input.as_mut()) {
+        (Some(socket), Some(input)) => Some(browser_input_resolver(&managed, socket, input)?),
+        _ => None,
+    };
     let mut display_retry = None;
     let retry_link = if let Some(failed_id) = failed_operation_id {
         let failures = manager
@@ -2754,12 +2794,14 @@ pub(super) async fn submit(
             .await
     } else {
         match input {
-            Some(input) => {
-                managed
-                    .session
+            Some(input) => match resolver {
+                Some(resolver) => managed.session
+                    .stream_submission_with_settlement_and_important(input, operation.id.clone(), cancellation, resolver)
+                    .await,
+                None => managed.session
                     .stream_submission_with_settlement(input, operation.id.clone(), cancellation)
-                    .await
-            }
+                    .await,
+            },
             None => {
                 managed
                     .session

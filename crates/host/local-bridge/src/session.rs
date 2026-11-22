@@ -229,7 +229,7 @@ impl Live {
             WireFrame::Detach { lease_generation } if lease_generation == generation => {
                 let mut auth = self.bridge.authority.lock().await;
                 if auth.generation.to_string() == generation {
-                    if auth.require_token {
+                    if auth.pairing_mode.requires_token() {
                         auth.credential = None;
                     }
                     auth.lease_deadline = std::time::Instant::now();

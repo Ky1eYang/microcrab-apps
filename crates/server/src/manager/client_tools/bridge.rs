@@ -26,6 +26,8 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
+mod input_admission;
+
 #[path = "interactions.rs"]
 mod interactions;
 
@@ -61,6 +63,13 @@ struct Lease {
 struct Participant {
     client: String,
     id: String,
+    catalog_digest: String,
+    catalog_epoch: Option<u64>,
+}
+impl Participant {
+    fn matches_catalog(&self, catalog: &Catalog) -> bool {
+        self.catalog_digest == catalog.digest && self.catalog_epoch == Some(catalog.epoch)
+    }
 }
 struct DeferredCompletion {
     record: CallRecord,
@@ -69,6 +78,7 @@ struct DeferredCompletion {
 struct State {
     durable: Durable,
     lease: Option<Lease>,
+    committed_inventory: Option<input_admission::CommittedInventory>,
     participants: HashMap<String, Participant>,
     waiters: HashMap<String, oneshot::Sender<CallRecord>>,
     anchors: HashMap<String, Option<String>>,
@@ -86,17 +96,35 @@ struct State {
     implicit_buffers: HashSet<String>,
     deferred_completions: HashMap<String, DeferredCompletion>,
 }
+impl State {
+    fn invalidate_participant_catalogs(&mut self) {
+        for member in self.participants.values_mut() {
+            member.catalog_epoch = None;
+        }
+    }
+
+    fn execution_idle(&self) -> bool {
+        !self
+            .durable
+            .calls
+            .iter()
+            .any(|call| call.status.unsettled())
+            && self.writers.is_empty()
+            && self.contexts.is_empty()
+    }
+}
 pub(crate) struct ClientTools {
     parent_session_id: String,
     store: Store,
     decisions: super::decisions::DecisionStore,
-    state: AsyncMutex<State>,
+    state: Arc<AsyncMutex<State>>,
     #[expect(
         clippy::type_complexity,
         reason = "The bridge shares one optional synchronous event callback behind a short registration lock; preserve the erased Send + Sync observer port"
     )]
     observer: Mutex<Option<Arc<dyn Fn(ClientToolEvent) + Send + Sync>>>,
     executor_changes: tokio::sync::watch::Sender<Option<(String, String)>>,
+    last_input_handoff_notice: Mutex<Option<(String, String)>>,
     membership_changes: tokio::sync::watch::Sender<u64>,
     invocation_changes: tokio::sync::watch::Sender<Option<ClientToolEvent>>,
 }
@@ -169,9 +197,10 @@ impl ClientTools {
                 &data_dir.join("sessions").join(parent_session_id),
             )?,
             store,
-            state: AsyncMutex::new(State {
+            state: Arc::new(AsyncMutex::new(State {
                 durable,
                 lease: None,
+                committed_inventory: None,
                 participants: HashMap::new(),
                 waiters: HashMap::new(),
                 anchors: HashMap::new(),
@@ -187,9 +216,10 @@ impl ClientTools {
                 failures: HashMap::new(),
                 implicit_buffers: HashSet::new(),
                 deferred_completions: HashMap::new(),
-            }),
+            })),
             observer: Mutex::new(None),
             executor_changes: tokio::sync::watch::channel(None).0,
+            last_input_handoff_notice: Mutex::new(None),
             membership_changes: tokio::sync::watch::channel(0).0,
             invocation_changes: tokio::sync::watch::channel(None).0,
         }))
@@ -237,15 +267,7 @@ impl ClientTools {
     }
     pub(crate) async fn with_execution_idle<R>(&self, callback: impl FnOnce(bool) -> R) -> R {
         let state = self.state.lock().await;
-        callback(
-            !state
-                .durable
-                .calls
-                .iter()
-                .any(|call| call.status.unsettled())
-                && state.writers.is_empty()
-                && state.contexts.is_empty(),
-        )
+        callback(state.execution_idle())
     }
     pub(crate) fn membership_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.membership_changes.subscribe()
@@ -433,6 +455,7 @@ impl ClientTools {
         next.catalogs.push(catalog);
         self.store.commit(&next)?;
         state.durable = next;
+        state.invalidate_participant_catalogs();
         // The same executor remains owner of already issued old-catalog calls.
         // A new bind validates the new advertised digest without changing its lease.
         Ok(())
@@ -509,6 +532,7 @@ impl ClientTools {
         bounded(&durable, MAX_STORE_BYTES - MAX_JSON_BYTES - 1024)?;
         self.store.commit(&durable)?;
         state.durable = durable;
+        state.invalidate_participant_catalogs();
         // An old socket must explicitly bind to the newly admitted digest.
         state.lease = None;
         self.executor_changes.send_replace(None);
@@ -581,6 +605,7 @@ impl ClientTools {
         durable.catalogs.push(catalog);
         self.store.commit(&durable)?;
         state.durable = durable;
+        state.invalidate_participant_catalogs();
         state.lease = None;
         self.executor_changes.send_replace(None);
         Ok(())
@@ -741,16 +766,26 @@ impl ClientTools {
         if request.catalog_digest != current.digest {
             return Err(invalid("client tool catalog digest mismatch"));
         }
+        let catalog_epoch = current.epoch;
         if state.participants.len() >= 128 && !state.participants.contains_key(socket_id) {
             return Err(invalid("client participant limit reached"));
         }
-        state
+        let member = state
             .participants
             .entry(socket_id.into())
             .or_insert_with(|| Participant {
                 client: request.client_id.clone(),
                 id: uuid::Uuid::new_v4().to_string(),
+                catalog_digest: request.catalog_digest.clone(),
+                catalog_epoch: Some(catalog_epoch),
             });
+        if member.client != request.client_id {
+            return Err(invalid("socket is already bound to a different client"));
+        }
+        // Existing interaction membership survives a catalog transition, but
+        // a fresh exact bind is required before the socket can be selected.
+        member.catalog_digest.clone_from(&request.catalog_digest);
+        member.catalog_epoch = Some(catalog_epoch);
         self.membership_changes
             .send_modify(|revision| *revision = revision.saturating_add(1));
         if let Some(lease) = &state.lease {
@@ -792,15 +827,16 @@ impl ClientTools {
         identifier(socket_id)?;
         identifier(&request.client_id)?;
         let mut state = self.state.lock().await;
-        if state
+        let Some((member, catalog)) = state
             .participants
             .get(socket_id)
-            .is_none_or(|member| member.client != request.client_id)
-            || state
-                .durable
-                .catalogs
-                .last()
-                .is_none_or(|catalog| catalog.digest != request.catalog_digest)
+            .zip(state.durable.catalogs.last())
+        else {
+            return Err(invalid("bound participant and exact catalog required"));
+        };
+        if member.client != request.client_id
+            || catalog.digest != request.catalog_digest
+            || !member.matches_catalog(catalog)
         {
             return Err(invalid("bound participant and exact catalog required"));
         }
@@ -813,18 +849,11 @@ impl ClientTools {
                     Some(lease.id.clone()),
                 ));
             }
-            if state
-                .durable
-                .calls
-                .iter()
-                .any(|call| call.status.unsettled())
-                || !state.writers.is_empty()
-                || !state.contexts.is_empty()
-            {
-                return Err(invalid(
-                    "client tool executor is busy; takeover requires idle execution",
-                ));
-            }
+        }
+        if !state.execution_idle() {
+            return Err(invalid(
+                "client tool executor is busy; takeover requires idle execution",
+            ));
         }
         let lease_id = uuid::Uuid::new_v4().to_string();
         state.lease = Some(Lease {

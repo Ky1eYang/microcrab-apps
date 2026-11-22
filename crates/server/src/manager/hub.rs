@@ -366,6 +366,29 @@ impl Hub {
             self.session_changed();
         }
     }
+    /// Update the applied mode on the ordered session stream without touching
+    /// configured settings, directory revision or the settled transcript.
+    pub fn applied_mode(&self, mode: Option<&str>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(session) = state
+            .snapshot
+            .get_mut("session")
+            .filter(|value| value.is_object())
+        else {
+            return;
+        };
+        if session["mode"].as_str() == mode {
+            return;
+        }
+        session["mode"] = json!(mode);
+        let session = session.clone();
+        self.send(
+            &mut state,
+            SessionRuntimeEvent::SessionMeta(json!({"session":session})),
+        );
+        drop(state);
+        self.session_changed();
+    }
     pub fn statistics(&self, statistics: Value, expected_revision: u64) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         if state.snapshot["session"]["revision"].as_u64() != Some(expected_revision) {

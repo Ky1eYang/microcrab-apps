@@ -1,8 +1,19 @@
-//! Bearer-only external admission; no browser Principal, second queue or credential index.
-use super::{Manager, safe};
+//! Bearer-only admission and observation of exact operations in the canonical Core inbox.
+use super::{Manager, external_speakers::CredentialUse, safe};
 use microcrab_protocol::application::WireError;
-use microcrab_session::state::communication::inbox::QueuedReceipt;
-use std::sync::Arc;
+use microcrab_session::state::communication::{
+    AgentId,
+    inbox::{DurableInbox, ExternalCredentialIncarnation, ExternalDialogueReceipt, QueuedReceipt},
+};
+use std::{path::Path, sync::Arc};
+
+pub(crate) mod reply;
+
+#[derive(Debug)]
+pub(crate) enum ExternalInboxReceipt {
+    Legacy(QueuedReceipt),
+    Dialogue(ExternalDialogueReceipt),
+}
 
 pub(super) fn denied() -> WireError {
     WireError::new(
@@ -10,25 +21,56 @@ pub(super) fn denied() -> WireError {
         "External speaker key is not bound to the target Session",
     )
 }
-fn backend(error: microcrab_session::Error) -> WireError {
-    let cause = safe(error);
-    let mut error = WireError::new("storage_unavailable", &cause.message);
-    error.details = Some(Box::new(serde_json::json!({"cause":cause})));
-    error
+fn missing() -> WireError {
+    WireError::new(
+        "operation_not_found",
+        "External operation has no committed receipt; this does not prove a pending append failed",
+    )
 }
+fn backend(_: microcrab_session::Error) -> WireError {
+    WireError::new(
+        "storage_unavailable",
+        "External inbox storage is unavailable",
+    )
+}
+fn auth_error(error: WireError) -> WireError {
+    match error.code.as_str() {
+        "unauthenticated" | "not_found" => denied(),
+        "io" | "protocol" | "configuration_unavailable" | "storage_unavailable" => WireError::new(
+            "storage_unavailable",
+            "External speaker configuration is unavailable",
+        ),
+        _ => error,
+    }
+}
+fn enqueue_error(error: microcrab_session::Error, operation: &str) -> WireError {
+    use microcrab_session::{Error, observation::diagnostics::EffectKnowledge};
+    if matches!(&error, Error::Diagnostic(diagnostic) if diagnostic.effects == EffectKnowledge::MayHaveOccurred && diagnostic.retryable == Some(false))
+    {
+        let mut uncertain = WireError::new(
+            "outcome_unknown",
+            "External enqueue requires receipt observation before retrying",
+        );
+        uncertain.details = Some(Box::new(serde_json::json!({"operation_id":operation})));
+        return uncertain;
+    }
+    if matches!(&error, Error::Config(reason) if reason.public_reason() == Some("operation id already names a different communication admission"))
+        || matches!(&error, Error::Denied(reason) if reason.public_reason() == Some("no matching legacy external admission"))
+    {
+        return WireError::new(
+            "operation_conflict",
+            "Operation does not match the committed external admission",
+        );
+    }
+    safe(error)
+}
+
 impl Manager {
-    async fn inspect_external_receipt(
-        &self,
-        id: &str,
-        operation: &str,
-    ) -> Result<QueuedReceipt, WireError> {
+    async fn inspect_external_inbox(&self, id: &str) -> Result<Option<DurableInbox>, WireError> {
         let path = self.config.data_dir.join("sessions").join(id);
-        let point = self.child_checkpoint(&path, id).await?.ok_or_else(|| {
-            WireError::new(
-                "operation_not_found",
-                "Session has no selected durable communication checkpoint",
-            )
-        })?;
+        let Some(point) = self.child_checkpoint(&path, id).await? else {
+            return Ok(None);
+        };
         let identity = point
             .checkpoint
             .recover
@@ -42,24 +84,34 @@ impl Manager {
             })?
             .identity
             .agent_id;
-        let inbox = match self.config.storage {
+        self.inspect_communication(&path, id, identity).await
+    }
+
+    async fn inspect_communication(
+        &self,
+        path: &Path,
+        id: &str,
+        identity: AgentId,
+    ) -> Result<Option<DurableInbox>, WireError> {
+        let _ = (path, id, &identity);
+        match self.config.storage {
             crate::config::Storage::File => {
                 #[cfg(feature = "storage-file")]
                 {
                     microcrab_storage::history::FileJournal::inspect_communication(
-                        &path,
+                        path,
                         id.to_owned(),
                         identity,
                     )
                     .await
-                    .map_err(backend)?
+                    .map_err(backend)
                 }
                 #[cfg(not(feature = "storage-file"))]
                 {
-                    return Err(WireError::new(
+                    Err(WireError::new(
                         "storage_unavailable",
                         "File storage is not compiled",
-                    ));
+                    ))
                 }
             }
             crate::config::Storage::Sqlite => {
@@ -71,26 +123,26 @@ impl Manager {
                         identity,
                     )
                     .await
-                    .map_err(backend)?
+                    .map_err(backend)
                 }
                 #[cfg(not(feature = "storage-sqlite"))]
                 {
-                    return Err(WireError::new(
+                    Err(WireError::new(
                         "storage_unavailable",
                         "SQLite storage is not compiled",
-                    ));
+                    ))
                 }
             }
-        };
-        inbox.and_then(|inbox|inbox.receipt(operation)).ok_or_else(||WireError::new("operation_not_found","External operation has no committed receipt; this does not prove a pending append failed"))
+        }
     }
+
     pub(crate) async fn external_inbox(
         &self,
         session_id: String,
         bearer: String,
         operation_id: String,
         body: Option<String>,
-    ) -> Result<QueuedReceipt, WireError> {
+    ) -> Result<ExternalInboxReceipt, WireError> {
         let permit = self
             .admission
             .clone()
@@ -114,102 +166,114 @@ impl Manager {
             )
         })?
     }
+
     async fn external_inbox_owned(
         self: Arc<Self>,
         id: &str,
         bearer: &str,
         operation: String,
         body: Option<String>,
-    ) -> Result<QueuedReceipt, WireError> {
-        if !crate::config::valid_id(id) {
-            return Err(denied());
-        }
-        // The canonical exact index selects an owner; only effective bearer proof grants admission.
-        let owner = self
-            .directory
-            .session_owner(id)
+    ) -> Result<ExternalInboxReceipt, WireError> {
+        let (record, _gate) = self
+            .lock_external_speaker_session(id)
             .await
-            .map_err(backend)?
-            .ok_or_else(denied)?;
-        let _admission = self.speaker_gate(&owner).lock_owned().await;
-        let record = self
-            .directory
-            .get(&owner, id)
-            .await
-            .map_err(backend)?
-            .ok_or_else(denied)?;
-        let identity = self
-            .authenticate_external_speaker(&owner, id, bearer)
-            .await
-            .map_err(|error| {
-                if matches!(error.code.as_str(), "unauthenticated" | "not_found") {
-                    denied()
-                } else if matches!(
-                    error.code.as_str(),
-                    "io" | "protocol" | "configuration_unavailable" | "storage_unavailable"
-                ) {
-                    let mut unavailable = WireError::new("storage_unavailable", &error.message);
-                    unavailable.details = Some(Box::new(serde_json::json!({"cause":error})));
-                    unavailable
-                } else {
-                    error
-                }
-            })?;
-        let managed = if body.is_some() {
-            self.active(record, true).await?
-        } else {
-            // Observation never activates dormant Sessions or starts a dispatcher.
-            let slot = self
-                .registry
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .get(id)
-                .cloned();
-            let active = if let Some(slot) = slot {
-                slot.active.lock().await.clone()
-            } else {
-                None
-            };
-            match active {
-                Some(managed) => managed,
-                None => return self.inspect_external_receipt(id, &operation).await,
-            }
-        };
-        if let Some(body) = body {
-            self.synchronize_external_speakers(
-                &owner,
-                managed.record.lock().await.project_id.as_deref(),
+            .map_err(auth_error)?;
+        // Prove the effective bearer before any inbox reads. Legacy compatibility is
+        // deliberately non-migrating, even on POST of an already admitted legacy row.
+        let speaker = self
+            .authenticate_external_speaker_at(
+                &record.owner,
+                record.project_id.as_deref(),
                 id,
-                &managed.session,
+                bearer,
             )
-            .await?;
-            match managed
-                .session
-                .enqueue_external(operation.clone(), identity.identity, body)
-                .await
-            {
-                Ok(receipt) => Ok(receipt),
-                Err(error) => {
-                    let uncertain = matches!(&error, microcrab_session::Error::Diagnostic(diagnostic) if diagnostic.effects == microcrab_session::observation::diagnostics::EffectKnowledge::MayHaveOccurred && diagnostic.retryable == Some(false));
-                    let cause = safe(error);
-                    if !uncertain {
-                        return Err(cause);
-                    }
-                    let mut uncertain = WireError::new(
-                        "outcome_unknown",
-                        format!(
-                            "External enqueue requires receipt observation: {}",
-                            cause.message
-                        ),
-                    );
-                    uncertain.details = Some(Box::new(
-                        serde_json::json!({"operation_id":operation,"cause":cause}),
-                    ));
-                    Err(uncertain)
-                }
-            }
+            .await
+            .map_err(auth_error)?;
+        let slot = self
+            .registry
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(id)
+            .cloned();
+        let active = if let Some(slot) = slot {
+            slot.active.lock().await.clone()
         } else {
-            managed.session.delivery_receipt(&operation).await.map_err(backend)?.ok_or_else(|| WireError::new("operation_not_found", "External operation has no committed receipt; this does not prove a pending append failed"))
+            None
+        };
+        let dormant = if active.is_none() {
+            self.inspect_external_inbox(id).await?
+        } else {
+            None
+        };
+        let legacy = if let Some(active) = &active {
+            active
+                .session
+                .delivery_receipt(&operation)
+                .await
+                .map_err(backend)?
+        } else {
+            dormant.as_ref().and_then(|inbox| inbox.receipt(&operation))
+        };
+
+        let Some(body) = body else {
+            if let Some(legacy) = legacy {
+                return Ok(ExternalInboxReceipt::Legacy(legacy));
+            }
+            let proof = self
+                .external_speaker_credential_locked(&record, bearer, CredentialUse::Observe)
+                .await
+                .map_err(auth_error)?
+                .ok_or_else(missing)?;
+            let incarnation = ExternalCredentialIncarnation::new(*proof.witness());
+            let receipt = if let Some(active) = active {
+                active
+                    .session
+                    .authenticated_external_receipt(&operation, &proof.identity, &incarnation)
+                    .await
+            } else if let Some(inbox) = dormant {
+                inbox.authenticated_external_receipt(&operation, &proof.identity, &incarnation)
+            } else {
+                return Err(missing());
+            };
+            return receipt
+                .map_err(backend)?
+                .map(ExternalInboxReceipt::Dialogue)
+                .ok_or_else(missing);
+        };
+
+        if legacy.is_some() {
+            // Core checks exact body/source under its communication fence. This port
+            // MUST NOT append on absence, even across activation or history changes.
+            let managed = self.active(record, true).await?;
+            return managed
+                .session
+                .replay_legacy_external(operation.clone(), speaker.identity, body)
+                .await
+                .map(ExternalInboxReceipt::Legacy)
+                .map_err(|error| enqueue_error(error, &operation));
         }
+
+        let proof = self
+            .external_speaker_credential_locked(&record, bearer, CredentialUse::Admit)
+            .await
+            .map_err(auth_error)?
+            .ok_or_else(denied)?;
+        let incarnation = ExternalCredentialIncarnation::new(*proof.witness());
+        let owner = record.owner.clone();
+        let managed = self.active(record, true).await?;
+        self.synchronize_external_speakers(
+            &owner,
+            managed.record.lock().await.project_id.as_deref(),
+            id,
+            &managed.session,
+        )
+        .await?;
+        // One exact enqueue, never a fallback or retry after an uncertain result.
+        managed
+            .session
+            .enqueue_authenticated_external(operation.clone(), proof.identity, body, incarnation)
+            .await
+            .map(ExternalInboxReceipt::Dialogue)
+            .map_err(|error| enqueue_error(error, &operation))
     }
 }

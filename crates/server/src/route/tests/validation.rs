@@ -42,6 +42,54 @@ async fn capabilities_negotiate_relay_and_display_without_cross_socket_authority
 }
 
 #[tokio::test]
+async fn capabilities_expose_build_identity_only_after_authentication() {
+    let fixture = Fixture::new(false).await;
+    let unauthenticated = fixture
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/capabilities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert!(body(unauthenticated).await.get("build").is_none());
+
+    let response = fixture.request("GET", "/api/v1/capabilities", None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let capabilities = body(response).await;
+    let build = capabilities["build"].as_object().unwrap();
+    assert_eq!(build.len(), 2);
+    assert_eq!(build["version"], env!("CARGO_PKG_VERSION"));
+    #[cfg(target_os = "linux")]
+    {
+        let hash = build["sha256"].as_str().unwrap();
+        assert_eq!(hash.len(), 64);
+        assert!(
+            hash.bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(build.get("sha256"), Some(&Value::Null));
+
+    for path in ["/api/health", "/api/v1/health"] {
+        let health = fixture
+            .router
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(body(health).await.get("build").is_none());
+    }
+    fixture.state.manager.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn invalid_path_query_and_json_report_safe_actionable_facts() {
     let fixture = Fixture::new(false).await;
     for (path, source, kind, field, cause) in [

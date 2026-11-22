@@ -150,7 +150,7 @@ pub(super) async fn create_from(
     manager: &Manager,
     record: SessionRecord,
     restore: bool,
-    fork_source: Option<(&Session, &microcrab_storage::ModelSelection)>,
+    fork_source: Option<&super::fork::Source>,
 ) -> Result<Arc<Managed>, Error> {
     let directory = manager.config.data_dir.join("sessions").join(&record.id);
     let host = manager.session_host(&record).await?;
@@ -181,7 +181,11 @@ pub(super) async fn create_from(
                 catalogs
                     .iter()
                     .find(|component| &component.digest == digest)
-                    .ok_or_else(|| Error::config("pinned agent component unavailable"))?,
+                    .ok_or_else(|| {
+                        Error::Config(format!(
+                            "pinned agent component unavailable (SHA-256 {digest}). Restore the exact Agent component to the Server's configured Agent catalog, or start a new Session with the current Agent. This Session's Agent pin has not changed."
+                        ).into())
+                    })?,
             ),
             None => None,
         }
@@ -317,7 +321,7 @@ pub(super) async fn create_from(
     let prompt_config = super::prompt_defaults::retained(
         prompt_config,
         recover.as_ref(),
-        fork_source.map(|(source, _)| source.prompt_config()),
+        fork_source.map(|source| source.session.prompt_config()),
     );
     prompt_config.validate()?;
     let client_tools = manager.client_tools(&record.id).await?;
@@ -334,6 +338,20 @@ pub(super) async fn create_from(
         ToolRegistration::Builtin(BuiltinTool::Job),
         ToolRegistration::Builtin(BuiltinTool::Sleep),
     ]);
+    // Register native wiring for the fixed root Agent only. Core retains the
+    // exact frozen definitions on restore/fork and rejects unadvertised calls;
+    // a later explicit environment/catalog update may adopt this builtin.
+    if agent.as_ref().is_some_and(|agent| {
+        let mut modes = agent
+            .modes
+            .iter()
+            .filter(|mode| matches!(mode.role, AgentRole::MainAgent | AgentRole::Both));
+        modes
+            .next()
+            .is_some_and(|first| modes.any(|mode| mode.name != first.name))
+    }) {
+        tools.push(ToolRegistration::Builtin(BuiltinTool::SwitchMode));
+    }
     if catalog.iter().any(|agent| {
         agent
             .modes
@@ -404,7 +422,7 @@ pub(super) async fn create_from(
         None => None,
     };
     let applied_selection = fork_source
-        .map(|(_, route)| route.clone())
+        .map(|source| source.route.clone())
         .or(selected_route)
         .or(known_legacy.clone())
         .unwrap_or_else(|| selection.clone());
@@ -661,7 +679,11 @@ pub(super) async fn create_from(
         .catalog(catalog)
         .is_main(true)
         .auditor(usage)
-        .journal(journal.clone());
+        .journal(journal.clone())
+        .dialogue_reply_store_with(super::external_inbox::reply::store_factory(
+            &manager.config,
+            &record,
+        ));
     let reference_sources: Vec<microcrab_session::state::reference::ReferenceSource> = manager
         .configuration
         .get(&record.owner, "session_references", &record.id)
@@ -686,20 +708,26 @@ pub(super) async fn create_from(
     // Publish Managed before Session.start: effectful init may ask the existing
     // socket executor for permission. Slot owns startup admission, cancellation
     // and failure publication after this pure build/restore phase returns.
-    let select_initial_mode = fork_source.is_some() || recover.is_none();
+    let new_invocation_owner = fork_source.is_some() || recover.is_none();
+    let initial_mode = match fork_source {
+        Some(source) => source.selected_mode.as_deref(),
+        None if recover.is_none() => record.mode.as_deref(),
+        None => None,
+    };
     let initialized = async {
         let session = if let Some(source) = fork_source {
-            source.0.fork(builder).await
+            source.session.fork(builder).await
         } else {
             match recover {
                 Some(recover) => Session::restore(builder, recover).await,
                 None => builder.build(),
             }
         }?;
-        // Install the requested initial permission mode before the first guest effect.
-        // Restored policy remains the exact saved mode installed by Session::restore.
-        if select_initial_mode
-            && let Some(mode) = record.mode.clone()
+        // A fork retains its historical mode, even if the source's live/manual
+        // selection or the copied creator configuration has since changed.
+        // Restore already applies the exact saved policy in Core.
+        if let Some(mode) = initial_mode
+            && (fork_source.is_none() || session.state().selected_mode.as_deref() != Some(mode))
             && let Err(error) = session.select_mode(mode).await
         {
             let _ = session.close().await;
@@ -745,7 +773,7 @@ pub(super) async fn create_from(
         .unwrap_or_else(|error| error.into_inner())
         .get(&record.id)
         .cloned();
-    if select_initial_mode
+    if new_invocation_owner
         && session.state().agent_initialization_pending
         && super::agent_init::requires_deferred_start(
             record.project_id.is_none()
@@ -820,6 +848,7 @@ pub(super) async fn create_from(
     // results. Streaming observations remain advisory and never enter snapshots.
     let mut conversation_changes = managed.session.context_measurement_changes();
     let mut executor_changes = managed.client_tools.executor_changes();
+    let task_client_tools = Arc::downgrade(&managed.client_tools);
     let mut turn_events = managed.hub.subscribe().receiver;
     let task_hub = managed.hub.clone();
     let task_close = managed.close_token.clone();
@@ -855,10 +884,12 @@ pub(super) async fn create_from(
                 }
                 changed = executor_changes.changed() => {
                     if changed.is_err() { break; }
-                    let executor_connected = executor_changes.borrow_and_update().is_some();
-                    task_hub.publish(super::SessionRuntimeEvent::ClientToolsLeaseChanged(
-                        serde_json::json!({"executor_connected": executor_connected}),
-                    ));
+                    let lease = executor_changes.borrow_and_update().clone();
+                    if !lease.as_ref().is_some_and(|lease| task_client_tools.upgrade().is_some_and(|tools| tools.input_handoff_notified(lease))) {
+                        task_hub.publish(super::SessionRuntimeEvent::ClientToolsLeaseChanged(
+                            serde_json::json!({"executor_connected": lease.is_some()}),
+                        ));
+                    }
                     continue;
                 }
                 changed = conversation_changes.changed() => {

@@ -3,12 +3,16 @@
 mod attachments;
 mod citations;
 mod children;
+mod execution_history;
+mod external_reply;
 mod external_speakers;
 mod host_connection;
 mod images;
 mod model_metadata;
 mod permission_ask;
+mod prompt_history;
 mod provenance;
+mod providers;
 mod question_images;
 mod v018;
 mod validation;
@@ -37,6 +41,17 @@ impl Fixture {
         embedded: bool,
         client: Option<Arc<dyn microcrab_session::Client>>,
     ) -> Self {
+        #[cfg(feature = "storage-sqlite")]
+        let storage = crate::config::Storage::Sqlite;
+        #[cfg(not(feature = "storage-sqlite"))]
+        let storage = crate::config::Storage::File;
+        Self::with_storage(embedded, client, storage).await
+    }
+    async fn with_storage(
+        embedded: bool,
+        client: Option<Arc<dyn microcrab_session::Client>>,
+        storage: crate::config::Storage,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         let mut value: Value =
             serde_json::from_str(include_str!("../../config.example.json")).unwrap();
@@ -54,10 +69,7 @@ impl Fixture {
         value["auth"]["jwt_secret"] = json!("test-only-secret-at-least-thirty-two-characters");
         let mut config: crate::config::Config = serde_json::from_value(value).unwrap();
         config.resolve(root.path()).unwrap();
-        #[cfg(not(feature = "storage-sqlite"))]
-        {
-            config.storage = crate::config::Storage::File;
-        }
+        config.storage = storage;
         let (router, state) = if let Some(client) = client {
             assert!(
                 embedded,

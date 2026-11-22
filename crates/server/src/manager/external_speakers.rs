@@ -10,6 +10,12 @@
 //! receipts until the bounded resource is full, then reject rather than lose deduplication.
 //! Limits: 128 entries per layer/effective set, 4096 layers and receipts, existing 1 MiB
 //! Configuration budget. Custom format validates alphabet and length, not statistical entropy.
+//!
+//! Witnessed admission (not legacy inbox auth or observation) lazily upgrades the matched
+//! legacy key origin by CAS, bumping the owner revision. No proof is issued before durable
+//! acknowledgement. Neither historic management receipts nor legacy inbox receipts are
+//! migrated. A Session that resumes inheritance after a local shadow starts a new effective
+//! incarnation without changing the project bearer or affecting siblings.
 mod model;
 #[cfg(test)]
 mod publication_tests;
@@ -19,8 +25,8 @@ mod tests;
 
 use super::{Manager, safe};
 use microcrab_protocol::application::{Command, WireError};
-pub(crate) use model::SpeakerIdentity;
 use model::{Configuration, Layer, SpeakerChange, SpeakerProjection};
+pub(crate) use model::{SpeakerCredential, SpeakerIdentity};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -79,6 +85,13 @@ fn encode(value: impl Serialize) -> Result<Value, WireError> {
     serde_json::to_value(value)
         .map_err(|_| WireError::new("serialization_error", "Cannot encode external speakers"))
 }
+/// The caller must explicitly choose a non-writing read or a new witnessed admission.
+#[derive(Clone, Copy)]
+pub(crate) enum CredentialUse {
+    Observe,
+    Admit,
+}
+
 impl Manager {
     pub(super) fn speaker_gate(&self, owner: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         let mut gates = self
@@ -168,8 +181,7 @@ impl Manager {
             .collect())
     }
 
-    /// The inbox adapter supplies the exact target's owner; bearer data never chooses an owner or identity.
-    /// Re-evaluate on every append: disabled, overridden and revoked keys fail immediately.
+    #[cfg(test)]
     pub(crate) async fn authenticate_external_speaker(
         &self,
         owner: &str,
@@ -177,8 +189,80 @@ impl Manager {
         bearer: &str,
     ) -> Result<SpeakerIdentity, WireError> {
         let project = self.speaker_session_project(owner, session_id).await?;
+        self.authenticate_external_speaker_at(owner, project.as_deref(), session_id, bearer)
+            .await
+    }
+
+    pub(super) async fn authenticate_external_speaker_at(
+        &self,
+        owner: &str,
+        project: Option<&str>,
+        session_id: &str,
+        bearer: &str,
+    ) -> Result<SpeakerIdentity, WireError> {
         let (_, config) = store::load(self.configuration.as_ref(), owner).await?;
-        config.authenticate(project.as_deref(), session_id, bearer)
+        config.authenticate(project, session_id, bearer)
+    }
+
+    /// Resolve the owner from the exact Session index, then re-read that Session
+    /// in its owner namespace under the same gate as credential mutations.
+    pub(super) async fn lock_external_speaker_session(
+        &self,
+        session_id: &str,
+    ) -> Result<
+        (
+            microcrab_storage::directory::SessionRecord,
+            tokio::sync::OwnedMutexGuard<()>,
+        ),
+        WireError,
+    > {
+        use super::external_inbox::denied;
+        if !crate::config::valid_id(session_id) {
+            return Err(denied());
+        }
+        let owner = self
+            .directory
+            .session_owner(session_id)
+            .await
+            .map_err(safe)?
+            .ok_or_else(denied)?;
+        let gate = self.speaker_gate(&owner).lock_owned().await;
+        let record = self
+            .directory
+            .get(&owner, session_id)
+            .await
+            .map_err(safe)?
+            .ok_or_else(denied)?;
+        if let Some(project) = record.project_id.as_deref() {
+            self.editable_project(&owner, project)
+                .await
+                .map_err(|error| {
+                    if error.code == "not_found" {
+                        denied()
+                    } else {
+                        error
+                    }
+                })?;
+        }
+        Ok((record, gate))
+    }
+
+    /// Requires the owner speaker gate and the exact record from the canonical directory.
+    pub(super) async fn external_speaker_credential_locked(
+        &self,
+        record: &microcrab_storage::directory::SessionRecord,
+        bearer: &str,
+        usage: CredentialUse,
+    ) -> Result<Option<SpeakerCredential>, WireError> {
+        store::authenticate_witnessed(
+            self.configuration.as_ref(),
+            &record.owner,
+            record.project_id.as_deref(),
+            &record.id,
+            bearer,
+            matches!(usage, CredentialUse::Admit),
+        )
+        .await
     }
 
     async fn speaker_session_project(
@@ -357,15 +441,9 @@ pub(super) async fn command(
             config.layer(project.as_deref(), session),
         )?;
         if let Some(session) = session {
-            config.sessions.insert(
-                session.into(),
-                model::SessionLayer {
-                    project_id: project.clone(),
-                    speakers: layer,
-                },
-            );
+            config.replace_session_layer(project.clone(), session.into(), layer);
         } else {
-            config.projects.insert(
+            config.replace_project_layer(
                 project
                     .clone()
                     .ok_or_else(|| invalid("Project path required"))?,

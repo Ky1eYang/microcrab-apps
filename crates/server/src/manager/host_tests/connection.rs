@@ -92,6 +92,7 @@ async fn attach(
             },
             sender,
             generation,
+            super::super::bindings::ProjectCarrierMode::BrowserRelay,
         ),
     )
     .await
@@ -103,6 +104,26 @@ async fn finish(manager: &Manager, task: tokio::task::JoinHandle<()>) {
     manager.close().await.unwrap();
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test]
+async fn embedded_host_state_has_no_native_route_or_grant() {
+    let root = tempfile::tempdir().unwrap();
+    let manager = Manager::with_host(config(root.path()), Arc::new(TestHost))
+        .await
+        .unwrap();
+    let owner = Principal::for_test("owner");
+    let state = manager.host_state(&owner, "a").await.unwrap();
+    assert_eq!(state["carrier_mode"], "embedded");
+    assert_eq!(state["connected"], true);
+    assert_eq!(state["ready"], true);
+    assert_eq!(state["reconciling"], false);
+    for key in ["descriptor", "connection_generation", "readiness", "scope"] {
+        assert_eq!(state[key], Value::Null, "{key}");
+    }
+    assert!(manager.pins.grant("a").await.unwrap().is_none());
+    assert!(manager.routes.lock().await.is_empty());
+    manager.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -136,7 +157,16 @@ async fn reconciliation_failure_retains_route_owner_inspection_and_generation_gu
     );
     let mut state = manager.host_state(&owner, "a").await.unwrap();
     assert!(state["diagnostics"].is_array());
-    state.as_object_mut().unwrap().remove("diagnostics");
+    assert_eq!(state["carrier_mode"], "browser_relay");
+    assert_eq!(state["descriptor"]["host_id"], "host");
+    assert!(state["descriptor"].get("bridge_instance_id").is_none());
+    assert!(state["descriptor"].get("info").is_none());
+    assert!(state.get("socket").is_none());
+    assert!(state.get("relay_release").is_none());
+    let fields = state.as_object_mut().unwrap();
+    for field in ["diagnostics", "carrier_mode", "descriptor"] {
+        fields.remove(field);
+    }
     assert_eq!(state, attached);
     let rejected = match manager.project_host("owner", "a").await {
         Ok(_) => panic!("failed Recovery must fence execution"),
@@ -188,6 +218,9 @@ async fn reconciliation_failure_retains_route_owner_inspection_and_generation_gu
     let state = manager.host_state(&owner, "a").await.unwrap();
     assert_eq!(state["connected"], false);
     assert_eq!(state["ready"], false);
+    assert_eq!(state["carrier_mode"], "detached");
+    assert_eq!(state["descriptor"], Value::Null);
+    assert_eq!(state["connection_generation"], generation.to_string());
     assert!(state["scope"].is_object());
     finish(&manager, responder).await;
 }
@@ -217,6 +250,7 @@ async fn disconnect_during_recovery_reports_current_cause_without_identity_misma
                     },
                     sender,
                     generation,
+                    super::super::bindings::ProjectCarrierMode::BrowserRelay,
                 )
                 .await
         })
@@ -231,6 +265,16 @@ async fn disconnect_during_recovery_reports_current_cause_without_identity_misma
             _ => panic!("only inspection is allowed during attachment"),
         }
     }
+    let state = manager.host_state(&owner, "a").await.unwrap();
+    assert_eq!(state["carrier_mode"], "browser_relay");
+    assert_eq!(state["connection_generation"], generation.to_string());
+    assert_eq!(
+        state["connection_generation"],
+        state["readiness"]["connection_generation"]
+    );
+    assert_eq!(state["connected"], true);
+    assert_eq!(state["reconciling"], true);
+    assert_eq!(state["ready"], false);
     manager.detach_socket(&socket, Some("a")).await;
     let attached = tokio::time::timeout(std::time::Duration::from_secs(3), attaching)
         .await
@@ -522,6 +566,7 @@ async fn unbound_legacy_sessions_cannot_adopt_remote_identity_even_with_explicit
             },
             sender,
             manager.next_connection_generation(),
+            super::super::bindings::ProjectCarrierMode::BrowserRelay,
         )
         .await
         .unwrap_err();
@@ -582,6 +627,10 @@ async fn provisional_cleanup_preserves_grants_and_refuses_pins_routes_sessions_o
             generation: 1,
             remote,
             ready: false,
+            carrier: super::super::bindings::ProjectCarrier {
+                mode: super::super::bindings::ProjectCarrierMode::BrowserRelay,
+                descriptor: descriptor("host"),
+            },
             diagnostics: None,
         },
     );
@@ -713,6 +762,7 @@ async fn retained_session_host_waits_for_the_active_manager_reconciliation() {
             },
             sender,
             generation,
+            super::super::bindings::ProjectCarrierMode::BrowserRelay,
         )
         .await
         .unwrap();
