@@ -1,5 +1,5 @@
 {
-  // microcrab-client startup configuration (JSON with comments/trailing commas).
+  // microcrab-apps startup configuration (JSON with comments/trailing commas).
   // Copy this file to .microcrab/config.jsonc in the SERVER STARTUP DIRECTORY.
   // Run: cargo run --locked --offline -p microcrab-server
   // Or select an explicit file with: --config /path/to/config.jsonc
@@ -117,9 +117,13 @@
     "mode": "plan",
     "restore_only": false, // true retains bytes only for reopening pinned Sessions
   },
-  // Additional backend-owned components with the same fields as agent above.
-  // Backend selection pins exact component bytes; replacing a path is not migration.
-  "agents": [],
+  // Additional trusted components with the same fields as agent above. Configure
+  // only administrator-approved artifacts. The Server discovers requirements from
+  // WIT imports; Browser needs a matching Project Host with web_transport.
+  // Sessions pin the loaded bytes and discovery; replacing a path is not migration.
+  "agents": [
+    // {"path":".microcrab/agents/browser.wasm"},
+  ],
 
   "auto_rename": true,
   "auto_compaction": {
@@ -144,8 +148,11 @@
     "review": true, // internal action review; mode tabs do not grant permission
     "review_model": null, // use the current model for review
     "limits": {}, // omit per-field overrides to inherit the Server defaults
-    // Optional: model_selection, agent, mode, permissions, auto_compaction,
-    // auto_naming. Leave absent to inherit rather than fabricating component IDs.
+    // Optional: model_selection, agent, mode, permissions, initialization,
+    // review, review_model, auto_compaction, auto_naming, system_template,
+    // compact_template, auto_compact_template, rename_template,
+    // action_review_template, client_prompt. Leave absent to inherit rather
+    // than fabricating component IDs. agent_wasm_fuel is not allowed here.
   },
   // Optional administrator maximums: omit to retain the Server's hard ceilings.
   // This object is a full Limits structure: include every required Limits field
@@ -157,6 +164,7 @@
   //   "max_tool_calls_per_round": 1024,
   //   "max_context_bytes": 1073741824,
   //   "max_tool_output_bytes": 16777216,
+  //   "max_tool_image_bytes": 1048576,
   //   "max_output_tokens": 1048576,
   //   "interaction_timeout_ms": 3600000,
   //   "max_pending_executions": 1024,
@@ -168,6 +176,11 @@
   //   "output_buffer_bytes": 67108864,
   //   "sleep_max_ms": 3600000,
   // },
+
+  // Optional Agent WASM fuel default and ceiling for Project overrides. Without
+  // explicitly raising agent_wasm_fuel_max, Projects cannot exceed agent_wasm_fuel.
+  // "agent_wasm_fuel": 10000000,
+  // "agent_wasm_fuel_max": 10000000,
 
   // Projects/Host pairing are managed through authenticated APIs, not a projects
   // array here. Unknown fields are rejected. No shell-style ${VAR} expansion:

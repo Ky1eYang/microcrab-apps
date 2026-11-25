@@ -1,8 +1,8 @@
 {
-  "name": "microcrab-client-test-tools",
+  "name": "microcrab-apps-test-tools",
   "private": true,
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/Ky1eYang/microcrab-client.git" },
+  "repository": { "type": "git", "url": "git+https://github.com/Ky1eYang/microcrab-apps.git" },
   "type": "module",
   "scripts": {
     "test:poll": "node --test dev/tests/poll.test.mjs"

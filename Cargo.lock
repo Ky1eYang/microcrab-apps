@@ -1810,8 +1810,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-agent-types"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "microcrab-permission",
  "microcrab-protocol",
@@ -1821,13 +1821,24 @@ dependencies = [
 
 [[package]]
 name = "microcrab-agent-wit"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
+
+[[package]]
+name = "microcrab-app-bootstrap"
+version = "0.2.38"
+dependencies = [
+ "microcrab-agent-types",
+ "microcrab-host-api",
+ "microcrab-session",
+ "sha2 0.10.9",
+ "tempfile",
+]
 
 [[package]]
 name = "microcrab-auditor"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "microcrab-protocol",
  "serde",
@@ -1838,8 +1849,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-creator"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1862,8 +1873,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-host-api"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1878,8 +1889,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-host-local"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1898,8 +1909,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-host-protocol"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "microcrab-host-api",
  "microcrab-protocol",
@@ -1916,8 +1927,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-host-remote"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "async-trait",
  "microcrab-host-api",
@@ -1933,10 +1944,13 @@ dependencies = [
 
 [[package]]
 name = "microcrab-local-bridge"
-version = "0.1.20"
+version = "0.2.38"
 dependencies = [
  "axum",
  "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "microcrab-host-api",
  "microcrab-host-local",
  "microcrab-host-protocol",
@@ -1960,8 +1974,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-permission"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "regex",
  "serde",
@@ -1971,8 +1985,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-protocol"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "serde",
  "serde_json",
@@ -1980,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "microcrab-server"
-version = "0.1.20"
+version = "0.2.38"
 dependencies = [
  "async-trait",
  "axum",
@@ -1988,6 +2002,7 @@ dependencies = [
  "futures-util",
  "jwt-simple",
  "microcrab-agent-types",
+ "microcrab-app-bootstrap",
  "microcrab-auditor",
  "microcrab-creator",
  "microcrab-host-api",
@@ -2025,8 +2040,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-session"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "aho-corasick",
  "async-trait",
@@ -2057,8 +2072,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-storage"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "async-trait",
  "microcrab-permission",
@@ -2074,8 +2089,8 @@ dependencies = [
 
 [[package]]
 name = "microcrab-transport"
-version = "0.1.20"
-source = "git+https://github.com/Ky1eYang/microcrab-core?branch=main#580a112d8b886fcba6d8f5c1057b9f3c257e7a61"
+version = "0.2.15"
+source = "git+https://github.com/Ky1eYang/microcrab-core?rev=d7643a0fcb07892c4b7dcd5174d3a10cbff73b50#d7643a0fcb07892c4b7dcd5174d3a10cbff73b50"
 dependencies = [
  "async-trait",
  "base64 0.22.1",

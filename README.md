@@ -1,4 +1,4 @@
-# microcrab-client
+# microcrab-apps
 
 Application hosts for the [microcrab core runtime](https://github.com/Ky1eYang/microcrab-core).
 The Rust workspace contains an authenticated HTTP/WebSocket server and a local
@@ -6,10 +6,13 @@ Host bridge.
 
 ## Layout
 
-- [`crates/server`](crates/server): authentication, project/session APIs, streaming
-  transport, persistence assembly and static web asset serving.
-- [`crates/host/local-bridge`](crates/host/local-bridge): local filesystem/process
-  access over authenticated WebSocket and gRPC carriers.
+- [`crates/surfaces/server`](crates/surfaces/server) (`microcrab-server`):
+  authentication, project/session APIs, streaming, persistence assembly, and
+  static web asset serving.
+- [`crates/hosts/local-bridge`](crates/hosts/local-bridge) (`microcrab-local-bridge`):
+  local filesystem/process access over authenticated WebSocket and gRPC carriers.
+- [`crates/bootstrap`](crates/bootstrap) (`microcrab-app-bootstrap`): pure Session
+  assembly helpers; see [architecture](docs/architecture.md) for what stays in Server.
 - [`dev`](dev): source-only integration and browser acceptance tooling.
 
 Core packages are Git dependencies from the same repository and revision. The
@@ -22,8 +25,8 @@ native build tools. Windows builds expect `rust-lld.exe` on `PATH` and the Windo
 SDK for SQLite.
 
 ```sh
-git clone git@github.com:Ky1eYang/microcrab-client.git
-cd microcrab-client
+git clone git@github.com:Ky1eYang/microcrab-apps.git
+cd microcrab-apps
 cargo fetch --locked
 cargo fmt --all -- --check
 cargo test --workspace --all-features --locked --offline -- --test-threads=1
@@ -46,7 +49,7 @@ cargo run --locked --offline -p microcrab-local-bridge -- --help
 ```
 
 The template uses external OIDC and does not require the `dev` feature. For local
-loopback development only, the separate [development example](crates/server/config.example.jsonc)
+loopback development only, the separate [development example](crates/surfaces/server/config.example.jsonc)
 uses the built-in issuer and requires `--features dev`.
 
 All relative paths resolve from the server's startup working directory, not from
@@ -55,6 +58,9 @@ file. Legacy `.microcrab/config.json` is considered only when the default JSONC
 file is absent. The optional external TOML provider catalog is a distinct advanced
 input; it is not the Server startup configuration. Each native Project requires
 authenticated Host attachment.
+
+Rust embedders can [prepare an opt-in provider image hosting route](docs/image-hosting.md)
+with an injected uploader; ordinary Server model traffic remains inline.
 
 Bridge token mode has no pairing-token time limit. `--require-token` generates a
 code that remains valid until the first successful pairing (across all workspaces
@@ -69,8 +75,17 @@ identity and capabilities. For a mismatch, connect a compatible Host or use a
 different workspace. Selecting the same Host workspace follows duplicate
 Project detection. Deleting a Project also deletes its Sessions.
 
-`GET /api/v1/projects/{project_id}/host-state` is an owner-scoped read of the
-published route. `carrier_mode` is `server_direct_grpc`, `server_direct_outbound`,
+Use `project.host_watch` on the authenticated global `/api/v1/ws` to observe the
+selected Project. Send `project_id` and a fresh UUID `subscription_id`; the result
+contains that ID, `sequence: 0`, and `summary`. Later `project_host_event` frames
+for that ID carry the next sequence and a replacement summary; an omitted summary
+ends the observation without closing the socket. A second watch replaces the first;
+`project.host_unwatch` removes only the matching subscription. A gap or reconnect
+requires a new baseline. The watch does not own a Host route or relay.
+
+`GET /api/v1/projects/{project_id}/host-state` remains an owner-scoped, on-demand
+read of the published route for startup/recovery and explicit diagnostics; do not
+poll it when the global watcher is available. `carrier_mode` is `server_direct_grpc`, `server_direct_outbound`,
 `browser_relay`, `embedded`, or `detached`. For a connected native route,
 `descriptor` supplies Host/workspace identity, root, platform, tool capabilities
 and supported primitives; otherwise it is `null`. A detached route can retain
@@ -99,7 +114,31 @@ paging on the same observation, pass `witness.rows_revision` as the opaque
 without a precondition. Requests without a precondition retain numeric cursor
 paging, but do not guarantee consistency between pages.
 
+The Server may include an optional `presentation` hint on selected tool calls
+and results, live tool events, native execution rows, and approval requests.
+A trusted runtime observation can identify `coding-file`, `message-receipt`, or
+`view-image`; retained framework image carriers can also establish `view-image`
+for historical calls. Unproven tools have no hint, and an observation without an
+execution reservation can label only its own live event. This field is for display
+only: it does not change arguments, tool output, retained audit evidence, execution
+identity, or permission checks.
+
 ### External Speaker replies
+
+In **Project → External Messaging**, explicitly enable **Allow external messaging**
+for the bound Project. Projects start off, including upgrades with retained sender
+keys; projectless Sessions cannot opt in. Disabled Projects reject new submissions
+and all new receipt or reply observations, and keys cannot be revealed while off.
+Disabling keeps keys, admitted inputs, and committed reply bytes. Re-enabling
+resumes access only for still-effective credential incarnations; remove or rotate
+keys for permanent revocation. A flag change is rejected without writing if an
+affected Turn or activation is busy. Configuration acknowledgement is separate
+from Session catalog application.
+
+Only an enabled Project's eligible root Session advertises `reply_external_dialogue`.
+Sessions with a live `reply_external_speaker` catalog cannot reopen; start a new
+Session. A retained continuation whose catalog no longer matches the Project needs
+explicit settlement or recovery, not replay under a different catalog.
 
 Submit once to `POST /api/v1/sessions/{session_id}/inbox` with a speaker Bearer,
 canonical UUID `Idempotency-Key`, and JSON `{ "body": "…" }`. Use the

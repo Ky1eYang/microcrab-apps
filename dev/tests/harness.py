@@ -246,7 +246,7 @@ class ModelProvider(AbstractContextManager):
         self.worker.join(timeout=2)
 
 
-# Keep aligned with crates/server/src/route/session.rs and project.rs.
+# Keep aligned with crates/surfaces/server/src/route/session.rs and project.rs.
 HTTP_COMMANDS = {
     "server.capabilities": ("GET", "/capabilities"),
     "identity.current": ("GET", "/identity"),

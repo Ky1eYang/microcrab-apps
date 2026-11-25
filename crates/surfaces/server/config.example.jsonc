@@ -1,0 +1,276 @@
+{
+  // Complete development startup configuration for microcrab-server (JSONC).
+  // Supports // and /* */ comments and trailing commas.
+  // Copy to .microcrab/config.jsonc in the server's startup working directory,
+  // or pass an explicit path via `--config /path/to/config.jsonc` (disables
+  // fallback to legacy `.microcrab/config.json`).
+  // All relative paths below resolve from the server's startup working directory,
+  // NOT from this file's directory.
+  // Unknown fields are rejected (`deny_unknown_fields`). Only `auth.jwt_secret`,
+  // `auth.client_secret`, and resolved `provider.api_key` expand `env:VAR_NAME`.
+
+  // Socket address to bind (`host:port`). Default: "127.0.0.1:4096".
+  "listen": "127.0.0.1:4096",
+
+  // Private persistent storage root (DB/files/logs). Never serve as static assets.
+  // Default: ".microcrab".
+  "data_dir": ".microcrab",
+
+  // Persistence backend: "sqlite" (default when built with storage-sqlite) or "file"
+  // (requires storage-file). Switching backends never silently migrates old data.
+  "storage": "sqlite",
+
+  // Built web UI static asset root (index.html, plugins/, browser-host/).
+  // Must not overlap `data_dir` or `.microcrab`. Default: "public".
+  "frontend_dir": "public",
+
+  // Maximum concurrent active Sessions in memory (1..=4096). Default: 64.
+  "max_active_sessions": 64,
+
+  // Enable automatic Session title generation on first user input. Default: true.
+  "auto_rename": true,
+
+  // OIDC authentication and application-session cookie policy.
+  "auth": {
+    // Enable same-listener development OIDC issuer (requires `--features dev` and
+    // numeric loopback HTTP settings below). Set false for external OIDC in production.
+    "dev_oidc": true,
+
+    // Exact OIDC issuer URL. With `dev_oidc: true`, the server hosts and validates
+    // its own issuer on the bound loopback listener.
+    "issuer": "http://127.0.0.1:4096/api/dev/oidc",
+
+    // Fetch `{issuer}/.well-known/openid-configuration` at startup. Default: false.
+    // Explicit endpoints below override discovered values; all three core endpoints
+    // (authorization_endpoint, token_endpoint, jwks_uri) are required if false.
+    "discovery": true,
+    // "authorization_endpoint": "http://127.0.0.1:4096/api/dev/oidc/authorize",
+    // "token_endpoint": "http://127.0.0.1:4096/api/dev/oidc/token",
+    // "jwks_uri": "http://127.0.0.1:4096/api/dev/oidc/jwks",
+    // "end_session_endpoint": "https://auth.example.com/api/logout",
+
+    // Absolute URL registered with the IdP to return to after RP-initiated logout.
+    // Its origin must be listed in `allowed_origins`. Optional (null/omitted disables).
+    "post_logout_redirect_uri": "http://127.0.0.1:4096/login",
+
+    // Perform RP-initiated logout redirect when `end_session_endpoint` is known.
+    // Set false to keep logout local to MicroCrab. Default: true.
+    "rp_logout": true,
+
+    // RFC 9207: require `iss` on login callback. `null` tracks discovered
+    // `authorization_response_iss_parameter_supported` (else false). Any present
+    // `iss` is always verified against `issuer`.
+    "require_callback_iss": null,
+
+    // Literal registered OIDC client identifier (1..=256 bytes).
+    // `env:` expansion is NOT supported for `client_id`.
+    "client_id": "microcrab-dev",
+
+    // Optional OIDC client secret for confidential clients (max 4096 bytes).
+    // Omit or set null for public PKCE clients. Supports `env:VAR_NAME`.
+    // "client_secret": "env:MICROCRAB_OIDC_CLIENT_SECRET",
+
+    // Token endpoint client authentication: "client_secret_post" (default) or
+    // "client_secret_basic".
+    "token_endpoint_auth_method": "client_secret_post",
+
+    // Requested OIDC scopes (max 16 items; must include "openid").
+    // Default: ["openid", "profile"].
+    "scopes": ["openid", "profile"],
+
+    // Allowed clock skew for ID Token `exp`/`nbf`/`iat` validation (0..=300s).
+    // Default: 60.
+    "clock_skew_seconds": 60,
+
+    // Upper bound on ID Token lifetime `exp - iat` (60..=2592000s). Default: 604800.
+    "max_id_token_lifetime_seconds": 604800,
+
+    // Maximum JWKS keys accepted from `jwks_uri` (1..=64). Default: 16.
+    "jwks_max_keys": 16,
+
+    // Exact OIDC callback URL registered at the IdP (`/api/auth/callback`).
+    "redirect_uri": "http://127.0.0.1:4096/api/auth/callback",
+
+    // Same-origin relative path to redirect to after login (must start with `/`,
+    // not `//`). Default: "/".
+    "post_login_redirect": "/",
+
+    // Exact allowed browser origins (`scheme://host[:port]`, 1..=16 entries).
+    "allowed_origins": ["http://127.0.0.1:4096"],
+
+    // Application session JWT signing secret (32..=4096 bytes; NOT the IdP secret).
+    // Replace placeholder privately or use "env:MICROCRAB_SESSION_SECRET".
+    "jwt_secret": "REPLACE_WITH_A_RANDOM_PRIVATE_SIGNING_SECRET_AT_LEAST_32_BYTES",
+
+    // Internal JWT `iss` / `aud` claims (1..=256 bytes). Must differ from OIDC
+    // `issuer` and `client_id` respectively. Defaults: "microcrab" / "microcrab-web".
+    "jwt_issuer": "microcrab",
+    "jwt_audience": "microcrab-web",
+
+    // Mark session cookies `Secure`. Default: true. Setting false requires
+    // `allow_http_loopback: true` and loopback-only endpoints/origins.
+    "cookie_secure": false,
+
+    // Application session cookie TTL in seconds (1..=604800). Default: 43200 (12h).
+    "session_ttl_seconds": 900,
+
+    // Allow `http://` only for loopback hosts (`127.0.0.1`, `localhost`, `[::1]`).
+    // Default: false; keep false in production.
+    "allow_http_loopback": true,
+  },
+
+  // Inline default model provider (complete wire endpoint, not a gateway base URL).
+  // Alternative: replace the entire `provider` object with an external TOML catalog
+  // reference: `{"config_file": ".microcrab/providers.toml", "name": "provider_id"}`
+  // (`name` may be omitted when the catalog defines a single provider; never mix
+  // `config_file` with inline fields).
+  "provider": {
+    // Wire protocol: "openai-compatible" (default, /v1/chat/completions),
+    // "openai" (Responses API; aliases: "openai-response", "openai-responses"),
+    // "anthropic" (Messages API; alias: "claude"),
+    // "google" (Gemini REST; alias: "gemini").
+    "protocol": "openai-compatible",
+
+    // Credential header placement: "native" (default: Bearer for OpenAI protocols,
+    // x-api-key for Anthropic, x-goog-api-key for Google) or "bearer".
+    "auth": "native",
+
+    // Complete HTTPS endpoint (or loopback/private-IP HTTP for local gateways).
+    "endpoint": "https://api.openai.com/v1/chat/completions",
+
+    // Default provider-local model ID (non-empty).
+    "model": "gpt-4.1-mini",
+
+    // Literal key or "env:MICROCRAB_PROVIDER_API_KEY"; omit/null for keyless local servers.
+    "api_key": "YOUR_LITERAL_API_KEY",
+
+    // Resettable network inactivity timeout in ms (renewed per received chunk; > 0).
+    // Default: 60000.
+    "timeout_ms": 30000,
+
+    // Per-response safety ceiling in bytes (> 0; warns before cap). Default: 1073741824.
+    "max_response_bytes": 262144,
+
+    // Google-only opt-in for native `functionResponse.parts` media. Must be false
+    // for all non-Google protocols. Default: false.
+    "google_function_response_media": false,
+  },
+
+  // Optional display/capacity metadata for the inline `"configured"` provider.
+  // Does not add model routes or override `provider.protocol`. When `provider` uses
+  // `config_file`, this list is populated from the resolved TOML catalog instead.
+  "available_models": [
+    {
+      "id": "gpt-4.1-mini",
+      "name": "GPT-4.1 mini",
+      "provider_id": "configured",
+      "protocol": "openai-compatible",
+      // "variants": ["default"],
+      // Positive nonzero context window token count; omit or null if unknown.
+      // "context_window_tokens": 1047576,
+    },
+  ],
+
+  // Automatic context compaction thresholds for new Sessions.
+  // Pressure thresholds satisfy: 0 < turn_threshold < round_threshold < 1.
+  "auto_compaction": {
+    "enabled": true,
+    "turn_threshold": 0.8,
+    "round_threshold": 0.95,
+    "headroom_tokens": 0,
+  },
+
+  // Background public model-metadata cache refresh policy (never gates startup).
+  "model_metadata": {
+    "enabled": true,
+    "refresh_interval_secs": 21600, // 60..=604800
+    "request_timeout_ms": 20000, // 100..=120000
+    "max_response_bytes": 33554432, // 1024..=67108864
+  },
+
+  // Default Session settings applied to newly created Sessions (overridable per
+  // owner/project/session within `limit_ceilings` and `agent_wasm_fuel_max`).
+  "session_defaults": {
+    // Partial per-field overrides of Session `Limits` (unknown keys are rejected).
+    // Empty `{}` inherits Server defaults (`max_tool_output_bytes: 65536`, etc.).
+    "limits": {},
+    // Optional default model selection:
+    // "model_selection": {"provider_id": "configured", "model": "gpt-4.1-mini", "variant": null},
+    // Optional default Agent component name and mode (1..=256 bytes):
+    // "agent": "coding",
+    // "mode": "plan",
+    // Optional default permission rules (max 256 entries):
+    // "permissions": [
+    //   {
+    //     "agent": "coding",
+    //     "mode": "plan",
+    //     "tool": {"kind": "exact", "value": "write_file"},
+    //     "args": [{"pointer": "/path", "matcher": {"kind": "glob", "value": "docs/**"}}],
+    //     "action": "ask"
+    //   }
+    // ],
+    // Component initialization lifecycle gate ("allow" | "ask" | "deny"). Default: "allow".
+    "initialization": "allow",
+    // Enable internal clean-context action review. Default: true.
+    "review": true,
+    // Separate review model selection, or null to reuse the Session's active model.
+    "review_model": null,
+    // Optional override of Server `auto_compaction` and `auto_rename` for new Sessions:
+    // "auto_compaction": {"enabled": true, "turn_threshold": 0.8, "round_threshold": 0.95, "headroom_tokens": 0},
+    // "auto_naming": true,
+    // Note: `agent_wasm_fuel` is NOT permitted in `session_defaults` (use top-level
+    // `agent_wasm_fuel` / `agent_wasm_fuel_max` instead).
+    // Optional Tera prompt template overrides (omit/null inherit; "" selects the
+    // embedded baseline for templates, whereas "" for `client_prompt` disables it):
+    // "system_template": "",
+    // "compact_template": "",          // binding: {{ user_input }}
+    // "auto_compact_template": "",     // no bindings
+    // "rename_template": "",           // binding: {{ user_input }}
+    // "action_review_template": "",    // bindings: user_input, tool, tool_name, tool_args, operation_kind, mode, mode_prompt
+    // "client_prompt": "",
+  },
+
+  // Administrator hard ceilings for Session `Limits` (15 fields). Any omitted
+  // `limit_ceilings` object defaults to these Server hard ceilings.
+  "limit_ceilings": {
+    "max_rounds": 4096,
+    "max_tool_calls_per_round": 1024,
+    "max_context_bytes": 1073741824, // 1 GiB
+    "max_tool_output_bytes": 16777216, // 16 MiB
+    "max_tool_image_bytes": 1048576, // 1 MiB
+    "max_output_tokens": 1048576,
+    "interaction_timeout_ms": 3600000,
+    "max_pending_executions": 1024,
+    "max_retained_executions": 4096,
+    "lifecycle_timeout_ms": 300000,
+    "max_processes": 1024,
+    "max_execution_buffers": 1024,
+    "max_retained_processes": 4096,
+    "output_buffer_bytes": 67108864, // 64 MiB
+    "sleep_max_ms": 3600000, // hard cap 3600000 ms (1 hour)
+  },
+
+  // Default Agent WASM fuel budget per execution (1..=9007199254740991).
+  // Default: 10000000.
+  "agent_wasm_fuel": 10000000,
+
+  // Optional maximum Agent WASM fuel ceiling for Project overrides
+  // (agent_wasm_fuel..=9007199254740991). When omitted/null, equals `agent_wasm_fuel`.
+  "agent_wasm_fuel_max": 10000000,
+
+  // Primary trusted Agent WASM component. Projects are managed through the
+  // authenticated project API and persisted in the registry (no startup `projects`).
+  "agent": {
+    "path": ".microcrab/agents/coding.wasm", // default: ".microcrab/agents/coding.wasm"
+    "name": "coding", // optional; validated against component metadata
+    "mode": "plan", // optional; validated against component metadata
+    "restore_only": false, // true retains bytes only for reopening pinned Sessions
+  },
+
+  // Additional trusted Agent WASM components (same fields as `agent`).
+  // WIT imports determine Host capability requirements (e.g. Browser requires
+  // a matching Project Host with web_transport).
+  "agents": [
+    // {"path": ".microcrab/agents/browser.wasm", "restore_only": false},
+  ],
+}
