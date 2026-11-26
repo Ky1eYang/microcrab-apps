@@ -41,6 +41,12 @@ struct Key {
     key: KeyMetadata,
 }
 
+#[derive(Serialize)]
+struct DeletedKey {
+    deleted: bool,
+    id: String,
+}
+
 pub(super) async fn list(
     State(state): State<Arc<Application>>,
     path: Result<Path<String>, PathRejection>,
@@ -119,18 +125,25 @@ async fn change_key(
     let Path((owner, id)) = path.map_err(path_error)?;
     let principal = authorize(state, request.headers(), &owner, true)?;
     let store = &state.manager.relay_keys;
-    let result = if revoke {
+    if revoke {
         let request = json::<Revoke>(request).await?;
         state.auth.check_active(&principal).map_err(auth_error)?;
-        store.revoke(&owner, &id, request.expected_revision).await
+        store
+            .revoke(&owner, &id, request.expected_revision)
+            .await
+            .map_err(|error| key_error(error, true))?;
+        check_completion_auth(&state.auth, &principal, true)?;
+        Ok(Json(DeletedKey { deleted: true, id }).into_response())
     } else {
         let request = json::<UpdateKey>(request).await?;
         state.auth.check_active(&principal).map_err(auth_error)?;
-        store.update(&owner, &id, request).await
-    };
-    let key = result.map_err(|error| key_error(error, true))?;
-    check_completion_auth(&state.auth, &principal, true)?;
-    Ok(Json(Key { key }).into_response())
+        let key = store
+            .update(&owner, &id, request)
+            .await
+            .map_err(|error| key_error(error, true))?;
+        check_completion_auth(&state.auth, &principal, true)?;
+        Ok(Json(Key { key }).into_response())
+    }
 }
 
 #[expect(
@@ -222,7 +235,6 @@ fn key_error(error: KeyError, mutation: bool) -> Response {
         KeyError::Invalid(message) => Error::parameters("json", message),
         KeyError::NotFound => Error::new(StatusCode::NOT_FOUND, "not_found", "Relay key not found"),
         KeyError::Conflict => Error::new(StatusCode::CONFLICT, "revision_conflict", "Relay key revision changed; reload before retrying"),
-        KeyError::Revoked => Error::new(StatusCode::CONFLICT, "revoked", "Revoked keys cannot be modified"),
         KeyError::Capacity => Error::new(StatusCode::CONFLICT, "key_capacity", "Relay key retention limit reached"),
         KeyError::Busy => Error::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "Relay key authority is busy"),
         KeyError::Closed => Error::new(StatusCode::SERVICE_UNAVAILABLE, "closed", "Relay key authority is closed"),

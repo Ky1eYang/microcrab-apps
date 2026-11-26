@@ -110,6 +110,38 @@ impl Store {
         Ok(credential.key)
     }
 
+    pub(super) fn delete(
+        &mut self,
+        owner: &str,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<(), KeyError> {
+        let transaction = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row = transaction
+            .query_row(
+                &format!("SELECT owner, key_id, {PAYLOAD} FROM relay_keys WHERE owner = ?2 AND key_id = ?3"),
+                params![MAX_RECORD_BYTES, owner, id],
+                row_fields,
+            )
+            .optional()?
+            .ok_or(KeyError::NotFound)?;
+        let credential = checked_record(row)?;
+        if credential.key.revision != expected_revision {
+            return Err(KeyError::Conflict);
+        }
+        if transaction.execute(
+            "DELETE FROM relay_keys WHERE owner = ?1 AND key_id = ?2",
+            params![owner, id],
+        )? != 1
+        {
+            return Err(KeyError::Storage("expected exactly one row to delete"));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub(super) fn record_use(
         &mut self,
         owner: &str,

@@ -145,7 +145,8 @@ async fn relay_key_management_is_cookie_origin_and_owner_scoped() {
         .await
         .unwrap();
     body(mixed, StatusCode::UNAUTHORIZED).await;
-    let url = format!("{base}/{}", created["key"]["id"].as_str().unwrap());
+    let created_id = created["key"]["id"].as_str().unwrap().to_owned();
+    let url = format!("{base}/{created_id}");
     body(
         send(
             "DELETE",
@@ -174,7 +175,8 @@ async fn relay_key_management_is_cookie_origin_and_owner_scoped() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(response["key"]["revoked"], true);
+    assert_eq!(response["deleted"], true);
+    assert_eq!(response["id"], created_id);
     assert!(response.get("secret").is_none());
     assert!(
         state
@@ -190,7 +192,7 @@ async fn relay_key_management_is_cookie_origin_and_owner_scoped() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(listed["keys"][0], response["key"]);
+    assert_eq!(listed["keys"].as_array().unwrap().len(), 0);
     assert!(!listed.to_string().contains(secret));
     state.manager.close().await.unwrap();
 }

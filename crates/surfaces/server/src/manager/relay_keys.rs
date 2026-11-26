@@ -28,8 +28,6 @@ pub(crate) enum KeyError {
     NotFound,
     #[error("Relay key revision changed")]
     Conflict,
-    #[error("Revoked keys cannot be modified")]
-    Revoked,
     #[error("Relay key retention limit reached")]
     Capacity,
     #[error("Relay key authority is busy")]
@@ -113,44 +111,26 @@ where
 
 enum Change {
     Update(UpdateKey),
-    Revoke(u64),
 }
 impl Change {
-    fn expected(&self) -> u64 {
-        match self {
-            Self::Update(key) => key.expected_revision,
-            Self::Revoke(revision) => *revision,
-        }
-    }
-
     fn apply(self, key: &mut KeyMetadata) -> Result<(), KeyError> {
-        if key.revision != self.expected() {
+        let Self::Update(update) = self;
+        if key.revision != update.expected_revision || key.revoked {
             return Err(KeyError::Conflict);
         }
-        if key.revoked {
-            return Err(KeyError::Revoked);
+        if let Some(name) = update.name {
+            key.name = name;
         }
-        match self {
-            Self::Update(update) => {
-                if let Some(name) = update.name {
-                    key.name = name;
-                }
-                if let Some(enabled) = update.enabled {
-                    key.enabled = enabled;
-                }
-                if let Some(allowed_providers) = update.allowed_providers {
-                    key.allowed_providers = allowed_providers;
-                }
-                if let Some(default_model_selection) = update.default_model_selection {
-                    key.default_model_selection = default_model_selection;
-                }
-                validate_metadata(key)?;
-            }
-            Self::Revoke(_) => {
-                key.enabled = false;
-                key.revoked = true;
-            }
+        if let Some(enabled) = update.enabled {
+            key.enabled = enabled;
         }
+        if let Some(allowed_providers) = update.allowed_providers {
+            key.allowed_providers = allowed_providers;
+        }
+        if let Some(default_model_selection) = update.default_model_selection {
+            key.default_model_selection = default_model_selection;
+        }
+        validate_metadata(key)?;
         key.revision = key.revision.checked_add(1).ok_or(KeyError::Conflict)?;
         Ok(())
     }
@@ -328,6 +308,7 @@ impl RelayKeys {
                 #[cfg(feature = "storage-sqlite")]
                 Backend::Sqlite(store) => store.list(&owner),
             }?;
+            keys.retain(|key| !key.revoked);
             keys.sort_unstable_by(|a, b| (b.created_at_ms, &b.id).cmp(&(a.created_at_ms, &a.id)));
             Ok(keys)
         })
@@ -387,9 +368,20 @@ impl RelayKeys {
         owner: &str,
         id: &str,
         expected_revision: u64,
-    ) -> Result<KeyMetadata, KeyError> {
-        self.change(owner, id, Change::Revoke(expected_revision))
-            .await
+    ) -> Result<(), KeyError> {
+        if uuid::Uuid::parse_str(id)
+            .ok()
+            .is_none_or(|value| value.to_string() != id)
+        {
+            return Err(KeyError::NotFound);
+        }
+        let (owner, id) = (owner.to_owned(), id.to_owned());
+        self.run(move |store| match store {
+            Backend::File(store) => store.delete(&owner, &id, expected_revision),
+            #[cfg(feature = "storage-sqlite")]
+            Backend::Sqlite(store) => store.delete(&owner, &id, expected_revision),
+        })
+        .await
     }
 
     /// Record a non-revision-bumping usage telemetry update for a key.

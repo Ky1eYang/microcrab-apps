@@ -136,6 +136,29 @@ impl Store {
         Ok(found.key)
     }
 
+    pub(super) fn delete(
+        &self,
+        owner: &str,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<(), KeyError> {
+        let mut index = self.index(owner)?;
+        let hash = *index.get(id).ok_or(KeyError::NotFound)?;
+        let found = self.owned(owner, id, &hash)?.ok_or(KeyError::NotFound)?;
+        if found.key.revision != expected_revision {
+            return Err(KeyError::Conflict);
+        }
+        // Remove the digest record first so bearer lookup stops immediately.
+        match fs::remove_file(self.digest_path(&hash)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        index.remove(id);
+        let index_bytes = serde_json::to_vec(&index)?;
+        atomic_write(&self.owner_path(owner), &index_bytes)
+    }
+
     pub(super) fn record_use(&self, owner: &str, id: &str, used_at_ms: u64) -> Result<(), KeyError> {
         let index = self.index(owner)?;
         let Some(hash) = index.get(id) else {

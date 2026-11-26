@@ -61,33 +61,29 @@ async fn lifecycle_contract(storage: Storage) {
         keys.revoke("owner-a", &created.key.id, 1).await,
         Err(KeyError::Conflict)
     ));
-    let revoked = keys.revoke("owner-a", &created.key.id, 2).await.unwrap();
-    assert!(revoked.revoked);
+    keys.revoke("owner-a", &created.key.id, 2).await.unwrap();
+    assert!(keys.lookup(&created.secret).await.unwrap().is_none());
     assert!(matches!(
         keys.update(
             "owner-a",
             &created.key.id,
             UpdateKey {
                 expected_revision: 3,
-                name: Some("After revoke".into()),
+                name: Some("After delete".into()),
                 enabled: None,
                 allowed_providers: None,
                 default_model_selection: None,
             }
         )
         .await,
-        Err(KeyError::Revoked)
+        Err(KeyError::NotFound)
     ));
     keys.close().await.unwrap();
 
     let reopened = RelayKeys::open_at(storage, dir.path().to_path_buf())
         .await
         .unwrap();
-    let items = reopened.list("owner-a").await.unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].name, "Renamed client");
-    assert_eq!(items[0].request_count, 1);
-    assert_eq!(items[0].last_used_at_ms, Some(123_456));
+    assert!(reopened.list("owner-a").await.unwrap().is_empty());
     assert!(reopened.list("owner-b").await.unwrap().is_empty());
     reopened.close().await.unwrap();
 }
