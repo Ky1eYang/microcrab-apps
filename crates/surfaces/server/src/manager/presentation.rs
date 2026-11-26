@@ -9,7 +9,7 @@ use std::{collections::BTreeMap, sync::Mutex};
 pub(super) enum Presentation {
     CodingFile,
     MessageReceipt,
-    ViewImage,
+    Reference,
 }
 
 impl Presentation {
@@ -23,7 +23,7 @@ impl Presentation {
         match body.tool_presentation {
             Some(ToolPresentation::CodingFile) => Some(Self::CodingFile),
             Some(ToolPresentation::MessageReceipt) => Some(Self::MessageReceipt),
-            Some(ToolPresentation::ViewImage) => Some(Self::ViewImage),
+            Some(ToolPresentation::Reference) => Some(Self::Reference),
             None => None,
         }
     }
@@ -64,13 +64,7 @@ impl Presentations {
         let position = (body.epoch, body.turn_id, body.round);
         let typed = Presentation::from_audit(body);
         let (presentation, pending) = match &body.payload {
-            HookPayload::ToolCall { name, .. } if *name == row.tool => (
-                // The original Core witness is still sufficient for ViewImage.
-                typed.or(body
-                    .authored_image_arguments
-                    .then_some(Presentation::ViewImage)),
-                true,
-            ),
+            HookPayload::ToolCall { name, .. } if *name == row.tool => (typed, true),
             HookPayload::ToolResult { .. } => (typed, false),
             _ => return None,
         };

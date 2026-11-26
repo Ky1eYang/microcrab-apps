@@ -539,10 +539,9 @@ pub(super) async fn create_from(
         tools.push(ToolRegistration::DialogueReply(reply));
     }
     tools.extend([
-        ToolRegistration::Builtin(BuiltinTool::Expand),
+        ToolRegistration::Builtin(BuiltinTool::Reference),
         ToolRegistration::Builtin(BuiltinTool::Job),
         ToolRegistration::Builtin(BuiltinTool::Sleep),
-        ToolRegistration::Builtin(BuiltinTool::ViewImage),
     ]);
     // Core retains the exact frozen definitions on restore/fork and rejects
     // unadvertised calls; this only registers the applicable native wiring.
@@ -878,15 +877,6 @@ pub(super) async fn create_from(
             &manager.config,
             &record,
         ));
-    let reference_sources: Vec<microcrab_session::state::reference::ReferenceSource> = manager
-        .configuration
-        .get(&record.owner, "session_references", &record.id)
-        .await?
-        .and_then(|r| r.value)
-        .map(serde_json::from_value)
-        .transpose()?
-        .unwrap_or_default();
-    let builder = builder.markdown_references("references", reference_sources);
     let builder = if let Some(selection) = &record.review_model {
         builder.review_client(
             super::model::review_target(manager, &record.owner, selection, hub.clone()).await?,
@@ -909,6 +899,7 @@ pub(super) async fn create_from(
         None => None,
     };
     let initialized = async {
+        let fresh_session = fork_source.is_none() && recover.is_none();
         let preparation = match (fork_source, recover) {
             (Some(source), _) => {
                 microcrab_app_bootstrap::session::Preparation::Fork(&source.session)
@@ -919,6 +910,25 @@ pub(super) async fn create_from(
             (None, None) => microcrab_app_bootstrap::session::Preparation::Create,
         };
         let session = microcrab_app_bootstrap::session::prepare(builder, preparation).await?;
+        if fresh_session
+            && let Some(project_id) = record.project_id.as_deref()
+        {
+            manager
+                .personal_library
+                .mount_project_to_session(&record.owner, project_id, &record.id)
+                .await?;
+        }
+        let library = Arc::new(super::library::SessionLibraryAdapter::new(
+            manager.self_ref.clone(),
+            record.owner.clone(),
+            record.id.clone(),
+            record.project_id.clone(),
+            host.clone(),
+            manager.personal_library.clone(),
+            manager.config.personal_library.limits(),
+        ));
+        session.state_handle().install_reference_library(library);
+        let _ = session.refresh_reference_library().await;
         // A fork retains its historical mode, even if the source's live/manual
         // selection or the copied creator configuration has since changed.
         // Restore already applies the exact saved policy in Core.

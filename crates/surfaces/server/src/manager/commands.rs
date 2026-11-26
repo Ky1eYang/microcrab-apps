@@ -806,7 +806,7 @@ pub(super) async fn execute_with_sender(
         "identity.current" => {
             let _: Empty = parse(command)?;
             return Ok(
-                json!({"id":owner,"subject":principal.subject,"name":principal.display_name,"expires_at":principal.expires_at}),
+                json!({"id":owner,"user_id":owner,"subject":principal.subject,"name":principal.display_name,"expires_at":principal.expires_at}),
             );
         }
         "project.host_state" => {
@@ -2379,30 +2379,6 @@ pub(super) async fn create(
             manager
                 .configuration
                 .compare_exchange(owner, "session_effective", &id, 0, Some(json!(frozen)))
-                .await
-                .map_err(safe)?;
-        }
-        if manager
-            .configuration
-            .get(owner, "session_references", &id)
-            .await
-            .map_err(safe)?
-            .is_none()
-        {
-            let sources = if let Some(project) = project_id.as_deref() {
-                manager
-                    .configuration
-                    .get(owner, "project_references", project)
-                    .await
-                    .map_err(safe)?
-                    .and_then(|r| r.value)
-                    .unwrap_or_else(|| json!([]))
-            } else {
-                json!([])
-            };
-            manager
-                .configuration
-                .compare_exchange(owner, "session_references", &id, 0, Some(sources))
                 .await
                 .map_err(safe)?;
         }

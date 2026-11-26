@@ -313,6 +313,11 @@ pub(super) async fn execute(
             super::display::fork::record_fork(manager, owner, source, &id, &context)
                 .await
                 .err();
+        manager
+            .personal_library
+            .copy_session_mounts(owner, source_id, &id)
+            .await
+            .map_err(super::library::library_wire_error)?;
         let managed = manager
             .activate(
                 destination,

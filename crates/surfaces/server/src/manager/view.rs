@@ -261,11 +261,10 @@ fn project_messages(
     items: Vec<ContentItem>,
     epoch: u64,
     session_id: &str,
-    include_presentation: bool,
+    _include_presentation: bool,
 ) -> Vec<Value> {
     let mut calls = HashMap::<String, (String, Value)>::new();
     let mut messages: Vec<Value> = vec![];
-    let mut assistant_index = None;
     let mut projection = serde_json::Map::new();
     let mut pending_users = Vec::<usize>::new();
     for (index, item) in items.into_iter().enumerate() {
@@ -297,46 +296,6 @@ fn project_messages(
         };
         let mut message = match item {
             ContentItem::State(_) => unreachable!("State frames are projected above"),
-            ContentItem::User {
-                parts,
-                envelope:
-                    Some(microcrab_transport::CarrierEnvelopeVersion::RetainedToolImage { call_id }),
-                source: provenance,
-            } => {
-                if let Some(result_index) = messages
-                    .iter()
-                    .rposition(|message| message["role"] == "tool" && message["call_id"] == call_id)
-                {
-                    let (before, results) = messages.split_at_mut(result_index);
-                    let result = &mut results[0];
-                    if let (
-                        Some(original_id),
-                        Some(microcrab_protocol::InputPart::Image { source }),
-                    ) = (result["id"].as_str(), parts.get(1))
-                    {
-                        result["parts"] =
-                            json!([super::images::reference(session_id, original_id, 0, source)]);
-                        result["image_retention"] = json!("retained");
-                        // This framework carrier is emitted only by the HTTPS
-                        // image archive, not by arbitrary tools with image output.
-                        if include_presentation
-                            && provenance == Some(microcrab_transport::UserSource::Framework)
-                            && matches!(source, microcrab_protocol::ImageSource::Data { .. })
-                            && let Some(call) = assistant_index
-                                .and_then(|index: usize| before.get_mut(index))
-                                .and_then(|assistant| assistant["tool_calls"].as_array_mut())
-                                .and_then(|calls| {
-                                    calls.iter_mut().find(|call| call["id"] == call_id)
-                                })
-                        {
-                            let presentation = json!(super::presentation::Presentation::ViewImage);
-                            call["presentation"] = presentation.clone();
-                            result["presentation"] = presentation;
-                        }
-                    }
-                }
-                continue;
-            }
             ContentItem::User { parts, source, .. } => {
                 let text = parts
                     .iter()
@@ -374,7 +333,6 @@ fn project_messages(
                 tool_calls,
                 ..
             } => {
-                assistant_index = Some(messages.len());
                 let scope = position(&projection);
                 for call in &tool_calls {
                     calls.insert(call.id.clone(), (call.name.clone(), scope.clone()));

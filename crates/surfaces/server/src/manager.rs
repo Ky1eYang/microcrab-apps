@@ -32,6 +32,7 @@ mod host_tests;
 mod hub;
 mod images;
 mod inbox;
+pub(crate) mod library;
 mod model;
 mod model_metadata;
 #[cfg(test)]
@@ -125,7 +126,8 @@ pub struct Manager {
     instance: String,
     self_ref: std::sync::Weak<Manager>,
     client_override: Option<Arc<dyn microcrab_session::Client>>,
-    bytes_ingress_admission: Arc<Semaphore>,
+    pub(crate) personal_library: Arc<dyn microcrab_storage::library::PersonalLibrary>,
+    library_admission: Arc<Semaphore>,
     citation_admission: Arc<Semaphore>,
     external_reply_admission: Arc<Semaphore>,
     external_reply_stop: tokio_util::sync::CancellationToken,
@@ -632,6 +634,39 @@ impl Manager {
                     }
                 }
             };
+        let personal_library: Arc<dyn microcrab_storage::library::PersonalLibrary> =
+            match config.storage {
+                Storage::File => {
+                    #[cfg(feature = "storage-file")]
+                    {
+                        Arc::new(
+                            microcrab_storage::library::FilePersonalLibrary::open(
+                                config.data_dir.join("storage"),
+                            )
+                            .await?,
+                        )
+                    }
+                    #[cfg(not(feature = "storage-file"))]
+                    {
+                        return Err(Error::config("File storage support is not compiled"));
+                    }
+                }
+                Storage::Sqlite => {
+                    #[cfg(feature = "storage-sqlite")]
+                    {
+                        Arc::new(
+                            microcrab_storage::library::SqlitePersonalLibrary::open(
+                                config.data_dir.join("storage.sqlite"),
+                            )
+                            .await?,
+                        )
+                    }
+                    #[cfg(not(feature = "storage-sqlite"))]
+                    {
+                        return Err(Error::config("SQLite support is not compiled"));
+                    }
+                }
+            };
         config
             .validate_agent_wasm_fuel()
             .map_err(|e| Error::Config(e.to_string().into()))?;
@@ -693,7 +728,8 @@ impl Manager {
             instance: uuid::Uuid::new_v4().to_string(),
             self_ref: weak.clone(),
             client_override,
-            bytes_ingress_admission: Arc::new(Semaphore::new(4)),
+            personal_library,
+            library_admission: Arc::new(Semaphore::new(4)),
             citation_admission: Arc::new(Semaphore::new(4)),
             external_reply_admission: Arc::new(Semaphore::new(32)),
             external_reply_stop: tokio_util::sync::CancellationToken::new(),
@@ -1426,6 +1462,11 @@ impl Manager {
             failure = Some(error);
         }
         if let Err(error) = self.directory.close().await
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+        if let Err(error) = self.personal_library.close().await
             && failure.is_none()
         {
             failure = Some(error);

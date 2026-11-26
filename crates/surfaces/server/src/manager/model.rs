@@ -38,45 +38,6 @@ struct RoutedClient {
     recording: Option<Arc<microcrab_creator::display::DisplayRecorder>>,
     anchors: Option<Arc<super::display::anchors::Anchors>>,
 }
-struct PinnedImageModel {
-    client: Arc<dyn Client>,
-    selection: ModelSelection,
-}
-
-#[async_trait]
-impl Client for PinnedImageModel {
-    fn public_https_image_attempts(&self) -> u8 {
-        self.client.public_https_image_attempts()
-    }
-
-    async fn stream_public_https_image_attempt(
-        &self,
-        content: &Content,
-        auditor: &dyn Auditor,
-        variables: &dyn VariableView,
-        cancellation: CancellationToken,
-        events: Option<mpsc::Sender<ModelEvent>>,
-    ) -> Result<ResponseOutcome, microcrab_transport::Error> {
-        let measured =
-            super::statistics::FingerprintAuditor::new(auditor, content, &self.selection)?;
-        self.client
-            .stream_public_https_image_attempt(content, &measured, variables, cancellation, events)
-            .await
-    }
-
-    async fn complete(
-        &self,
-        _: &Content,
-        _: &dyn Auditor,
-        _: &dyn VariableView,
-        _: CancellationToken,
-    ) -> Result<Response, microcrab_transport::Error> {
-        Err(microcrab_transport::Error::config(
-            "pinned image route only accepts its single-attempt port",
-        ))
-    }
-}
-
 struct RouteEstimator {
     routing: Routing,
     config: Config,
@@ -278,30 +239,6 @@ impl RoutedClient {
 }
 #[async_trait]
 impl Client for RoutedClient {
-    fn public_https_image_attempts(&self) -> u8 {
-        self.snapshot(true).0.public_https_image_attempts()
-    }
-
-    fn pin_public_https_image_route(&self) -> Option<Arc<dyn Client>> {
-        let (client, selection) = self.snapshot(true);
-        Some(Arc::new(PinnedImageModel { client, selection }))
-    }
-
-    async fn stream_public_https_image_attempt(
-        &self,
-        content: &Content,
-        auditor: &dyn Auditor,
-        variables: &dyn VariableView,
-        cancellation: CancellationToken,
-        events: Option<mpsc::Sender<ModelEvent>>,
-    ) -> Result<ResponseOutcome, microcrab_transport::Error> {
-        let (client, selection) = self.snapshot(true);
-        let measured = super::statistics::FingerprintAuditor::new(auditor, content, &selection)?;
-        client
-            .stream_public_https_image_attempt(content, &measured, variables, cancellation, events)
-            .await
-    }
-
     async fn observe_input_admitted(
         &self,
         epoch: u64,

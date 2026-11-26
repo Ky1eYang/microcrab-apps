@@ -297,11 +297,11 @@ impl From<WireError> for Error {
         let status = match wire.code.as_str() {
             "unauthenticated" => StatusCode::UNAUTHORIZED,
             "internal_error" => StatusCode::INTERNAL_SERVER_ERROR,
-            "permission_denied" | "variable_forbidden" => StatusCode::FORBIDDEN,
+            "permission_denied" | "variable_forbidden" | "forbidden" => StatusCode::FORBIDDEN,
             "not_found" | "operation_not_found" | "unavailable" | "inbox_item_not_found" => {
                 StatusCode::NOT_FOUND
             }
-            "request_too_large" => StatusCode::PAYLOAD_TOO_LARGE,
+            "request_too_large" | "user_storage_quota_exceeded" => StatusCode::PAYLOAD_TOO_LARGE,
             "capacity" | "command_limit" | "subscription_limit" => StatusCode::TOO_MANY_REQUESTS,
             "inbox_changed"
             | "inbox_revision_conflict"

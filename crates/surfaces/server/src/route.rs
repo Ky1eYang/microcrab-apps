@@ -1,7 +1,7 @@
 //! Central transport assembly. Business effects stay owned by Manager; routes own
 //! HTTP authentication and socket delivery, with one API fallback/error vocabulary.
 mod attachment;
-mod bytes;
+mod library;
 mod citations;
 mod children;
 mod endpoint;

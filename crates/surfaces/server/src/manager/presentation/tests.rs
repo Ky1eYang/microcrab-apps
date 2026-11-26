@@ -5,7 +5,7 @@ fn row() -> ExecutionSnapshot {
     let mut row = ExecutionSnapshot::new(
         "session".into(),
         "call".into(),
-        "view_image".into(),
+        "reference".into(),
         "agent".into(),
         None,
     );
@@ -13,17 +13,17 @@ fn row() -> ExecutionSnapshot {
     row
 }
 
-fn authored_image() -> AuditBody {
+fn reference_call() -> AuditBody {
     AuditBody {
         epoch: 2,
         turn_id: Some(3),
         round: Some(4),
         tool_call_id: Some("call".into()),
         tool_execution_id: Some(7),
-        authored_image_arguments: true,
+        tool_presentation: Some(ToolPresentation::Reference),
         payload: HookPayload::ToolCall {
-            name: "view_image".into(),
-            arguments: json!({"image_url":"unmodified authored source"}),
+            name: "reference".into(),
+            arguments: json!({"action":"expand","id":"ref_0000000000000001"}),
         },
         ..Default::default()
     }
@@ -33,11 +33,11 @@ fn authored_image() -> AuditBody {
 fn presentation_requires_an_exact_scoped_producer_observation() {
     let known = Presentations::default();
     let row = row();
-    let start = authored_image();
+    let start = reference_call();
     assert_eq!(
         known.observe(
             &AuditBody {
-                authored_image_arguments: false,
+                tool_presentation: None,
                 ..start.clone()
             },
             &row
@@ -60,25 +60,25 @@ fn presentation_requires_an_exact_scoped_producer_observation() {
             .get("presentation")
             .is_none()
     );
-    assert_eq!(known.observe(&start, &row), Some(Presentation::ViewImage));
+    assert_eq!(known.observe(&start, &row), Some(Presentation::Reference));
     assert_eq!(
-        known.permission("session", "call", "view_image"),
-        Some(Presentation::ViewImage)
+        known.permission("session", "call", "reference"),
+        Some(Presentation::Reference)
     );
     assert_eq!(
-        known.permission("different-session", "call", "view_image"),
+        known.permission("different-session", "call", "reference"),
         None
     );
     assert_eq!(known.permission("session", "call", "arbitrary"), None);
     let mut wire = serde_json::to_value(NativeExecution::new(&row, Some(&known))).unwrap();
     assert_eq!(
         wire.as_object_mut().unwrap().remove("presentation"),
-        Some(json!("view-image"))
+        Some(json!("reference"))
     );
     assert_eq!(wire, serde_json::to_value(&row).unwrap());
 
     let done = AuditBody {
-        authored_image_arguments: false,
+        tool_presentation: None,
         payload: HookPayload::ToolResult {
             result: Some("unmodified result".into()),
             error: None,
@@ -95,8 +95,8 @@ fn presentation_requires_an_exact_scoped_producer_observation() {
         ),
         None
     );
-    assert_eq!(known.observe(&done, &row), Some(Presentation::ViewImage));
-    assert_eq!(known.permission("session", "call", "view_image"), None);
+    assert_eq!(known.observe(&done, &row), Some(Presentation::Reference));
+    assert_eq!(known.permission("session", "call", "reference"), None);
 }
 
 #[test]
@@ -104,18 +104,18 @@ fn typed_results_bind_generic_presentation_only_to_exact_native_rows() {
     for (witness, value) in [
         (ToolPresentation::CodingFile, "coding-file"),
         (ToolPresentation::MessageReceipt, "message-receipt"),
+        (ToolPresentation::Reference, "reference"),
     ] {
         let known = Presentations::default();
         let mut row = row();
         row.tool = "not-a-recognized-name".into();
         let body = AuditBody {
-            authored_image_arguments: false,
             tool_presentation: Some(witness),
             payload: HookPayload::ToolResult {
                 result: Some("raw".into()),
                 error: None,
             },
-            ..authored_image()
+            ..reference_call()
         };
         assert_eq!(
             known.observe(
@@ -154,9 +154,9 @@ fn typed_results_bind_generic_presentation_only_to_exact_native_rows() {
 #[test]
 fn selected_history_requires_a_certified_result_and_exact_call_slot() {
     let known = Presentations::default();
-    known.observe(&authored_image(), &row());
+    known.observe(&reference_call(), &row());
     let call =
-        json!({"id":"call","name":"view_image","execution_id":7,"arguments":{"value":"raw"}});
+        json!({"id":"call","name":"reference","execution_id":7,"arguments":{"value":"raw"}});
     let result = json!({"role":"tool","call_id":"call","execution_id":7,"execution_session_id":"session","execution_call_source_id":"selected","execution_call_index":1,"position":{"epoch":2,"turn":3,"round":4},"text":"raw result"});
     let mut messages = [
         json!({"role":"assistant","canonical_source_id":"selected","tool_calls":[call.clone(),call.clone()]}),
@@ -166,10 +166,10 @@ fn selected_history_requires_a_certified_result_and_exact_call_slot() {
     ];
     known.decorate_messages(&mut messages);
     assert_eq!(messages[0]["tool_calls"][0], call);
-    assert_eq!(messages[0]["tool_calls"][1]["presentation"], "view-image");
+    assert_eq!(messages[0]["tool_calls"][1]["presentation"], "reference");
     assert_eq!(messages[0]["tool_calls"][1]["arguments"], call["arguments"]);
     assert_eq!(messages[1]["tool_calls"][1], call);
     assert!(messages[2].get("presentation").is_none());
-    assert_eq!(messages[3]["presentation"], "view-image");
+    assert_eq!(messages[3]["presentation"], "reference");
     assert_eq!(messages[3]["text"], result["text"]);
 }

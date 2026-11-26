@@ -68,6 +68,44 @@ pub const DEFAULT_AGENT_PATH: &str = ".microcrab/agents/coding.wasm";
 pub const DEFAULT_AGENT_WASM_FUEL: u64 = 10_000_000;
 pub const MAX_SAFE_AGENT_WASM_FUEL: u64 = (1u64 << 53) - 1;
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PersonalLibraryConfig {
+    pub max_user_bytes: u64,
+    pub max_user_entries: u64,
+    pub max_object_bytes: usize,
+}
+impl Default for PersonalLibraryConfig {
+    fn default() -> Self {
+        Self {
+            max_user_bytes: microcrab_session::state::reference::library::DEFAULT_MAX_USER_BYTES,
+            max_user_entries:
+                microcrab_session::state::reference::library::DEFAULT_MAX_USER_ENTRIES,
+            max_object_bytes:
+                microcrab_session::state::reference::library::DEFAULT_MAX_OBJECT_BYTES,
+        }
+    }
+}
+impl PersonalLibraryConfig {
+    pub(crate) fn limits(self) -> microcrab_storage::library::LibraryLimits {
+        microcrab_storage::library::LibraryLimits {
+            max_user_bytes: self.max_user_bytes,
+            max_user_entries: self.max_user_entries,
+            max_object_bytes: self.max_object_bytes,
+        }
+    }
+    pub(crate) fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_user_bytes == 0
+            || self.max_user_entries == 0
+            || self.max_object_bytes == 0
+            || (self.max_object_bytes as u64) > self.max_user_bytes
+        {
+            return Err(ConfigError::new("personal_library", "invalid_quota"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -77,6 +115,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     #[serde(default)]
     pub storage: Storage,
+    #[serde(default)]
+    pub personal_library: PersonalLibraryConfig,
     #[serde(default = "frontend_dir")]
     pub frontend_dir: PathBuf,
     pub auth: AuthConfig,
@@ -562,6 +602,7 @@ impl Config {
         Ok(())
     }
     pub fn resolve(&mut self, startup: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        self.personal_library.validate()?;
         self.validate_agent_wasm_fuel()?;
         self.auto_compaction
             .validate()

@@ -216,15 +216,51 @@ impl Manager {
         }
         let attachments = SessionAttachments::new(&self.config.data_dir, &record.id);
         let mime = media_type.to_owned();
+        let personal_library = self.personal_library.clone();
+        let owner = principal.owner.clone();
+        let session_id = record.id.clone();
+        let limits = self.config.personal_library.limits();
         // Retain the effect owner across a disconnected HTTP waiter. Uploaded but
         // unsubmitted objects are inert; no Context or historical node is changed.
-        self.track(async move {
+        let saved = self.track(async move {
             let _permit = permit;
             let _lifecycle = lifecycle;
-            attachments.save(&mime, data).await.map_err(safe)
+            let mut value = attachments.save(&mime, data.clone()).await.map_err(safe)?;
+            let short_id = value["attachment_id"]
+                .as_str()
+                .and_then(|s| s.strip_prefix("sha256:"))
+                .map(|s| &s[..s.len().min(12)])
+                .unwrap_or("image");
+            let created = personal_library
+                .create(
+                    &owner,
+                    limits,
+                    microcrab_session::state::reference::CreateLibraryObject::LocalBlob {
+                        id: None,
+                        title: format!("attachment:{short_id}"),
+                        media_type: mime,
+                        data,
+                        origin: microcrab_session::state::reference::LocalBlobOrigin::Upload,
+                        origin_execution_id: None,
+                    },
+                    Some(&session_id),
+                    None,
+                )
+                .await
+                .map_err(super::library::library_wire_error)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("reference_id".into(), json!(created.summary.id));
+            }
+            Ok::<Value, WireError>(value)
         })?
         .await
-        .map_err(|_| WireError::new("operation_failed", "Attachment owner failed"))?
+        .map_err(|_| WireError::new("operation_failed", "Attachment owner failed"))??;
+        if let Some(managed) = super::settings::active(self, &record.id).await
+            && managed.commands.try_lock().is_ok()
+        {
+            let _ = managed.session.refresh_reference_library().await;
+        }
+        Ok(saved)
     }
 }
 

@@ -55,13 +55,10 @@ pub(super) fn router(state: Arc<Application>) -> Router<Arc<Application>> {
         .route_layer(axum::middleware::from_fn_with_state(state, inbox::cors));
     let mut router = bearer_routes
         .route(
-            "/api/v1/sessions/{session_id}/variables/bytes/{name}",
-            axum::routing::put(super::bytes::upload).delete(super::bytes::remove),
-        )
-        .route(
             "/api/v1/sessions/{session_id}/attachments",
             axum::routing::post(super::attachment::upload),
         )
+        .merge(super::library::router())
         .route(
             "/api/v1/sessions/{session_id}/attachments/{attachment_id}",
             get(super::attachment::read),

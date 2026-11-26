@@ -221,7 +221,8 @@ mod tests {
     }
 
     #[test]
-    fn image_presentation_uses_the_builtin_witness_not_name_or_result_text() {
+    fn reference_presentation_uses_the_builtin_witness_not_name_or_result_text() {
+        use microcrab_auditor::ToolPresentation;
         use microcrab_session::runtime::execution::{ExecutionId, ExecutionSnapshot};
         let hub = Arc::new(Hub::new());
         hub.set_operation(Some("operation".into()));
@@ -230,7 +231,7 @@ mod tests {
         let mut row = ExecutionSnapshot::new(
             "session".into(),
             "call".into(),
-            "view_image".into(),
+            "reference".into(),
             "agent".into(),
             None,
         );
@@ -247,8 +248,8 @@ mod tests {
             tool_call_id: Some("call".into()),
             tool_execution_id: Some(7),
             payload: HookPayload::ToolCall {
-                name: "view_image".into(),
-                arguments: json!({"image_url":"unmodified-authored-value"}),
+                name: "reference".into(),
+                arguments: json!({"action":"expand","ids":["ref_0000000000000001"]}),
             },
             ..Default::default()
         };
@@ -266,18 +267,18 @@ mod tests {
         auditor.publish(
             Moment::ToolCall,
             AuditBody {
-                authored_image_arguments: true,
+                tool_presentation: Some(ToolPresentation::Reference),
                 ..start.clone()
             },
         );
         let event = subscription.receiver.try_recv().unwrap();
-        assert_eq!(event.event.payload()["presentation"], "view-image");
+        assert_eq!(event.event.payload()["presentation"], "reference");
         assert!(
             !event
                 .event
                 .payload()
                 .to_string()
-                .contains("unmodified-authored-value")
+                .contains("ref_0000000000000001")
         );
         auditor.publish(
             Moment::ToolResult,
@@ -290,7 +291,7 @@ mod tests {
             },
         );
         let event = subscription.receiver.try_recv().unwrap();
-        assert_eq!(event.event.payload()["presentation"], "view-image");
+        assert_eq!(event.event.payload()["presentation"], "reference");
         assert!(!event.event.payload().to_string().contains("not-a-preview"));
     }
 

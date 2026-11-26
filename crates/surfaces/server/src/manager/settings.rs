@@ -1,12 +1,10 @@
 //! Durable defaults and explicit Session application. Saves never mutate other
 //! live Sessions; desired/applied revisions remain separate on a safe deferral.
-pub(crate) mod bytes;
 pub(crate) mod grants;
 mod variables;
 use super::{Managed, Manager, safe};
 use crate::config::settings::{SettingsOverrides, limits};
 use microcrab_protocol::application::{Command, WireError};
-use microcrab_session::state::reference::markdown::ReferenceSource;
 use microcrab_storage::configuration::ConfigurationRecord;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -29,13 +27,16 @@ struct Write {
 #[serde(deny_unknown_fields)]
 struct ReferencesWrite {
     project_id: String,
-    expected_revision: u64,
-    sources: Vec<ReferenceSource>,
+    #[serde(default)]
+    ref_ids: Vec<String>,
+    #[serde(default)]
+    expected_revision: Option<u64>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct Refresh {
-    project_revision: u64,
+    #[serde(default)]
+    project_revision: Option<u64>,
 }
 fn configuration_error(error: microcrab_session::Error) -> WireError {
     if matches!(&error,microcrab_session::Error::Protocol(reason) if reason.public_reason() == Some("configuration revision conflict; reload before saving"))
@@ -285,7 +286,7 @@ fn values(manager: &Manager, settings: &SettingsOverrides) -> Result<Value, Wire
     }
     Ok(value)
 }
-async fn active(manager: &Manager, id: &str) -> Option<Arc<Managed>> {
+pub(super) async fn active(manager: &Manager, id: &str) -> Option<Arc<Managed>> {
     let slot = manager
         .registry
         .lock()
@@ -322,43 +323,66 @@ pub(super) async fn command(
 ) -> Result<Value, WireError> {
     let method = command.method.as_str();
     if method.starts_with("project.references.") {
-        let (project, sources, expected) = if method.ends_with(".set") {
+        let (project, next_ids) = if method.ends_with(".set") {
             let p: ReferencesWrite = parse(command.params.clone())?;
-            (p.project_id, Some(p.sources), Some(p.expected_revision))
+            let _ = p.expected_revision;
+            (p.project_id, Some(p.ref_ids))
         } else {
             let p: Read = parse(command.params.clone())?;
             (
                 p.project_id.ok_or_else(|| invalid("project_id required"))?,
                 None,
-                None,
             )
         };
         manager.editable_project(owner, &project).await?;
-        let record = if let Some(sources) = sources {
-            validate_references(&sources)?;
-            Some(
+        if let Some(ref_ids) = next_ids {
+            if ref_ids.len() > 256 {
+                return Err(invalid("Project references exceed 256 mounts"));
+            }
+            for ref_id in &ref_ids {
+                if !microcrab_session::state::reference::valid_library_id(ref_id) {
+                    return Err(invalid("Invalid personal library reference id"));
+                }
                 manager
-                    .configuration
-                    .compare_exchange(
-                        owner,
-                        "project_references",
-                        &project,
-                        expected.expect("write has revision"),
-                        Some(json!(sources)),
-                    )
+                    .personal_library
+                    .get(owner, ref_id)
                     .await
-                    .map_err(configuration_error)?,
-            )
-        } else {
-            manager
-                .configuration
-                .get(owner, "project_references", &project)
+                    .map_err(super::library::library_wire_error)?
+                    .ok_or_else(|| invalid("Personal library reference not found for owner"))?;
+            }
+            let current = manager
+                .personal_library
+                .list_project_mounts(owner, &project)
                 .await
-                .map_err(configuration_error)?
-        };
-        return Ok(
-            json!({"revision":record.as_ref().map_or(0,|r|r.revision),"sources":record.and_then(|r|r.value).unwrap_or_else(||json!([]))}),
-        );
+                .map_err(super::library::library_wire_error)?;
+            for item in current {
+                if !ref_ids.iter().any(|id| id == &item.id) {
+                    manager
+                        .personal_library
+                        .unmount_project(owner, &item.id, &project)
+                        .await
+                        .map_err(super::library::library_wire_error)?;
+                }
+            }
+            for ref_id in &ref_ids {
+                manager
+                    .personal_library
+                    .mount_project(owner, ref_id, &project)
+                    .await
+                    .map_err(super::library::library_wire_error)?;
+            }
+        }
+        let items = manager
+            .personal_library
+            .list_project_mounts(owner, &project)
+            .await
+            .map_err(super::library::library_wire_error)?;
+        let ref_ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
+        return Ok(json!({
+            "project_id": project,
+            "items": items,
+            "ref_ids": ref_ids,
+        }));
     }
     if method == "session.references.refresh" {
         let p: Refresh = parse(command.params.clone())?;
@@ -367,24 +391,9 @@ pub(super) async fn command(
             .as_deref()
             .ok_or_else(|| invalid("Session path required"))?;
         let record = session_record(manager, owner, id).await?;
-        let project = record
-            .project_id
-            .ok_or_else(|| invalid("Project references require a Project Session"))?;
-        manager.editable_project(owner, &project).await?;
-        let refs = manager
-            .configuration
-            .get(owner, "project_references", &project)
-            .await
-            .map_err(configuration_error)?;
-        if refs.as_ref().map_or(0, |r| r.revision) != p.project_revision {
-            return Err(WireError::new(
-                "revision_conflict",
-                "Project references changed; reload before refresh",
-            ));
+        if let Some(project) = record.project_id.as_deref() {
+            manager.editable_project(owner, project).await?;
         }
-        let sources: Vec<ReferenceSource> =
-            parse(refs.and_then(|r| r.value).unwrap_or_else(|| json!([])))?;
-        validate_references(&sources)?;
         let managed = active(manager, id).await.ok_or_else(|| {
             WireError::new(
                 "closed",
@@ -395,46 +404,14 @@ pub(super) async fn command(
         ensure_mutable(&managed)?;
         managed
             .session
-            .replace_markdown_references(
-                "references".into(),
-                sources.clone(),
-                microcrab_session::state::reference::markdown::ReferenceLimits::default(),
-            )
+            .refresh_reference_library()
             .await
-            .map_err(configuration_error)?;
-        let publication = async {
-            let saved = manager
-                .configuration
-                .get(owner, "session_references", id)
-                .await
-                .map_err(configuration_error)?;
-            manager
-                .configuration
-                .compare_exchange(
-                    owner,
-                    "session_references",
-                    id,
-                    saved.as_ref().map_or(0, |r| r.revision),
-                    Some(json!(sources)),
-                )
-                .await
-                .map_err(configuration_error)?;
-            Ok::<(), WireError>(())
-        }
-        .await;
-        if let Err(error) = publication {
-            return Err(quarantine(
-                &managed,
-                p.project_revision,
-                &json!({}),
-                "reference source metadata publication",
-                error,
-            )
-            .await);
-        }
-        return Ok(
-            json!({"project_revision":p.project_revision,"applied":true,"boundary":"next_state_patch"}),
-        );
+            .map_err(super::library::library_wire_error)?;
+        return Ok(json!({
+            "project_revision": p.project_revision.unwrap_or(0),
+            "applied": true,
+            "boundary": "next_state_patch"
+        }));
     }
     if matches!(
         method,
@@ -919,54 +896,5 @@ async fn apply_after_limits(
         )
         .await
         .map_err(configuration_error)?;
-    Ok(())
-}
-fn validate_references(sources: &[ReferenceSource]) -> Result<(), WireError> {
-    if sources.len() > 256 {
-        return Err(invalid("Reference sources exceed 256 entries"));
-    }
-    for source in sources {
-        match source {
-            ReferenceSource::HostPath { path } | ReferenceSource::HostGlob { root: path, .. } => {
-                if path.as_os_str().is_empty()
-                    || path.to_string_lossy().len() > 4096
-                    || path.is_absolute()
-                    || path.components().any(|c| {
-                        matches!(
-                            c,
-                            std::path::Component::ParentDir | std::path::Component::Prefix(_)
-                        )
-                    })
-                {
-                    return Err(invalid(
-                        "Reference paths must stay relative to the injected Host workspace without parent traversal",
-                    ));
-                }
-                if let ReferenceSource::HostGlob { pattern, .. } = source
-                    && (pattern.is_empty() || pattern.len() > 4096 || pattern.contains(".."))
-                {
-                    return Err(invalid(
-                        "Reference glob must be nonempty, bounded and exclude parent traversal",
-                    ));
-                }
-            }
-            ReferenceSource::Url { url } | ReferenceSource::DirectoryUrl { url } => {
-                let parsed =
-                    url::Url::parse(url).map_err(|_| invalid("Reference URL is malformed"))?;
-                if url.len() > 8192
-                    || !matches!(parsed.scheme(), "http" | "https")
-                    || parsed.host_str().is_none()
-                    || !parsed.username().is_empty()
-                    || parsed.password().is_some()
-                    || parsed.query().is_some()
-                    || parsed.fragment().is_some()
-                {
-                    return Err(invalid(
-                        "Reference URL requires bounded HTTP(S) with host and no credentials/query/fragment",
-                    ));
-                }
-            }
-        }
-    }
     Ok(())
 }

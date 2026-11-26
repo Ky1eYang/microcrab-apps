@@ -120,10 +120,41 @@ async fn provider_secrets_refresh_failure_and_route_pin() {
 }
 #[cfg(feature = "storage-file")]
 #[tokio::test]
-async fn reference_save_is_revisioned_and_does_not_create_runtime() {
+async fn project_reference_mounts_bind_owner_library_items_without_creating_runtime() {
     let (manager, _root) = manager(model(), "file").await;
-    let saved=super::super::settings::command(&manager,"owner",&command("project.references.set",None,json!({"project_id":"project","expected_revision":0,"sources":[{"type":"host_path","path":"AGENTS.md"}]}))).await.unwrap();
-    assert_eq!(saved["revision"], 1);
+    let owner = Principal::for_test("owner");
+    let permit = manager.library_permit().unwrap();
+    let created = manager
+        .library_create(
+            &owner,
+            microcrab_session::state::reference::CreateLibraryObject::Shortcut {
+                title: "Agents guide".into(),
+                target: microcrab_session::state::reference::ShortcutTarget::HostPath {
+                    path: "AGENTS.md".into(),
+                    project_id: Some("project".into()),
+                    host_id: None,
+                    workspace_id: None,
+                },
+            },
+            None,
+            None,
+            permit,
+        )
+        .await
+        .unwrap();
+    let ref_id = created["id"].as_str().unwrap().to_owned();
+    let saved = super::super::settings::command(
+        &manager,
+        "owner",
+        &command(
+            "project.references.set",
+            None,
+            json!({"project_id":"project","ref_ids":[ref_id]}),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved["ref_ids"], json!([created["id"]]));
     assert!(manager.registry.lock().unwrap().is_empty());
     let read = super::super::settings::command(
         &manager,
@@ -140,17 +171,29 @@ async fn reference_save_is_revisioned_and_does_not_create_runtime() {
     assert!(
         super::super::settings::command(
             &manager,
-            "owner",
+            "other",
             &command(
                 "project.references.set",
                 None,
-                json!({"project_id":"project","expected_revision":0,"sources":[]})
+                json!({"project_id":"project","ref_ids":[created["id"]]})
             )
         )
         .await
         .is_err()
     );
-    assert!(super::super::settings::command(&manager,"owner",&command("project.references.set",None,json!({"project_id":"project","expected_revision":1,"sources":[{"type":"host_path","path":"../escape.md"}]}))).await.is_err());
+    assert!(
+        super::super::settings::command(
+            &manager,
+            "owner",
+            &command(
+                "project.references.set",
+                None,
+                json!({"project_id":"project","ref_ids":["not-a-ref-id"]})
+            )
+        )
+        .await
+        .is_err()
+    );
 }
 #[cfg(feature = "storage-file")]
 #[tokio::test]

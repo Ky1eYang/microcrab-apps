@@ -66,52 +66,6 @@ fn select(
     id: &str,
     part_index: usize,
 ) -> Result<ImageContent, WireError> {
-    // Presentation merges the append-only archive into its original tool row.
-    // Resolve that row's exact same ID and projected part ordinal, never a URL
-    // or a different call. Existing canonical image identities remain unchanged.
-    if part_index == 0 {
-        for (index, item) in items.iter().enumerate() {
-            let ContentItem::Tool { call_id, parts, .. } = item else {
-                continue;
-            };
-            if !parts.is_empty() || message_id(session_id, epoch, index, item) != id {
-                continue;
-            }
-            let archive = items[index + 1..]
-                .iter()
-                .take_while(|item| !matches!(item, ContentItem::Assistant { .. }))
-                .find_map(|item| {
-                    let ContentItem::User {
-                        parts,
-                        envelope:
-                            Some(microcrab_transport::CarrierEnvelopeVersion::RetainedToolImage {
-                                call_id: related,
-                            }),
-                        ..
-                    } = item
-                    else {
-                        return None;
-                    };
-                    (related == call_id).then(|| parts.get(1)).flatten()
-                });
-            if let Some(InputPart::Image {
-                source:
-                    ImageSource::Data {
-                        media_type: mime,
-                        data,
-                    },
-            }) = archive
-                && !data.is_empty()
-            {
-                let media_type = media_type(mime).ok_or_else(unavailable)?;
-                return Ok(ImageContent {
-                    media_type,
-                    data: data.clone(),
-                });
-            }
-            break;
-        }
-    }
     for (index, item) in items.into_iter().enumerate() {
         if !matches!(&item, ContentItem::User { .. } | ContentItem::Tool { .. })
             || message_id(session_id, epoch, index, &item) != id
@@ -254,72 +208,6 @@ impl Manager {
 #[cfg(test)]
 mod tool_image_tests {
     use super::*;
-    #[test]
-    fn https_archive_is_addressed_using_the_linked_tool_row_and_not_the_archive_row() {
-        let result = ContentItem::Tool {
-            call_id: "image".into(),
-            content: "pending".into(),
-            parts: vec![],
-        };
-        let archive = ContentItem::User {
-            parts: vec![
-                InputPart::Text {
-                    text: "retained".into(),
-                },
-                InputPart::Image {
-                    source: ImageSource::Data {
-                        media_type: "image/png".into(),
-                        data: vec![1, 2, 3],
-                    },
-                },
-            ],
-            source: Some(microcrab_transport::UserSource::Framework),
-            envelope: Some(
-                microcrab_transport::CarrierEnvelopeVersion::RetainedToolImage {
-                    call_id: "image".into(),
-                },
-            ),
-        };
-        let assistant = ContentItem::Assistant {
-            content: String::new(),
-            tool_calls: vec![microcrab_protocol::ToolCall {
-                id: "image".into(),
-                name: "view_image".into(),
-                arguments: serde_json::json!({"image_url":"https:legacy-private-reference"}),
-                provider_metadata: None,
-            }],
-            provider_metadata: None,
-        };
-        let before =
-            super::super::view::messages(vec![assistant.clone(), result.clone()], 2, "owned");
-        assert!(before[0]["tool_calls"][0].get("presentation").is_none());
-        assert!(before[1].get("presentation").is_none());
-        let items = vec![assistant, result, archive];
-        let id = message_id("owned", 2, 1, &items[1]);
-        let messages = super::super::view::messages(items.clone(), 2, "owned");
-        let archived = super::super::view::canonical_display_messages(items.clone(), 2, "owned");
-        assert!(archived[0]["tool_calls"][0].get("presentation").is_none());
-        assert!(archived[1].get("presentation").is_none());
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["tool_calls"][0]["presentation"], "view-image");
-        assert_eq!(
-            messages[0]["tool_calls"][0]["arguments"],
-            before[0]["tool_calls"][0]["arguments"]
-        );
-        assert_eq!(messages[1]["presentation"], "view-image");
-        assert_eq!(messages[1]["id"], before[1]["id"]);
-        assert_eq!(messages[1]["text"], before[1]["text"]);
-        assert_eq!(
-            messages[1]["parts"][0]["source"]["url"],
-            format!("/api/v1/sessions/owned/images/{id}/0")
-        );
-        assert_eq!(
-            select(items.clone(), 2, "owned", &id, 0).unwrap().data,
-            vec![1, 2, 3]
-        );
-        assert!(select(items.clone(), 2, "other", &id, 0).is_err());
-        assert!(select(items, 2, "owned", &id, 1).is_err());
-    }
 
     #[test]
     fn exact_tool_image_resource_uses_canonical_identity_and_original_part_index() {
