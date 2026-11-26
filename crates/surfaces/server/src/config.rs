@@ -4,6 +4,7 @@
 use crate::auth::AuthConfig;
 mod jsonc;
 mod provider;
+pub(crate) mod relay;
 pub(crate) mod settings;
 
 /// Static startup diagnostics: never retain parser text, paths or secret values.
@@ -117,6 +118,8 @@ pub struct Config {
     pub storage: Storage,
     #[serde(default)]
     pub personal_library: PersonalLibraryConfig,
+    #[serde(default)]
+    pub relay: relay::RelayConfig,
     #[serde(default = "frontend_dir")]
     pub frontend_dir: PathBuf,
     pub auth: AuthConfig,
@@ -319,6 +322,7 @@ pub struct Agent {
     pub restore_only: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct ResolvedProviderSelection {
     pub provider: Provider,
     pub options: microcrab_transport::OpenAiCompatibleRequestOptions,
@@ -603,6 +607,7 @@ impl Config {
     }
     pub fn resolve(&mut self, startup: &Path) -> Result<(), Box<dyn std::error::Error>> {
         self.personal_library.validate()?;
+        self.relay.validate(self)?;
         self.validate_agent_wasm_fuel()?;
         self.auto_compaction
             .validate()

@@ -111,6 +111,7 @@ async fn run(flush: &mut Option<logging::FlushGuard>) -> Result<(), Box<dyn std:
     let relay = state.manager.clone();
     let service = axum::serve(listener, router).with_graceful_shutdown(async move {
         let _ = tokio::signal::ctrl_c().await;
+        relay.stop_relay();
         relay.stop_external_reply_reads();
     });
     let result = service.await;

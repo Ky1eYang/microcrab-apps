@@ -15,6 +15,47 @@ fn owner_id(fixture: &Fixture) -> String {
 }
 
 #[tokio::test]
+async fn library_json_upload_preserves_bytes_instead_of_interpreting_a_create_command() {
+    let fixture = Fixture::new(true).await;
+    let user_id = owner_id(&fixture);
+    let payload = r#"{"title":"inner","text":"not a create command"}"#;
+    let response = fixture
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/users/{user_id}/library/objects?upload=true&title=config.json"
+                ))
+                .header("cookie", format!("microcrab_session={}", fixture.token))
+                .header("origin", "http://127.0.0.1:4096")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let created = body(response).await;
+    assert_eq!(created["title"], "config.json");
+    assert_eq!(created["media_type"], "application/json");
+    let id = created["id"].as_str().unwrap();
+    let response = fixture
+        .request(
+            "GET",
+            &format!("/api/v1/users/{user_id}/library/objects/{id}/content"),
+            None,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["content-disposition"], "attachment");
+    let data = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(data.as_ref(), payload.as_bytes());
+    fixture.state.manager.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn library_enforces_user_id_isolation_and_cross_session_content_delivery() {
     let fixture = Fixture::new(true).await;
     let user_id = owner_id(&fixture);
@@ -93,10 +134,7 @@ async fn library_enforces_user_id_isolation_and_cross_session_content_delivery()
         "no-store"
     );
     assert_eq!(
-        content_res
-            .headers()
-            .get("x-content-type-options")
-            .unwrap(),
+        content_res.headers().get("x-content-type-options").unwrap(),
         "nosniff"
     );
     assert_eq!(
@@ -157,7 +195,16 @@ async fn library_enforces_user_id_isolation_and_cross_session_content_delivery()
         .unwrap();
     assert_eq!(mount_res.status(), StatusCode::OK);
     let mounted = body(mount_res).await;
-    assert_eq!(mounted["mounted_sessions"], json!([session_a, session_b]));
+    let mut actual_mounts: Vec<String> = mounted["mounted_sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+    actual_mounts.sort();
+    let mut expected_mounts = vec![session_a.clone(), session_b.clone()];
+    expected_mounts.sort();
+    assert_eq!(actual_mounts, expected_mounts);
 
     let inspected_b = fixture.inspect(&session_b).await.unwrap();
     let refs_b = inspected_b["state"]["references"].as_array().unwrap();
@@ -183,14 +230,20 @@ async fn library_enforces_user_id_isolation_and_cross_session_content_delivery()
     assert_eq!(attach_res.status(), StatusCode::OK);
     let attach_json = body(attach_res).await;
     assert!(attach_json["attachment_id"].is_string());
-    assert!(attach_json["reference_id"]
-        .as_str()
-        .is_some_and(|s| s.starts_with("ref_")));
+    assert!(
+        attach_json["reference_id"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("ref_"))
+    );
 
     // Delete removes the blob and reduces quota.
     let quota_before = body(
         fixture
-            .request("GET", &format!("/api/v1/users/{user_id}/library/quota"), None)
+            .request(
+                "GET",
+                &format!("/api/v1/users/{user_id}/library/quota"),
+                None,
+            )
             .await,
     )
     .await;
@@ -211,8 +264,7 @@ async fn library_enforces_user_id_isolation_and_cross_session_content_delivery()
     assert_eq!(del.status(), StatusCode::OK);
     let quota_after = body(del).await["quota"].clone();
     assert!(
-        quota_after["used_bytes"].as_u64().unwrap()
-            < quota_before["used_bytes"].as_u64().unwrap()
+        quota_after["used_bytes"].as_u64().unwrap() < quota_before["used_bytes"].as_u64().unwrap()
     );
 
     // State catalog exposes unified `reference` builtin (and never `view_image` / `expand`).

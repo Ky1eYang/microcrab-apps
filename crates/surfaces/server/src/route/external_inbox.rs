@@ -77,6 +77,7 @@ fn bearer(headers: &HeaderMap) -> Result<String, Error> {
     let header = single(headers, "authorization")?;
     let (scheme, key) = header.split_once(' ').ok_or_else(unauthorized)?;
     if !scheme.eq_ignore_ascii_case("Bearer")
+        || key.starts_with("mc_sk_")
         || !(43..=128).contains(&key.len())
         || !key
             .bytes()

@@ -4,6 +4,8 @@ mod attachments;
 mod library;
 mod citations;
 mod children;
+#[path = "dashboard_tests.rs"]
+mod dashboard;
 mod execution_history;
 mod external_reply;
 mod external_speakers;

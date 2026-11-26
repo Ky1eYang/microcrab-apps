@@ -88,8 +88,9 @@ impl microcrab_creator::delegate::ChildDisplayFactory for ChildDisplay {
             }
             journals.insert(key, journal.clone());
         }
+        let routing = self.routing.for_child(id);
         let Some(auditor) = auditor else {
-            return Ok(self.routing.client(false));
+            return Ok(routing.client(false));
         };
         let source = super::source(
             &self.config,
@@ -142,9 +143,7 @@ impl microcrab_creator::delegate::ChildDisplayFactory for ChildDisplay {
                         ));
                     }
                 });
-                Ok(self
-                    .routing
-                    .recorded_child(recorder, id.to_owned(), source, failure))
+                Ok(routing.recorded_child(recorder, id.to_owned(), source, failure))
             }
             Err(error) => {
                 self.hub
@@ -152,7 +151,7 @@ impl microcrab_creator::delegate::ChildDisplayFactory for ChildDisplay {
                         serde_json::json!({"child_session_id":id,"coverage":"unavailable"}),
                     ));
                 tracing::warn!(error_code = %super::super::safe(error).code,"Child display archive unavailable");
-                Ok(self.routing.client(false))
+                Ok(routing.client(false))
             }
         }
     }

@@ -139,6 +139,12 @@ async fn browser_real_component_is_cataloged_from_its_imports_only_on_eligible_p
     let catalog = project_components(&config, host.clone(), "project")
         .await
         .unwrap();
+    if catalog.is_empty() {
+        match load(source, host.clone(), Some("project"), config.agent_wasm_fuel) {
+            Ok(_) => panic!("Browser component loaded but discovery omitted it"),
+            Err(error) => panic!("Browser component rejected: {error:?}"),
+        }
+    }
     assert_eq!(catalog.len(), 1);
     assert_eq!(catalog[0].digest, fixture_digest);
     assert!(!catalog[0].agents.is_empty());

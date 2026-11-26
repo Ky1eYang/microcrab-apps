@@ -15,6 +15,7 @@ pub(crate) mod commands;
 mod compaction;
 mod conversation_flavors;
 pub(crate) mod conversations;
+pub(crate) mod dashboard;
 mod deletion;
 mod detached;
 pub(crate) mod direct;
@@ -41,10 +42,12 @@ mod naming;
 mod observation;
 mod permission_ask;
 mod presentation;
+pub(crate) mod preferences;
 mod prompt_defaults;
 pub(crate) mod prompt_history;
-mod providers;
+pub(crate) mod providers;
 pub(crate) mod question_images;
+pub(crate) mod relay_keys;
 mod round_limit;
 pub(crate) mod session_watch;
 pub(crate) mod settings;
@@ -88,6 +91,9 @@ use tokio::{
 pub struct Manager {
     pub(crate) config: Config,
     model_metadata: Arc<model_metadata::ModelMetadata>,
+    pub(crate) dashboard: dashboard::Dashboard,
+    pub(crate) relay_keys: relay_keys::RelayKeys,
+    pub(crate) relay_runtime: crate::route::relay::Runtime,
     pub(crate) projects: crate::project::ProjectRegistry,
     host: Arc<dyn Host>,
     embedded: bool,
@@ -692,6 +698,9 @@ impl Manager {
         let conversation_flavors = Arc::new(conversation_flavors::Flavors::open(&config.data_dir)?);
         let projects = crate::project::ProjectRegistry::new(&config.data_dir)?;
         let model_metadata = model_metadata::ModelMetadata::open(&config).await?;
+        let dashboard = dashboard::Dashboard::open(&config).await?;
+        let relay_keys = relay_keys::RelayKeys::open(&config).await?;
+        let relay_runtime = crate::route::relay::Runtime::new(&config.relay);
         let session_watch = session_watch::SessionWatch::new();
         let directory: Arc<dyn Directory> = Arc::new(session_watch::WatchedDirectory {
             inner: directory,
@@ -700,6 +709,9 @@ impl Manager {
         let manager = Arc::new_cyclic(|weak| Self {
             config,
             model_metadata,
+            dashboard,
+            relay_keys,
+            relay_runtime,
             projects,
             host,
             embedded,
@@ -1367,6 +1379,11 @@ impl Manager {
         ));
         outcome
     }
+    /// Stop stateless relay requests before HTTP graceful drain.
+    pub fn stop_relay(&self) {
+        self.relay_runtime.stop();
+    }
+
     pub async fn close(&self) -> Result<(), Error> {
         let manager = self.self_ref.upgrade().ok_or(Error::Closed)?;
         tokio::spawn(async move { manager.shutdown_inner().await })
@@ -1374,6 +1391,7 @@ impl Manager {
             .map_err(|_| Error::Protocol("shutdown owner failed".into()))?
     }
     async fn shutdown_inner(&self) -> Result<(), Error> {
+        self.stop_relay();
         self.stop_external_reply_reads();
         let _shutdown = self.shutdown.lock().await;
         if let Some(result) = self
@@ -1451,6 +1469,16 @@ impl Manager {
                 route.remote.detach(route.generation);
             }
         }
+        if let Err(error) = self.relay_keys.close().await
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
+        if let Err(error) = self.dashboard.close().await
+            && failure.is_none()
+        {
+            failure = Some(error);
+        }
         if let Err(error) = self.model_metadata.close().await
             && failure.is_none()
         {
@@ -1490,7 +1518,7 @@ impl Manager {
         result
     }
 }
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)

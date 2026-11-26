@@ -1,9 +1,9 @@
 //! Central transport assembly. Business effects stay owned by Manager; routes own
 //! HTTP authentication and socket delivery, with one API fallback/error vocabulary.
 mod attachment;
-mod library;
-mod citations;
 mod children;
+mod citations;
+mod dashboard;
 mod endpoint;
 pub(crate) mod error;
 mod external_inbox;
@@ -11,10 +11,14 @@ mod external_speakers;
 mod host;
 mod http;
 mod images;
+mod library;
+mod preferences;
 pub(crate) mod project;
 mod prompt_history;
 mod provenance;
 mod question_images;
+pub(crate) mod relay;
+mod relay_keys;
 pub(crate) mod session;
 mod settings;
 mod socket;
@@ -32,6 +36,34 @@ pub(crate) fn router(state: Arc<Application>, frontend: &Path) -> Router {
     let provider = auth::dev::router(state.auth.clone());
     let api = http::router(state.clone()) // include /api/v1/*
         .route("/api/v1/host/outbound", get(host::outbound))
+        .route(
+            "/api/v1/users/{user_id}/api-keys",
+            get(relay_keys::list).post(relay_keys::create),
+        )
+        .route(
+            "/api/v1/users/{user_id}/api-keys/{key_id}",
+            axum::routing::patch(relay_keys::update).delete(relay_keys::revoke),
+        )
+        .route(
+            "/api/v1/users/{user_id}/dashboard/summary",
+            get(dashboard::summary),
+        )
+        .route(
+            "/api/v1/users/{user_id}/dashboard/cache-diagnostics",
+            get(dashboard::cache_diagnostics),
+        )
+        .route(
+            "/api/v1/users/{user_id}/dashboard/logs",
+            get(dashboard::logs),
+        )
+        .route(
+            "/api/v1/users/{user_id}/dashboard/logs.csv",
+            get(dashboard::export_logs),
+        )
+        .route(
+            "/api/v1/users/{user_id}/preferences",
+            get(preferences::read).put(preferences::update),
+        )
         .route("/api/v1/ws", get(socket::global))
         .route("/api/v1/sessions/{session_id}/ws", get(socket::session))
         .route("/api/health", get(http::health))
@@ -49,6 +81,7 @@ pub(crate) fn router(state: Arc<Application>, frontend: &Path) -> Router {
     let api = api.merge(provider);
     Router::new()
         .merge(api)
+        .merge(relay::router(state))
         .fallback_service(
             ServeDir::new(frontend).not_found_service(ServeFile::new(frontend.join("index.html"))),
         )
@@ -60,7 +93,9 @@ async fn normalize_loopback_host(
     next: middleware::Next,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    if req.method() == axum::http::Method::GET
+    if !matches!(req.uri().path(), "/v1")
+        && !req.uri().path().starts_with("/v1/")
+        && req.method() == axum::http::Method::GET
         && let Some(host) = req
             .headers()
             .get(axum::http::header::HOST)

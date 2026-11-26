@@ -23,6 +23,7 @@ pub(super) struct Target {
     main: Arc<dyn Client>,
     child: Arc<dyn Client>,
     recordable: Option<RetryingClient>,
+    dashboard_model: Option<super::dashboard::Model>,
     context_window_tokens: Option<u64>,
 }
 #[derive(Clone)]
@@ -30,11 +31,13 @@ pub(super) struct Routing {
     target: Arc<Mutex<Arc<Target>>>,
     epoch_targets: Arc<Mutex<std::collections::BTreeMap<u64, Arc<Target>>>>,
     anchors: Arc<Mutex<Option<Arc<super::display::anchors::Anchors>>>>,
+    dashboard: Option<super::dashboard::SessionSink>,
 }
 #[derive(Clone)]
 struct RoutedClient {
     routing: Routing,
     main: bool,
+    fingerprint: bool,
     recording: Option<Arc<microcrab_creator::display::DisplayRecorder>>,
     anchors: Option<Arc<super::display::anchors::Anchors>>,
 }
@@ -97,7 +100,23 @@ impl Routing {
             target: Arc::new(Mutex::new(Arc::new(target))),
             epoch_targets: Arc::default(),
             anchors: Arc::new(Mutex::new(None)),
+            dashboard: None,
         }
+    }
+    pub(in crate::manager) fn with_dashboard(
+        mut self,
+        dashboard: super::dashboard::SessionSink,
+    ) -> Self {
+        self.dashboard = Some(dashboard);
+        self
+    }
+    pub(in crate::manager) fn for_child(&self, session_id: &str) -> Self {
+        let mut routing = self.frozen();
+        routing.dashboard = self
+            .dashboard
+            .as_ref()
+            .map(|sink| sink.for_session(session_id));
+        routing
     }
     pub(super) fn install_anchors(&self, anchors: Arc<super::display::anchors::Anchors>) {
         *self.anchors.lock().unwrap_or_else(|e| e.into_inner()) = Some(anchors);
@@ -154,16 +173,24 @@ impl Routing {
         captured
     }
     pub(super) fn epoch_client(&self, epoch: u64) -> Arc<dyn Client> {
-        let target = self
+        let pinned = self
             .epoch_targets
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(|error| error.into_inner())
             .get(&epoch)
             .cloned();
-        match target {
-            Some(target) => target.child.clone(),
-            None => self.client(false),
-        }
+        let Some(target) = pinned else {
+            return self.client(false);
+        };
+        let mut routing = self.frozen();
+        routing.target = Arc::new(Mutex::new(target));
+        Arc::new(RoutedClient {
+            routing,
+            main: false,
+            fingerprint: false,
+            recording: None,
+            anchors: None,
+        })
     }
     pub(super) fn selection(&self) -> ModelSelection {
         self.target
@@ -182,12 +209,14 @@ impl Routing {
             )),
             anchors: self.anchors.clone(),
             epoch_targets: self.epoch_targets.clone(),
+            dashboard: self.dashboard.clone(),
         }
     }
     pub(super) fn client(&self, main: bool) -> Arc<dyn Client> {
         Arc::new(RoutedClient {
             routing: if main { self.clone() } else { self.frozen() },
             main,
+            fingerprint: true,
             recording: None,
             anchors: None,
         })
@@ -204,6 +233,7 @@ impl Routing {
         Arc::new(RoutedClient {
             routing: self.frozen(),
             main: false,
+            fingerprint: true,
             anchors: Some(anchors),
             recording: Some(recording),
         })
@@ -217,24 +247,36 @@ impl Routing {
     }
 }
 impl RoutedClient {
-    fn snapshot(&self, visible: bool) -> (Arc<dyn Client>, ModelSelection) {
+    fn snapshot(&self, visible: bool) -> (Arc<dyn Client>, Arc<Target>) {
         let target = self
             .routing
             .target
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if !visible {
-            (target.child.clone(), target.selection.clone())
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let client = if !visible {
+            target.child.clone()
         } else if self.main {
-            (target.main.clone(), target.selection.clone())
+            target.main.clone()
         } else if let (Some(recording), Some(client)) = (&self.recording, &target.recordable) {
-            (
-                Arc::new(client.clone().with_recording(recording.clone())),
-                target.selection.clone(),
-            )
+            Arc::new(client.clone().with_recording(recording.clone()))
         } else {
-            (target.child.clone(), target.selection.clone())
-        }
+            target.child.clone()
+        };
+        (client, target)
+    }
+
+    fn dashboard_auditor<'a>(
+        &'a self,
+        target: &'a Target,
+        auditor: &'a dyn Auditor,
+    ) -> Option<super::dashboard::SessionAuditor<'a>> {
+        Some(
+            self.routing
+                .dashboard
+                .as_ref()?
+                .wrap(auditor, target.dashboard_model.as_ref()?),
+        )
     }
 }
 #[async_trait]
@@ -358,10 +400,22 @@ impl Client for RoutedClient {
         cancellation: CancellationToken,
         events: Option<mpsc::Sender<ModelEvent>>,
     ) -> Result<ResponseOutcome, microcrab_transport::Error> {
-        let (client, selection) = self.snapshot(true);
-        let measured = super::statistics::FingerprintAuditor::new(auditor, content, &selection)?;
+        let (client, target) = self.snapshot(true);
+        let dashboard = self.dashboard_auditor(&target, auditor);
+        let auditor = dashboard
+            .as_ref()
+            .map_or(auditor, |observer| observer as &dyn Auditor);
+        let measured = self
+            .fingerprint
+            .then(|| {
+                super::statistics::FingerprintAuditor::new(auditor, content, &target.selection)
+            })
+            .transpose()?;
+        let auditor = measured
+            .as_ref()
+            .map_or(auditor, |observer| observer as &dyn Auditor);
         client
-            .stream_admitted_outcome(content, &measured, variables, cancellation, events)
+            .stream_admitted_outcome(content, auditor, variables, cancellation, events)
             .await
     }
     async fn complete(
@@ -371,10 +425,22 @@ impl Client for RoutedClient {
         variables: &dyn VariableView,
         cancellation: CancellationToken,
     ) -> Result<Response, microcrab_transport::Error> {
-        let (client, selection) = self.snapshot(false);
-        let measured = super::statistics::FingerprintAuditor::new(auditor, content, &selection)?;
+        let (client, target) = self.snapshot(false);
+        let dashboard = self.dashboard_auditor(&target, auditor);
+        let auditor = dashboard
+            .as_ref()
+            .map_or(auditor, |observer| observer as &dyn Auditor);
+        let measured = self
+            .fingerprint
+            .then(|| {
+                super::statistics::FingerprintAuditor::new(auditor, content, &target.selection)
+            })
+            .transpose()?;
+        let auditor = measured
+            .as_ref()
+            .map_or(auditor, |observer| observer as &dyn Auditor);
         client
-            .complete(content, &measured, variables, cancellation)
+            .complete(content, auditor, variables, cancellation)
             .await
     }
     async fn stream(
@@ -385,10 +451,22 @@ impl Client for RoutedClient {
         cancellation: CancellationToken,
         events: Option<mpsc::Sender<ModelEvent>>,
     ) -> Result<Response, microcrab_transport::Error> {
-        let (client, selection) = self.snapshot(false);
-        let measured = super::statistics::FingerprintAuditor::new(auditor, content, &selection)?;
+        let (client, target) = self.snapshot(false);
+        let dashboard = self.dashboard_auditor(&target, auditor);
+        let auditor = dashboard
+            .as_ref()
+            .map_or(auditor, |observer| observer as &dyn Auditor);
+        let measured = self
+            .fingerprint
+            .then(|| {
+                super::statistics::FingerprintAuditor::new(auditor, content, &target.selection)
+            })
+            .transpose()?;
+        let auditor = measured
+            .as_ref()
+            .map_or(auditor, |observer| observer as &dyn Auditor);
         client
-            .stream(content, &measured, variables, cancellation, events)
+            .stream(content, auditor, variables, cancellation, events)
             .await
     }
 }
@@ -510,6 +588,7 @@ pub(super) async fn target(
 ) -> Result<Target, Error> {
     let PreparedModelRoute {
         witness,
+        protocol,
         client,
         context_window_tokens,
         ..
@@ -534,6 +613,14 @@ pub(super) async fn target(
         main,
         child,
         recordable,
+        dashboard_model: manager
+            .client_override
+            .is_none()
+            .then(|| super::dashboard::Model {
+                provider_id: selection.provider_id.clone(),
+                model: selection.model.clone(),
+                protocol: Some(protocol),
+            }),
         context_window_tokens,
     })
 }
@@ -542,6 +629,7 @@ pub(super) async fn target(
 pub(super) async fn review_target(
     manager: &Manager,
     owner: &str,
+    session_id: &str,
     selection: &microcrab_permission::ReviewModelSelection,
     hub: Arc<Hub>,
 ) -> Result<Arc<dyn Client>, Error> {
@@ -550,7 +638,13 @@ pub(super) async fn review_target(
         model: selection.model.clone(),
         variant: selection.variant.clone(),
     });
-    Ok(Routing::new(target(manager, owner, &selected, hub).await?).client(false))
+    Ok(Routing::new(target(manager, owner, &selected, hub).await?)
+        .with_dashboard(super::dashboard::SessionSink::new(
+            manager.dashboard.clone(),
+            owner,
+            session_id,
+        ))
+        .client(false))
 }
 
 impl Manager {

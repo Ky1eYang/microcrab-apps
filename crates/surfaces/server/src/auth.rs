@@ -231,6 +231,10 @@ fn same_secret(left: &str, right: &str) -> bool {
         .fold(0u8, |difference, (left, right)| difference | (left ^ right))
         == 0
 }
+pub(crate) fn has_session_cookie(headers: &HeaderMap) -> Result<bool, AuthError> {
+    cookie(headers, SESSION_COOKIE).map(|value| value.is_some())
+}
+
 fn cookie(headers: &HeaderMap, name: &str) -> Result<Option<String>, AuthError> {
     let mut found = None;
     let mut total = 0usize;

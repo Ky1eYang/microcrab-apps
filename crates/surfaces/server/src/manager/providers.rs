@@ -247,7 +247,7 @@ fn public(record: &ConfigurationRecord, p: &PrivateProvider) -> Value {
     value["discovered"] = json!(p.discovered);
     value
 }
-pub(super) async fn command(
+pub(crate) async fn command(
     manager: &Manager,
     owner: &str,
     method: &str,
@@ -445,6 +445,88 @@ pub(super) async fn choices(manager: &Manager, owner: &str) -> Result<Vec<Value>
     }
     Ok(choices)
 }
+
+#[derive(Clone)]
+pub(crate) struct RelayCandidate {
+    pub selection: ModelSelection,
+    pub resolved: ResolvedProviderSelection,
+}
+
+/// Enumerate all active model routes visible to `owner` under the server relay
+/// policy and optional per-key `allowed_providers` scope. Strictly isolates
+/// private `user:*` providers by `owner`.
+pub(crate) async fn relay_candidates(
+    manager: &Manager,
+    owner: &str,
+    key_allowed_providers: Option<&[String]>,
+) -> Result<Vec<RelayCandidate>, WireError> {
+    let config = &manager.config;
+    if !config.relay.enabled {
+        return Ok(Vec::new());
+    }
+    let provider_allowed = |provider_id: &str| {
+        config.relay.allows_provider(provider_id)
+            && key_allowed_providers.is_none_or(|list| list.iter().any(|item| item == provider_id))
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for choice in config.model_choices() {
+        if !provider_allowed(&choice.provider_id)
+            || !seen.insert((choice.provider_id.clone(), choice.id.clone()))
+        {
+            continue;
+        }
+        let Ok(resolved) = config.resolve_selection(&choice.provider_id, &choice.id, None) else {
+            continue;
+        };
+        let transport = resolved.provider.client_transport_config();
+        if config.relay.check_transport(config, &transport).is_err() {
+            continue;
+        }
+        out.push(RelayCandidate {
+            selection: ModelSelection {
+                provider_id: choice.provider_id,
+                model: choice.id,
+                variant: None,
+            },
+            resolved,
+        });
+    }
+    for r in manager
+        .configuration
+        .list(owner, "provider")
+        .await
+        .map_err(configuration_error)?
+    {
+        if !provider_allowed(&r.target) {
+            continue;
+        }
+        let p = decode(&r)?;
+        for m in merged(&p).into_iter().filter(|m| !m.disabled) {
+            if !seen.insert((r.target.clone(), m.id.clone())) {
+                continue;
+            }
+            let provider = transport(&p, Some(&m));
+            let transport_cfg = provider.client_transport_config();
+            if config.relay.check_transport(config, &transport_cfg).is_err() {
+                continue;
+            }
+            out.push(RelayCandidate {
+                selection: ModelSelection {
+                    provider_id: r.target.clone(),
+                    model: m.id,
+                    variant: None,
+                },
+                resolved: ResolvedProviderSelection {
+                    provider,
+                    options: Default::default(),
+                },
+            });
+        }
+    }
+    Ok(out)
+}
+
 pub(super) async fn resolve(
     manager: &Manager,
     owner: &str,

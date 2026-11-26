@@ -100,6 +100,8 @@ struct ListQuery {
 #[serde(deny_unknown_fields)]
 struct UploadQuery {
     #[serde(default)]
+    upload: bool,
+    #[serde(default)]
     title: Option<String>,
     #[serde(default)]
     mount_session_id: Option<String>,
@@ -157,8 +159,8 @@ async fn get_quota(
     path: Result<Path<String>, axum::extract::rejection::PathRejection>,
     request: Request,
 ) -> Result<Response, Response> {
-    let Path(user_id) =
-        path.map_err(|_| Error::path("user_id path parameter must be valid UTF-8").into_response())?;
+    let Path(user_id) = path
+        .map_err(|_| Error::path("user_id path parameter must be valid UTF-8").into_response())?;
     let principal = authorize_user(&state, request.headers(), &user_id, false)?;
     parse_query::<EmptyQuery>(request.uri()).map_err(IntoResponse::into_response)?;
     let quota = state
@@ -175,11 +177,11 @@ async fn list_objects(
     path: Result<Path<String>, axum::extract::rejection::PathRejection>,
     request: Request,
 ) -> Result<Response, Response> {
-    let Path(user_id) =
-        path.map_err(|_| Error::path("user_id path parameter must be valid UTF-8").into_response())?;
+    let Path(user_id) = path
+        .map_err(|_| Error::path("user_id path parameter must be valid UTF-8").into_response())?;
     let principal = authorize_user(&state, request.headers(), &user_id, false)?;
-    let Query(query) =
-        Query::<ListQuery>::try_from_uri(request.uri()).map_err(|e| Error::query(e).into_response())?;
+    let Query(query) = Query::<ListQuery>::try_from_uri(request.uri())
+        .map_err(|e| Error::query(e).into_response())?;
     let list = state
         .manager
         .library_list(
@@ -219,8 +221,8 @@ async fn create_object(
     path: Result<Path<String>, axum::extract::rejection::PathRejection>,
     request: Request,
 ) -> Result<Response, Response> {
-    let Path(user_id) =
-        path.map_err(|_| Error::path("user_id path parameter must be valid UTF-8").into_response())?;
+    let Path(user_id) = path
+        .map_err(|_| Error::path("user_id path parameter must be valid UTF-8").into_response())?;
     let principal = authorize_user(&state, request.headers(), &user_id, true)?;
     let permit = state
         .manager
@@ -248,7 +250,10 @@ async fn create_object(
         .unwrap_or(&content_type)
         .trim()
         .to_ascii_lowercase();
-    if mime_base == "application/json" {
+    let Query(query) = Query::<UploadQuery>::try_from_uri(request.uri())
+        .map_err(|e| Error::query(e).into_response())?;
+    // JSON create DTOs and uploaded JSON files share a content type, not an intent.
+    if mime_base == "application/json" && !query.upload {
         parse_query::<EmptyQuery>(request.uri()).map_err(IntoResponse::into_response)?;
         let bytes = to_bytes(request.into_body(), MAX_JSON_BODY)
             .await
@@ -312,10 +317,9 @@ async fn create_object(
         return Ok(Json(created).into_response());
     }
 
-    let Query(query) = Query::<UploadQuery>::try_from_uri(request.uri())
-        .map_err(|e| Error::query(e).into_response())?;
-    let media_type = canonical_mime(&mime_base)
-        .map_err(|_| Error::invalid("Unsupported Content-Type for library upload").into_response())?;
+    let media_type = canonical_mime(&mime_base).map_err(|_| {
+        Error::invalid("Unsupported Content-Type for library upload").into_response()
+    })?;
     let max_object = state.manager.config.personal_library.max_object_bytes;
     if request
         .headers()
@@ -501,8 +505,8 @@ async fn mount_session(
     path: Result<Path<(String, String, String)>, axum::extract::rejection::PathRejection>,
     request: Request,
 ) -> Result<Response, Response> {
-    let Path((user_id, ref_id, session_id)) = path
-        .map_err(|_| Error::path("Mount path parameters must be valid UTF-8").into_response())?;
+    let Path((user_id, ref_id, session_id)) =
+        path.map_err(|_| Error::path("Mount path parameters must be valid UTF-8").into_response())?;
     let principal = authorize_user(&state, request.headers(), &user_id, true)?;
     let updated = state
         .manager
@@ -518,8 +522,8 @@ async fn unmount_session(
     path: Result<Path<(String, String, String)>, axum::extract::rejection::PathRejection>,
     request: Request,
 ) -> Result<Response, Response> {
-    let Path((user_id, ref_id, session_id)) = path
-        .map_err(|_| Error::path("Mount path parameters must be valid UTF-8").into_response())?;
+    let Path((user_id, ref_id, session_id)) =
+        path.map_err(|_| Error::path("Mount path parameters must be valid UTF-8").into_response())?;
     let principal = authorize_user(&state, request.headers(), &user_id, true)?;
     let updated = state
         .manager
@@ -535,8 +539,8 @@ async fn mount_project(
     path: Result<Path<(String, String, String)>, axum::extract::rejection::PathRejection>,
     request: Request,
 ) -> Result<Response, Response> {
-    let Path((user_id, ref_id, project_id)) = path
-        .map_err(|_| Error::path("Mount path parameters must be valid UTF-8").into_response())?;
+    let Path((user_id, ref_id, project_id)) =
+        path.map_err(|_| Error::path("Mount path parameters must be valid UTF-8").into_response())?;
     let principal = authorize_user(&state, request.headers(), &user_id, true)?;
     let updated = state
         .manager
@@ -552,8 +556,8 @@ async fn unmount_project(
     path: Result<Path<(String, String, String)>, axum::extract::rejection::PathRejection>,
     request: Request,
 ) -> Result<Response, Response> {
-    let Path((user_id, ref_id, project_id)) = path
-        .map_err(|_| Error::path("Mount path parameters must be valid UTF-8").into_response())?;
+    let Path((user_id, ref_id, project_id)) =
+        path.map_err(|_| Error::path("Mount path parameters must be valid UTF-8").into_response())?;
     let principal = authorize_user(&state, request.headers(), &user_id, true)?;
     let updated = state
         .manager

@@ -273,4 +273,36 @@
   "agents": [
     // {"path": ".microcrab/agents/browser.wasm", "restore_only": false},
   ],
+
+  // Stateless OpenAI-compatible model relay (`/v1/models`, `/v1/chat/completions`)
+  // authenticated solely by owner-issued `mc_sk_...` API keys.
+  "relay": {
+    // Master toggle for the `/v1/*` model relay routes. Default: false.
+    "enabled": false,
+
+    // Permit relay keys to list and invoke Server-configured shared providers. Default: true.
+    "allow_shared_providers": true,
+
+    // Permit relay keys to list and invoke the key owner's private `user:*` providers.
+    // Strictly isolated by authenticated key owner. Default: true.
+    "allow_user_providers": true,
+
+    // Optional provider ID allowlist (max 256 entries); null permits all shared/user providers
+    // allowed by the flags above (still subject to each key's own `allowed_providers`).
+    "allowed_providers": null,
+
+    // Allow `http://` loopback upstream provider endpoints (`127.0.0.1`, `localhost`, `[::1]`)
+    // for local model gateways in development. Keep false in production. Default: false.
+    "allow_http_loopback": false,
+
+    // Global and per-owner concurrent relay admission limits (1..=128).
+    "max_concurrent": 16,
+    "max_concurrent_per_owner": 2,
+
+    // Maximum Chat Completions JSON request body size in bytes (1024..=1048576).
+    "max_request_bytes": 262144,
+
+    // Whole-request relay deadline in milliseconds (1000..=300000).
+    "deadline_ms": 120000,
+  },
 }

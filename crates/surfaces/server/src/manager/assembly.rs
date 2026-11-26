@@ -700,7 +700,7 @@ pub(super) async fn create_from(
     }
     let routing = super::model::Routing::new(
         super::model::target(manager, &record.owner, &applied_selection, hub.clone()).await?,
-    );
+    ).with_dashboard(super::dashboard::SessionSink::new(manager.dashboard.clone(), &record.owner, &record.id));
     routing.pin_epoch(recover.as_ref().map_or(0, |recover| recover.context.epoch));
     let route_admission = super::model::admission::Admission::new(
         manager,
@@ -879,7 +879,7 @@ pub(super) async fn create_from(
         ));
     let builder = if let Some(selection) = &record.review_model {
         builder.review_client(
-            super::model::review_target(manager, &record.owner, selection, hub.clone()).await?,
+            super::model::review_target(manager, &record.owner, &record.id, selection, hub.clone()).await?,
         )
     } else {
         builder

@@ -2599,7 +2599,10 @@ pub(super) async fn permission(
         });
         microcrab_permission::validate(&config).map_err(permission_validation)?;
         review_client = if let Some(selection) = config.review_model.as_ref() {
-            let owner = managed.record.lock().await.owner.clone();
+            let (owner, session_id) = {
+                let record = managed.record.lock().await;
+                (record.owner.clone(), record.id.clone())
+            };
             super::providers::resolve(
                 manager,
                 &owner,
@@ -2611,7 +2614,7 @@ pub(super) async fn permission(
             )
             .await?;
             Some(
-                super::model::review_target(manager, &owner, selection, managed.hub.clone())
+                super::model::review_target(manager, &owner, &session_id, selection, managed.hub.clone())
                     .await
                     .map_err(safe)?,
             )
