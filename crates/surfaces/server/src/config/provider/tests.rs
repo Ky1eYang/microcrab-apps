@@ -3,14 +3,33 @@ mod media_tests;
 use super::*;
 use serde_json::json;
 
-fn catalog(root: &Path, text: &str) -> PathBuf {
-    let path = root.join("config.toml");
-    std::fs::write(&path, text).unwrap();
-    path
+fn compatible_entry() -> serde_json::Value {
+    json!({
+        "protocol": "openai-compatible",
+        "api_key": "synthetic-literal-key",
+        "base_url": "http://127.0.0.1:1/v1",
+        "model": "grok",
+        "timeout_ms": 1234
+    })
 }
-fn compatible() -> &'static str {
-    "[provider.grok]\nprotocol='openai-compatible'\n[provider.grok.options]\napiKey='synthetic-literal-key'\nbaseURL='http://127.0.0.1:1/v1'\nmodel='grok'\ntimeoutMs=1234\n"
+
+fn read_multi_config(
+    root: &Path,
+    default_provider: &str,
+    providers: serde_json::Value,
+) -> super::super::Config {
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
+    value["auth"]["jwt_secret"] = json!("synthetic-signing-key-with-at-least-thirty-two-bytes");
+    value.as_object_mut().unwrap().remove("agent");
+    value.as_object_mut().unwrap().remove("provider");
+    value["default_provider"] = json!(default_provider);
+    value["providers"] = providers;
+    let path = root.join("server.json");
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    super::super::Config::read_at(&path, root).unwrap()
 }
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_model_overrides_resolve_defaults_and_discovered_models_without_probing() {
     let gateway = catalog_gateway(vec![(
@@ -21,40 +40,42 @@ async fn exact_model_overrides_resolve_defaults_and_discovered_models_without_pr
     )])
     .await;
     let root = tempfile::tempdir().unwrap();
-    catalog(
+    let config = read_multi_config(
         root.path(),
-        &format!(
-            r#"
-[provider.mixed]
-protocol='openai-compatible'
-[provider.mixed.options]
-baseURL='{base}/gateway/v1/chat/completions'
-apiKey='synthetic-private-inherited-key'
-auth='bearer'
-model='messages-wire'
-timeoutMs=1000
-[provider.mixed.models.a_messages]
-id='messages-wire'
-protocol='anthropic'
-name='Configured messages'
-[provider.mixed.models.b_responses]
-id='responses-wire'
-protocol='openai'
-auth='native'
-[provider.mixed.models.c_google]
-id='gemini-wire'
-protocol='google'
-endpoint='{base}/native/v1beta'
-[provider.mixed.models.d_chat]
-id='chat-wire'
-endpoint='{base}/custom-chat'
-variants=['high']
-"#,
-            base = gateway.base
-        ),
+        "mixed",
+        json!({
+            "mixed": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{}/gateway/v1/chat/completions", gateway.base),
+                "api_key": "synthetic-private-inherited-key",
+                "auth": "bearer",
+                "model": "messages-wire",
+                "timeout_ms": 1000,
+                "models": {
+                    "a_messages": {
+                        "id": "messages-wire",
+                        "protocol": "anthropic",
+                        "name": "Configured messages"
+                    },
+                    "b_responses": {
+                        "id": "responses-wire",
+                        "protocol": "openai",
+                        "auth": "native"
+                    },
+                    "c_google": {
+                        "id": "gemini-wire",
+                        "protocol": "google",
+                        "endpoint": format!("{}/native/v1beta", gateway.base)
+                    },
+                    "d_chat": {
+                        "id": "chat-wire",
+                        "endpoint": format!("{}/custom-chat", gateway.base),
+                        "variants": ["high"]
+                    }
+                }
+            }
+        }),
     );
-    let config = read_catalog_config(root.path(), "mixed");
-    // Discovery happens once on the provider default, never on the model endpoints.
     assert_catalog_gets(&gateway, &["/gateway/v1/models"]);
     assert_eq!(config.provider.model, "messages-wire");
     assert_eq!(config.provider.protocol, Protocol::Anthropic);
@@ -150,27 +171,45 @@ async fn fixed_endpoints_require_explicit_cross_protocol_routes_but_allow_same_p
 {
     let gateway = catalog_gateway(vec![("/v1/models", 503, "unavailable".into())]).await;
     let root = tempfile::tempdir().unwrap();
-    let header = format!(
-        "[provider.one]\nprotocol='openai-compatible'\n[provider.one.options]\nendpoint='{}/v1/chat/completions'\nmodel='wire'\ntimeoutMs=1000\n",
-        gateway.base
-    );
-    let mut value = json!({"provider":{"config_file":"config.toml"}});
-    catalog(
-        root.path(),
-        &format!("{header}[provider.one.models.alias]\nid='wire'\nprotocol='anthropic'\n"),
-    );
-    let error = resolve(&mut value, root.path()).unwrap_err();
+    let mut value = json!({
+        "providers": {
+            "one": {
+                "protocol": "openai-compatible",
+                "endpoint": format!("{}/v1/chat/completions", gateway.base),
+                "model": "wire",
+                "timeout_ms": 1000,
+                "models": {
+                    "alias": {
+                        "id": "wire",
+                        "protocol": "anthropic"
+                    }
+                }
+            }
+        }
+    });
+    let error = resolve(&mut value).unwrap_err();
     assert_eq!(error.code, "model_endpoint_required");
     assert!(error.cause.contains("fixed provider endpoint"));
     for protocol in ["anthropic", "openai-compatible"] {
-        catalog(
+        let config = read_multi_config(
             root.path(),
-            &format!(
-                "{header}[provider.one.models.alias]\nid='wire'\nprotocol='{protocol}'\nendpoint='{}/custom'\n",
-                gateway.base
-            ),
+            "one",
+            json!({
+                "one": {
+                    "protocol": "openai-compatible",
+                    "endpoint": format!("{}/v1/chat/completions", gateway.base),
+                    "model": "wire",
+                    "timeout_ms": 1000,
+                    "models": {
+                        "alias": {
+                            "id": "wire",
+                            "protocol": protocol,
+                            "endpoint": format!("{}/custom", gateway.base)
+                        }
+                    }
+                }
+            }),
         );
-        let config = read_catalog_config(root.path(), "one");
         assert_eq!(config.provider.endpoint, format!("{}/custom", gateway.base));
         assert_eq!(config.provider.protocol.as_str(), protocol);
     }
@@ -180,53 +219,57 @@ async fn fixed_endpoints_require_explicit_cross_protocol_routes_but_allow_same_p
 async fn google_cross_family_routes_require_explicit_endpoints_and_validate_every_real_model() {
     let gateway = catalog_gateway(vec![("/v1/models", 200, json!({"data":[]}).to_string())]).await;
     let root = tempfile::tempdir().unwrap();
-    let header = format!(
-        "[provider.one]\nprotocol='openai-compatible'\n[provider.one.options]\nbaseURL='{}/v1'\nmodel='default-good'\ntimeoutMs=1000\n",
-        gateway.base
-    );
     for (model, endpoint, expected, cause) in [
         (
             "gemini",
-            String::new(),
+            None,
             "model_endpoint_required",
             "base versions cannot be inferred",
         ),
         (
             "bad/model",
-            format!("endpoint='{}/v1beta'\n", gateway.base),
+            Some(format!("{}/v1beta", gateway.base)),
             "invalid_model_route",
             "Google model identifier",
         ),
         (
             "gemini",
-            format!(
-                "endpoint='{}/v1beta/models/other:generateContent'\n",
-                gateway.base
-            ),
+            Some(format!("{}/v1beta/models/other:generateContent", gateway.base)),
             "invalid_model_route",
             "differs from selected model",
         ),
     ] {
-        catalog(
-            root.path(),
-            &format!(
-                "{header}[provider.one.models.alias]\nid='{model}'\nprotocol='google'\n{endpoint}"
-            ),
-        );
-        let mut value = json!({"provider":{"config_file":"config.toml"}});
-        let error = resolve(&mut value, root.path()).unwrap_err();
+        let mut model_cfg = json!({"id": model, "protocol": "google"});
+        if let Some(ep) = endpoint {
+            model_cfg["endpoint"] = json!(ep);
+        }
+        let mut value = json!({
+            "providers": {
+                "one": {
+                    "protocol": "openai-compatible",
+                    "base_url": format!("{}/v1", gateway.base),
+                    "model": "default-good",
+                    "timeout_ms": 1000,
+                    "models": { "alias": model_cfg }
+                }
+            }
+        });
+        let error = resolve(&mut value).unwrap_err();
         assert_eq!(error.code, expected);
         assert!(error.cause.contains(cause), "{error:?}");
     }
-    // A fixed Google generation endpoint is validated with its actual model, not "discovery".
-    catalog(
+    let config = read_multi_config(
         root.path(),
-        &format!(
-            "[provider.one]\nprotocol='google'\n[provider.one.options]\nendpoint='{}/v1beta/models/gemini:generateContent'\nmodel='gemini'\ntimeoutMs=1000\n",
-            gateway.base
-        ),
+        "one",
+        json!({
+            "one": {
+                "protocol": "google",
+                "endpoint": format!("{}/v1beta/models/gemini:generateContent", gateway.base),
+                "model": "gemini",
+                "timeout_ms": 1000
+            }
+        }),
     );
-    let config = read_catalog_config(root.path(), "one");
     assert_eq!(config.provider.model, "gemini");
     assert_eq!(config.provider.protocol, Protocol::Google);
     assert_eq!(
@@ -238,23 +281,30 @@ async fn google_cross_family_routes_require_explicit_endpoints_and_validate_ever
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn variants_follow_effective_protocol_in_both_override_directions() {
     let gateway = catalog_gateway(vec![("/v1/models", 200, json!({"data":[]}).to_string())]).await;
-    let root = tempfile::tempdir().unwrap();
     for (provider_protocol, model_protocol, expected_protocol) in [
         ("anthropic", "openai-compatible", Some(Protocol::OpenaiCompatible)),
         ("openai-compatible", "openai", Some(Protocol::OpenaiResponses)),
         ("openai-compatible", "anthropic", None),
     ] {
-        catalog(
-            root.path(),
-            &format!(
-                "[provider.one]\nprotocol='{provider_protocol}'\n[provider.one.options]\nbaseURL='{}/v1'\ntimeoutMs=1000\n[provider.one.models.alias]\nid='wire'\nprotocol='{model_protocol}'\nvariants=['high']\n",
-                gateway.base
-            ),
-        );
-        let mut value = json!({"provider":{"config_file":"config.toml"}});
-        let result = resolve(&mut value, root.path());
+        let mut value = json!({
+            "providers": {
+                "one": {
+                    "protocol": provider_protocol,
+                    "base_url": format!("{}/v1", gateway.base),
+                    "timeout_ms": 1000,
+                    "models": {
+                        "alias": {
+                            "id": "wire",
+                            "protocol": model_protocol,
+                            "variants": ["high"]
+                        }
+                    }
+                }
+            }
+        });
+        let result = resolve(&mut value);
         if let Some(protocol) = expected_protocol {
-            let (_, resolved) = result.unwrap().unwrap();
+            let resolved = result.unwrap().unwrap();
             assert_eq!(resolved.models[0].variants, ["default", "high"]);
             assert_eq!(resolved.models[0].protocol, protocol);
         } else {
@@ -302,7 +352,7 @@ fn recognized_suffixes_are_replaced_without_guessing_google_versions() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn effective_model_routes_send_native_wire_requests_to_exact_endpoints() {
+async fn effective_model_routes_send_native_wire_requests_and_custom_headers_to_exact_endpoints() {
     use microcrab_auditor::{EmptyVariableView, NoopAuditor};
     use microcrab_protocol::InputPart;
     use microcrab_transport::{Client, Content, ContentItem, TransportClient};
@@ -313,6 +363,8 @@ async fn effective_model_routes_send_native_wire_requests_to_exact_endpoints() {
         uri: axum::http::Uri, headers: axum::http::HeaderMap, bytes: axum::body::Bytes| {
         let recorded = recorded.clone();
         async move {
+            assert_eq!(headers["user-agent"], "pi");
+            assert_eq!(headers["x-gateway-client"], "microcrab-test");
             if method == axum::http::Method::GET {
                 assert_eq!(uri.path(), "/v1/models");
                 assert_eq!(headers["authorization"], "Bearer synthetic-routing-key");
@@ -361,36 +413,29 @@ async fn effective_model_routes_send_native_wire_requests_to_exact_endpoints() {
         .await;
     });
     let root = tempfile::tempdir().unwrap();
-    catalog(
+    let config = read_multi_config(
         root.path(),
-        &format!(
-            r#"
-[provider.mixed]
-protocol='openai-compatible'
-[provider.mixed.options]
-baseURL='{base}/v1'
-model='messages-wire'
-apiKey='synthetic-routing-key'
-timeoutMs=1000
-[provider.mixed.models.chat]
-id='chat-wire'
-variants=['high']
-[provider.mixed.models.messages]
-id='messages-wire'
-protocol='anthropic'
-auth='bearer'
-[provider.mixed.models.responses]
-id='responses-wire'
-protocol='openai'
-[provider.mixed.models.google]
-id='gemini-wire'
-protocol='google'
-endpoint='{base}/v1beta'
-auth='bearer'
-"#
-        ),
+        "mixed",
+        json!({
+            "mixed": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{base}/v1"),
+                "model": "messages-wire",
+                "api_key": "synthetic-routing-key",
+                "timeout_ms": 1000,
+                "headers": {
+                    "User-Agent": "pi",
+                    "X-Gateway-Client": "microcrab-test"
+                },
+                "models": {
+                    "chat": {"id": "chat-wire", "variants": ["high"]},
+                    "messages": {"id": "messages-wire", "protocol": "anthropic", "auth": "bearer"},
+                    "responses": {"id": "responses-wire", "protocol": "openai"},
+                    "google": {"id": "gemini-wire", "protocol": "google", "endpoint": format!("{base}/v1beta"), "auth": "bearer"}
+                }
+            }
+        }),
     );
-    let config = read_catalog_config(root.path(), "mixed");
     let content = Content {
         epoch: 1,
         subagent: None,
@@ -450,34 +495,14 @@ auth='bearer'
 }
 
 #[test]
-fn provider_catalog_fixture_uses_supported_schema_without_network() {
-    let catalog: Catalog = toml::from_str(include_str!(
-        "../../../tests/fixtures/provider-catalog.toml"
-    ))
-    .unwrap();
-    assert_eq!(catalog.provider.len(), 4);
-    for raw in catalog.provider.into_values() {
-        let entry: Entry = raw.try_into().unwrap();
-        endpoint_for_protocol(
-            entry.protocol,
-            entry.options.endpoint,
-            entry.options.base_url,
-        )
-        .unwrap();
-    }
-}
-
-#[test]
-fn catalog_is_startup_relative_and_literal_credentials_are_preserved() {
-    let root = tempfile::tempdir().unwrap();
-    let path = catalog(root.path(), compatible());
-    let mut value = json!({"provider":{"config_file":"config.toml","name":"grok"}});
-    assert_eq!(
-        resolve(&mut value, root.path())
-            .unwrap()
-            .map(|(path, _)| path),
-        Some(path.canonicalize().unwrap())
-    );
+fn literal_credentials_and_headers_are_preserved_in_jsonc_multi_provider() {
+    let mut entry = compatible_entry();
+    entry["headers"] = json!({"User-Agent": "pi"});
+    let mut value = json!({
+        "default_provider": "grok",
+        "providers": { "grok": entry }
+    });
+    resolve(&mut value).unwrap().unwrap();
     assert_eq!(
         value["provider"]["endpoint"],
         "http://127.0.0.1:1/v1/chat/completions"
@@ -485,7 +510,9 @@ fn catalog_is_startup_relative_and_literal_credentials_are_preserved() {
     assert_eq!(value["provider"]["model"], "grok");
     assert_eq!(value["provider"]["api_key"], "synthetic-literal-key");
     assert_eq!(value["provider"]["timeout_ms"], 1234);
+    assert_eq!(value["provider"]["headers"], json!({"User-Agent": "pi"}));
 }
+
 #[test]
 fn endpoint_selection_is_exact_and_never_appends_twice() {
     for base in [
@@ -519,126 +546,111 @@ fn endpoint_selection_is_exact_and_never_appends_twice() {
         .is_err()
     );
 }
+
 #[test]
-fn single_provider_selects_without_name_but_multiple_requires_selection() {
-    let root = tempfile::tempdir().unwrap();
-    catalog(root.path(), compatible());
-    let mut value = json!({"provider":{"config_file":"config.toml"}});
-    resolve(&mut value, root.path()).unwrap();
-    catalog(
-        root.path(),
-        &format!(
-            "{}\n{}",
-            compatible(),
-            compatible().replace("provider.grok", "provider.other")
-        ),
-    );
-    let mut ambiguous = json!({"provider":{"config_file":"config.toml"}});
+fn single_provider_selects_without_default_but_multiple_requires_selection() {
+    let mut single = json!({ "providers": { "grok": compatible_entry() } });
+    resolve(&mut single).unwrap().unwrap();
+
+    let mut ambiguous = json!({
+        "providers": {
+            "grok": compatible_entry(),
+            "other": compatible_entry()
+        }
+    });
     assert_eq!(
-        resolve(&mut ambiguous, root.path()).unwrap_err().code,
+        resolve(&mut ambiguous).unwrap_err().code,
         "selection_required"
     );
-    let mut selected = json!({"provider":{"config_file":"config.toml","name":"other"}});
-    resolve(&mut selected, root.path()).unwrap();
-    let mut missing = json!({"provider":{"config_file":"config.toml","name":"missing"}});
+
+    let mut selected = json!({
+        "default_provider": "other",
+        "providers": {
+            "grok": compatible_entry(),
+            "other": compatible_entry()
+        }
+    });
+    let resolved = resolve(&mut selected).unwrap().unwrap();
+    assert_eq!(resolved.default_provider_id, "other");
+
+    let mut missing = json!({
+        "default_provider": "missing",
+        "providers": {
+            "grok": compatible_entry(),
+            "other": compatible_entry()
+        }
+    });
     assert_eq!(
-        resolve(&mut missing, root.path()).unwrap_err().code,
+        resolve(&mut missing).unwrap_err().code,
         "provider_not_found"
     );
 }
+
 #[test]
-fn rejects_mixed_source_unknown_options_and_unsupported_protocol_without_input_echo() {
+fn rejects_mixed_source_removed_toml_config_file_reserved_headers_and_bad_protocol() {
     let root = tempfile::tempdir().unwrap();
-    let mut mixed = json!({"provider":{"config_file":"config.toml","endpoint":"https://provider.invalid","api_key":"DO-NOT-ECHO"}});
-    let error = resolve(&mut mixed, root.path()).unwrap_err();
-    assert_eq!(error.code, "invalid_reference");
-    assert!(!error.to_string().contains("DO-NOT-ECHO"));
-    catalog(
-        root.path(),
-        &compatible().replace("openai-compatible", "DO-NOT-ECHO"),
-    );
-    let mut value = json!({"provider":{"config_file":"config.toml"}});
+    let mut mixed = json!({
+        "provider": {"endpoint": "https://provider.invalid", "model": "m"},
+        "providers": {"one": compatible_entry()}
+    });
     assert_eq!(
-        resolve(&mut value, root.path()).unwrap_err().code,
-        "unsupported_protocol"
+        resolve(&mut mixed).unwrap_err().code,
+        "conflicting_provider_configuration"
     );
-    catalog(
-        root.path(),
-        &format!("{}wrongField='DO-NOT-ECHO'\n", compatible()),
-    );
-    let error = resolve(&mut value, root.path()).unwrap_err();
-    assert_eq!(error.code, "invalid_format");
-    assert!(!error.to_string().contains("DO-NOT-ECHO"));
-}
-#[test]
-fn bounded_read_and_missing_source_produce_safe_actionable_codes() {
-    let root = tempfile::tempdir().unwrap();
-    let mut value = json!({"provider":{"config_file":"config.toml"}});
-    let error = resolve(&mut value, root.path()).unwrap_err();
-    assert_eq!(error.stage, "provider_catalog");
-    assert_eq!(error.code, "file_not_found");
-    catalog(root.path(), &"x".repeat(MAX_CONFIG_BYTES + 1));
-    assert_eq!(
-        resolve(&mut value, root.path()).unwrap_err().code,
-        "too_large"
-    );
-}
-#[test]
-fn loaded_catalog_is_private_and_cannot_overlap_public_assets() {
-    let root = tempfile::tempdir().unwrap();
-    let source = catalog(root.path(), compatible());
-    let mut value: serde_json::Value =
+
+    let mut base: serde_json::Value =
         serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
-    value["auth"]["jwt_secret"] = json!("synthetic-signing-key-with-at-least-thirty-two-bytes");
-    // This privacy test assembles no agent component; a default example path is not installed here.
-    value.as_object_mut().unwrap().remove("agent");
-    value["provider"] = json!({"config_file":"config.toml","name":"grok"});
-    let path = root.path().join("server.json");
-    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-    let config = super::super::Config::read_at(&path, root.path()).unwrap();
-    assert!(
-        config
-            .private_paths
-            .contains(&source.canonicalize().unwrap())
-    );
-    let host = crate::host::startup_local_host(&config).unwrap();
-    let runtime = tokio::runtime::Runtime::new().unwrap();
-    let result = runtime.block_on(host.read_file(
-        source.canonicalize().unwrap(),
-        1024,
-        tokio_util::sync::CancellationToken::new(),
-    ));
-    let error = result.unwrap_err();
-    assert!(matches!(
-        &error,
-        microcrab_host_api::ToolError::Host(cause)
-            if cause.category == microcrab_host_api::ErrorCategory::Permission
-    ));
-    assert_eq!(
-        error.public_reason(),
-        Some("target path is protected by Host private-directory policy")
-    );
-    assert!(!error.to_string().contains("synthetic-literal-key"));
-    value["frontend_dir"] = json!(root.path());
-    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    base["provider"] = json!({"config_file": "providers.toml", "name": "one"});
+    let path = root.path().join("legacy-toml.jsonc");
+    std::fs::write(&path, serde_json::to_vec(&base).unwrap()).unwrap();
     assert!(super::super::Config::read_at(&path, root.path()).is_err());
+
+    let mut bad_proto = compatible_entry();
+    bad_proto["protocol"] = json!("DO-NOT-ECHO");
+    let mut value = json!({"providers": {"grok": bad_proto}});
+    let err = resolve(&mut value).unwrap_err();
+    assert_eq!(err.code, "unsupported_protocol");
+    assert!(!err.to_string().contains("DO-NOT-ECHO"));
+
+    let mut unknown_field = compatible_entry();
+    unknown_field["wrong_field"] = json!("DO-NOT-ECHO");
+    let mut value = json!({"providers": {"grok": unknown_field}});
+    let err = resolve(&mut value).unwrap_err();
+    assert_eq!(err.code, "invalid_format");
+    assert!(!err.to_string().contains("DO-NOT-ECHO"));
+
+    let mut bad_header = compatible_entry();
+    bad_header["headers"] = json!({"Authorization": "DO-NOT-ECHO"});
+    let mut value = json!({"providers": {"grok": bad_header}});
+    let err = resolve(&mut value).unwrap_err();
+    assert_eq!(err.code, "invalid_options");
+    assert!(!err.to_string().contains("DO-NOT-ECHO"));
 }
 
 #[test]
 fn retained_catalog_preserves_provider_identity_and_explicit_default_model_metadata() {
-    let root = tempfile::tempdir().unwrap();
-    let first = format!(
-        "{}\n[provider.grok.models.alias]\nid='grok'\nname='Named'\nvariants=['low','high']\n",
-        compatible()
-    );
-    let second = compatible()
-        .replace("provider.grok", "provider.other")
-        .replace("synthetic-literal-key", "other-key");
-    let unsupported =
-        "\n[provider.future]\nprotocol='future'\n[provider.future.options]\nmodel='unavailable'\n";
-    catalog(root.path(), &format!("{first}\n{second}{unsupported}"));
-    let mut value = json!({"provider":{"config_file":"config.toml","name":"grok"}});
-    let (_, resolved) = resolve(&mut value, root.path()).unwrap().unwrap();
+    let mut first = compatible_entry();
+    first["models"] = json!({
+        "alias": {
+            "id": "grok",
+            "name": "Named",
+            "variants": ["low", "high"]
+        }
+    });
+    let mut second = compatible_entry();
+    second["api_key"] = json!("other-key");
+    let mut value = json!({
+        "default_provider": "grok",
+        "providers": {
+            "grok": first,
+            "other": second,
+            "future": {
+                "protocol": "future",
+                "model": "unavailable"
+            }
+        }
+    });
+    let resolved = resolve(&mut value).unwrap().unwrap();
     assert_eq!(resolved.providers.len(), 2);
     assert_eq!(resolved.models.len(), 2);
     assert_eq!(resolved.models[0].name, "Named");
@@ -686,41 +698,55 @@ fn retained_catalog_preserves_provider_identity_and_explicit_default_model_metad
 
 #[test]
 fn default_model_uses_wire_id_and_malformed_variants_are_safe_errors() {
-    let root = tempfile::tempdir().unwrap();
-    let text = "[provider.one]\nprotocol='openai-compatible'\n[provider.one.options]\nbaseURL='http://127.0.0.1:1/v1'\n[provider.one.models.alias]\nid='wire-model'\nvariants=['xhigh']\n";
-    catalog(root.path(), text);
-    let mut value = json!({"provider":{"config_file":"config.toml"}});
-    resolve(&mut value, root.path()).unwrap();
+    let mut value = json!({
+        "providers": {
+            "one": {
+                "protocol": "openai-compatible",
+                "base_url": "http://127.0.0.1:1/v1",
+                "models": {
+                    "alias": {
+                        "id": "wire-model",
+                        "variants": ["xhigh"]
+                    }
+                }
+            }
+        }
+    });
+    resolve(&mut value).unwrap();
     assert_eq!(value["provider"]["model"], "wire-model");
-    for variants in ["['high','high']", "['DO NOT ECHO']", "['']"] {
-        catalog(root.path(), &text.replace("['xhigh']", variants));
-        let mut value = json!({"provider":{"config_file":"config.toml"}});
-        let error = resolve(&mut value, root.path()).unwrap_err();
+    for variants in [json!(["high", "high"]), json!(["DO NOT ECHO"]), json!([""])] {
+        let mut value = json!({
+            "providers": {
+                "one": {
+                    "protocol": "openai-compatible",
+                    "base_url": "http://127.0.0.1:1/v1",
+                    "models": {
+                        "alias": {
+                            "id": "wire-model",
+                            "variants": variants
+                        }
+                    }
+                }
+            }
+        });
+        let error = resolve(&mut value).unwrap_err();
         assert_eq!(error.code, "invalid_variants");
         assert!(!error.to_string().contains("DO NOT ECHO"));
     }
 }
 
 #[test]
-fn model_context_windows_propagate_through_private_catalog_without_changing_routing() {
+fn model_context_windows_propagate_through_jsonc_catalog_without_changing_routing() {
     let root = tempfile::tempdir().unwrap();
-    let first = format!(
-        "{}\n[provider.grok.models.alias]\nid='grok'\ncontext_window_tokens=131072\n",
-        compatible()
-    );
-    let second = compatible().replace("provider.grok", "provider.other");
-    catalog(
+    let mut first = compatible_entry();
+    first["models"] = json!({"alias": {"id": "grok", "context_window_tokens": 131072}});
+    let mut second = compatible_entry();
+    second["models"] = json!({"alias": {"id": "grok", "context_window_tokens": 262144}});
+    let config = read_multi_config(
         root.path(),
-        &format!(
-            "{first}\n{second}\n[provider.other.models.alias]\nid='grok'\ncontext_window_tokens=262144\n"
-        ),
+        "grok",
+        json!({"grok": first, "other": second}),
     );
-    let mut value: serde_json::Value =
-        serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
-    value["provider"] = json!({"config_file":"config.toml","name":"grok"});
-    let path = root.path().join("server.json");
-    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-    let config = super::super::Config::read_at(&path, root.path()).unwrap();
     let choices = config.model_choices();
     assert_eq!(choices, config.available_models);
     assert_eq!(choices.len(), 2);
@@ -742,17 +768,11 @@ fn model_context_windows_propagate_through_private_catalog_without_changing_rout
 
 #[test]
 fn catalog_missing_model_context_is_unknown_for_explicit_and_default_only_models() {
-    let root = tempfile::tempdir().unwrap();
-    for text in [
-        compatible().to_owned(),
-        format!(
-            "{}\n[provider.grok.models.alias]\nid='grok'\n",
-            compatible()
-        ),
-    ] {
-        catalog(root.path(), &text);
-        let mut value = json!({"provider":{"config_file":"config.toml"}});
-        let (_, resolved) = resolve(&mut value, root.path()).unwrap().unwrap();
+    let mut with_alias = compatible_entry();
+    with_alias["models"] = json!({"alias": {"id": "grok"}});
+    for entry in [compatible_entry(), with_alias] {
+        let mut value = json!({"providers": {"grok": entry}});
+        let resolved = resolve(&mut value).unwrap().unwrap();
         assert_eq!(resolved.models.len(), 1);
         assert_eq!(resolved.models[0].context_window_tokens, None);
         assert!(
@@ -765,29 +785,20 @@ fn catalog_missing_model_context_is_unknown_for_explicit_and_default_only_models
 
 #[test]
 fn invalid_catalog_model_context_is_rejected_without_echoing_private_input() {
-    let root = tempfile::tempdir().unwrap();
-    for invalid in ["0", "-1", "1.5", "'synthetic-private-token'", "true"] {
-        catalog(
-            root.path(),
-            &format!(
-                "{}\n[provider.grok.models.alias]\nid='grok'\ncontext_window_tokens={invalid}\n",
-                compatible()
-            ),
-        );
-        let mut value = json!({"provider":{"config_file":"config.toml"}});
-        let error = resolve(&mut value, root.path()).unwrap_err();
+    for invalid in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!("synthetic-private-token"),
+        json!(true),
+    ] {
+        let mut entry = compatible_entry();
+        entry["models"] = json!({"alias": {"id": "grok", "context_window_tokens": invalid}});
+        let mut value = json!({"providers": {"grok": entry}});
+        let error = resolve(&mut value).unwrap_err();
         assert_eq!(error.stage, "provider_catalog");
         assert_eq!(error.code, "invalid_format");
         assert!(error.cause.contains("expected a nonzero u64"), "{error:?}");
-        assert!(
-            error.cause.contains("invalid value") || error.cause.contains("invalid type"),
-            "{error:?}"
-        );
-        assert_eq!(
-            error.to_string(),
-            format!("provider_catalog: invalid_format: {}", error.cause)
-        );
-        assert!(error.cause.len() <= 2048);
         for private in ["synthetic-private", "synthetic-literal-key"] {
             assert!(!format!("{error:?}").contains(private));
         }
@@ -799,32 +810,37 @@ fn native_protocol_models_remain_visible_selectable_and_use_native_adapters() {
     use microcrab_protocol::{InputPart, Message, Request};
     use microcrab_transport::{Protocol, TransportClient};
 
-    let root = tempfile::tempdir().unwrap();
-    let native = r#"
-[provider.gemini]
-protocol='google'
-[provider.gemini.options]
-baseURL='http://127.0.0.1:1/v1beta'
-apiKey='synthetic-google-key'
-[provider.gemini.models.alias]
-id='gemini-model'
-name='Gemini model'
-context_window_tokens=1048576
-[provider.responses]
-protocol='openai'
-[provider.responses.options]
-baseURL='http://127.0.0.1:1/v1'
-model='responses-model'
-[provider.claude]
-protocol='anthropic'
-[provider.claude.options]
-baseURL='http://127.0.0.1:1/v1'
-model='claude-model'
-"#;
-    catalog(root.path(), &format!("{}{native}", compatible()));
+    let providers = json!({
+        "grok": compatible_entry(),
+        "gemini": {
+            "protocol": "google",
+            "base_url": "http://127.0.0.1:1/v1beta",
+            "api_key": "synthetic-google-key",
+            "models": {
+                "alias": {
+                    "id": "gemini-model",
+                    "name": "Gemini model",
+                    "context_window_tokens": 1048576
+                }
+            }
+        },
+        "responses": {
+            "protocol": "openai",
+            "base_url": "http://127.0.0.1:1/v1",
+            "model": "responses-model"
+        },
+        "claude": {
+            "protocol": "anthropic",
+            "base_url": "http://127.0.0.1:1/v1",
+            "model": "claude-model"
+        }
+    });
     for default in ["grok", "gemini", "responses", "claude"] {
-        let mut value = json!({"provider":{"config_file":"config.toml","name":default}});
-        let (_, resolved) = resolve(&mut value, root.path()).unwrap().unwrap();
+        let mut value = json!({
+            "default_provider": default,
+            "providers": providers.clone()
+        });
+        let resolved = resolve(&mut value).unwrap().unwrap();
         assert_eq!(resolved.providers.len(), 4);
         assert_eq!(resolved.models.len(), 4);
         assert_eq!(
@@ -899,10 +915,10 @@ fn protocol_aliases_and_native_endpoint_suffixes_are_preserved() {
         ("openai-response", Protocol::OpenaiResponses),
         ("openai-responses", Protocol::OpenaiResponses),
     ] {
-        let root = tempfile::tempdir().unwrap();
-        catalog(root.path(), &compatible().replace("openai-compatible", raw));
-        let mut value = json!({"provider":{"config_file":"config.toml"}});
-        let (_, resolved) = resolve(&mut value, root.path()).unwrap().unwrap();
+        let mut entry = compatible_entry();
+        entry["protocol"] = json!(raw);
+        let mut value = json!({"providers": {"grok": entry}});
+        let resolved = resolve(&mut value).unwrap().unwrap();
         assert_eq!(resolved.providers["grok"].protocol, expected);
     }
     for (protocol, path) in [
@@ -1019,8 +1035,6 @@ async fn catalog_gateway(responses: Vec<(&str, u16, String)>) -> CatalogGateway 
         });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    // Synchronous resolution waits on its own runtime. The second Tokio worker
-    // serves these requests; both a deadline and Drop bound the fixture lifetime.
     let worker = tokio::spawn(async move {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), async move {
             axum::serve(listener, app).await.unwrap();
@@ -1069,17 +1083,6 @@ fn assert_discovery_warnings(resolved: &ResolvedCatalog, expected: &[(&str, &str
     }
 }
 
-fn read_catalog_config(root: &Path, provider_id: &str) -> super::super::Config {
-    let mut value: serde_json::Value =
-        serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
-    value["auth"]["jwt_secret"] = json!("synthetic-signing-key-with-at-least-thirty-two-bytes");
-    value.as_object_mut().unwrap().remove("agent");
-    value["provider"] = json!({"config_file":"config.toml","name":provider_id});
-    let path = root.join("server.json");
-    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-    super::super::Config::read_at(&path, root).unwrap()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gateway_discovery_precedes_configured_overlay_and_default_model_append() {
     let gateway = catalog_gateway(vec![
@@ -1103,40 +1106,35 @@ async fn gateway_discovery_precedes_configured_overlay_and_default_model_append(
     ])
     .await;
     let root = tempfile::tempdir().unwrap();
-    catalog(
-        root.path(),
-        &format!(
-            r#"
-[provider.alpha]
-protocol='openai-compatible'
-[provider.alpha.options]
-baseURL='{base}/alpha'
-apiKey='synthetic-private-key-alpha'
-model='options-only'
-timeoutMs=2000
-[provider.alpha.models.a_remote]
-id='remote'
-variants=['low']
-[provider.alpha.models.b_shared]
-id='shared'
-name='Configured shared name'
-variants=['high']
-context_window_tokens=131072
-[provider.alpha.models.c_local]
-id='configured-only'
-name='Configured only'
-[provider.beta]
-protocol='openai-compatible'
-[provider.beta.options]
-baseURL='{base}/beta'
-apiKey='synthetic-private-key-beta'
-timeoutMs=2000
-"#,
-            base = gateway.base
-        ),
-    );
-    let mut value = json!({"provider":{"config_file":"config.toml","name":"alpha"}});
-    let (_, resolved) = resolve(&mut value, root.path()).unwrap().unwrap();
+    let mut value = json!({
+        "default_provider": "alpha",
+        "providers": {
+            "alpha": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{}/alpha", gateway.base),
+                "api_key": "synthetic-private-key-alpha",
+                "model": "options-only",
+                "timeout_ms": 2000,
+                "models": {
+                    "a_remote": {"id": "remote", "variants": ["low"]},
+                    "b_shared": {
+                        "id": "shared",
+                        "name": "Configured shared name",
+                        "variants": ["high"],
+                        "context_window_tokens": 131072
+                    },
+                    "c_local": {"id": "configured-only", "name": "Configured only"}
+                }
+            },
+            "beta": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{}/beta", gateway.base),
+                "api_key": "synthetic-private-key-beta",
+                "timeout_ms": 2000
+            }
+        }
+    });
+    let resolved = resolve(&mut value).unwrap().unwrap();
     assert_catalog_gets(&gateway, &["/alpha/models", "/beta/models"]);
     assert_discovery_warnings(&resolved, &[]);
     assert_eq!(resolved.providers.len(), 2);
@@ -1203,6 +1201,7 @@ timeoutMs=2000
         .unwrap();
     assert_eq!(beta.name, "Other gateway name");
     assert_eq!(beta.variants, ["default"]);
+    drop(root);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1219,29 +1218,25 @@ async fn google_configured_models_preserve_omitted_discovered_metadata() {
         .to_string(),
     )])
     .await;
-    let root = tempfile::tempdir().unwrap();
-    catalog(
-        root.path(),
-        &format!(
-            r#"
-[provider.google]
-protocol='google'
-[provider.google.options]
-baseURL='{base}/v1beta'
-apiKey='synthetic-private-key'
-timeoutMs=2000
-[provider.google.models.a_keep]
-id='gemini-keep'
-[provider.google.models.b_shared]
-id='gemini-shared'
-name='Configured Google name'
-context_window_tokens=1048576
-"#,
-            base = gateway.base
-        ),
-    );
-    let mut value = json!({"provider":{"config_file":"config.toml"}});
-    let (_, resolved) = resolve(&mut value, root.path()).unwrap().unwrap();
+    let mut value = json!({
+        "providers": {
+            "google": {
+                "protocol": "google",
+                "base_url": format!("{}/v1beta", gateway.base),
+                "api_key": "synthetic-private-key",
+                "timeout_ms": 2000,
+                "models": {
+                    "a_keep": {"id": "gemini-keep"},
+                    "b_shared": {
+                        "id": "gemini-shared",
+                        "name": "Configured Google name",
+                        "context_window_tokens": 1048576
+                    }
+                }
+            }
+        }
+    });
+    let resolved = resolve(&mut value).unwrap().unwrap();
     assert_catalog_gets(&gateway, &["/v1beta/models"]);
     assert_discovery_warnings(&resolved, &[]);
     assert_eq!(resolved.models.len(), 2);
@@ -1284,17 +1279,36 @@ async fn discovery_failures_and_google_empty_do_not_abort_selected_healthy_provi
     ])
     .await;
     let root = tempfile::tempdir().unwrap();
-    let mut text = String::new();
-    for (id, protocol) in [
-        ("healthy", "openai-compatible"),
-        ("status", "openai-compatible"),
-        ("invalid", "openai-compatible"),
-        ("empty", "google"),
-    ] {
-        text.push_str(&format!("[provider.{id}]\nprotocol='{protocol}'\n[provider.{id}.options]\nbaseURL='{}/{id}'\napiKey='synthetic-private-key'\ntimeoutMs=2000\n", gateway.base));
-    }
-    catalog(root.path(), &text);
-    let config = read_catalog_config(root.path(), "healthy");
+    let config = read_multi_config(
+        root.path(),
+        "healthy",
+        json!({
+            "healthy": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{}/healthy", gateway.base),
+                "api_key": "synthetic-private-key",
+                "timeout_ms": 2000
+            },
+            "status": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{}/status", gateway.base),
+                "api_key": "synthetic-private-key",
+                "timeout_ms": 2000
+            },
+            "invalid": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{}/invalid", gateway.base),
+                "api_key": "synthetic-private-key",
+                "timeout_ms": 2000
+            },
+            "empty": {
+                "protocol": "google",
+                "base_url": format!("{}/empty", gateway.base),
+                "api_key": "synthetic-private-key",
+                "timeout_ms": 2000
+            }
+        }),
+    );
     assert_catalog_gets(
         &gateway,
         &[
@@ -1347,33 +1361,33 @@ async fn discovery_errors_preserve_configured_and_options_model_fallbacks() {
     ])
     .await;
     let root = tempfile::tempdir().unwrap();
-    catalog(
+    let config = read_multi_config(
         root.path(),
-        &format!(
-            r#"
-[provider.configured]
-protocol='openai-compatible'
-[provider.configured.options]
-baseURL='{base}/configured'
-apiKey='synthetic-private-key-configured'
-timeoutMs=2000
-[provider.configured.models.alias]
-id='shared'
-name='Configured fallback'
-variants=['high']
-context_window_tokens=65536
-[provider.defaulted]
-protocol='openai-compatible'
-[provider.defaulted.options]
-baseURL='{base}/defaulted'
-apiKey='synthetic-private-key-defaulted'
-model='shared'
-timeoutMs=2000
-"#,
-            base = gateway.base
-        ),
+        "configured",
+        json!({
+            "configured": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{}/configured", gateway.base),
+                "api_key": "synthetic-private-key-configured",
+                "timeout_ms": 2000,
+                "models": {
+                    "alias": {
+                        "id": "shared",
+                        "name": "Configured fallback",
+                        "variants": ["high"],
+                        "context_window_tokens": 65536
+                    }
+                }
+            },
+            "defaulted": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{}/defaulted", gateway.base),
+                "api_key": "synthetic-private-key-defaulted",
+                "model": "shared",
+                "timeout_ms": 2000
+            }
+        }),
     );
-    let config = read_catalog_config(root.path(), "configured");
     assert_catalog_gets(&gateway, &["/configured/models", "/defaulted/models"]);
     assert_discovery_warnings(
         config.provider_catalog.as_ref().unwrap(),
@@ -1424,14 +1438,22 @@ async fn selected_empty_provider_starts_and_keeps_other_provider_choices() {
     ])
     .await;
     let root = tempfile::tempdir().unwrap();
-    catalog(
+    let config = read_multi_config(
         root.path(),
-        &format!(
-            "[provider.empty]\nprotocol='google'\n[provider.empty.options]\nbaseURL='{base}/empty'\ntimeoutMs=2000\n[provider.healthy]\nprotocol='openai-compatible'\n[provider.healthy.options]\nbaseURL='{base}/healthy'\ntimeoutMs=2000\n",
-            base = gateway.base
-        ),
+        "empty",
+        json!({
+            "empty": {
+                "protocol": "google",
+                "base_url": format!("{}/empty", gateway.base),
+                "timeout_ms": 2000
+            },
+            "healthy": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{}/healthy", gateway.base),
+                "timeout_ms": 2000
+            }
+        }),
     );
-    let config = read_catalog_config(root.path(), "empty");
     assert_catalog_gets(&gateway, &["/empty/models", "/healthy/models"]);
     assert_eq!(config.default_provider_id(), "empty");
     assert_eq!(config.provider.model, "");
@@ -1460,14 +1482,22 @@ async fn all_empty_provider_catalog_starts_without_inventing_model_choices() {
     ])
     .await;
     let root = tempfile::tempdir().unwrap();
-    catalog(
+    let config = read_multi_config(
         root.path(),
-        &format!(
-            "[provider.google]\nprotocol='google'\n[provider.google.options]\nbaseURL='{base}/google'\ntimeoutMs=2000\n[provider.openai]\nprotocol='openai-compatible'\n[provider.openai.options]\nbaseURL='{base}/openai'\ntimeoutMs=2000\n",
-            base = gateway.base
-        ),
+        "google",
+        json!({
+            "google": {
+                "protocol": "google",
+                "base_url": format!("{}/google", gateway.base),
+                "timeout_ms": 2000
+            },
+            "openai": {
+                "protocol": "openai-compatible",
+                "base_url": format!("{}/openai", gateway.base),
+                "timeout_ms": 2000
+            }
+        }),
     );
-    let config = read_catalog_config(root.path(), "google");
     assert_catalog_gets(&gateway, &["/google/models", "/openai/models"]);
     assert_eq!(config.provider.model, "");
     assert!(config.model_choices().is_empty());

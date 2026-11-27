@@ -1,4 +1,4 @@
-//! Private provider catalog resolution happens once before application assembly.
+//! Private multi-provider configuration resolution happens once before application assembly.
 //! Inputs and parser errors may contain credentials; public errors use static codes.
 use super::{ConfigError, ModelChoice, Provider};
 mod discovery;
@@ -7,7 +7,7 @@ use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     io::Read,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 pub(crate) fn discover_models(
@@ -46,24 +46,31 @@ pub(super) fn read_private(path: &Path, stage: &'static str) -> Result<String, C
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Reference {
-    config_file: PathBuf,
-    #[serde(default)]
-    name: Option<String>,
-}
-#[derive(Deserialize)]
-struct Catalog {
-    #[serde(default)]
-    provider: BTreeMap<String, toml::Value>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Entry {
+    #[serde(default = "super::provider_protocol")]
     protocol: Protocol,
-    options: Options,
+    #[serde(default)]
+    auth: AuthMode,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default = "super::timeout")]
+    timeout_ms: u64,
+    #[serde(default = "super::response_budget")]
+    max_response_bytes: usize,
+    #[serde(default)]
+    google_function_response_media: bool,
     #[serde(default)]
     models: BTreeMap<String, ModelMeta>,
 }
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelMeta {
@@ -83,24 +90,6 @@ struct ModelMeta {
     variants: Vec<String>,
     #[serde(default, deserialize_with = "super::deserialize_context_window_tokens")]
     context_window_tokens: Option<u64>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Options {
-    #[serde(default)]
-    auth: AuthMode,
-    #[serde(default, rename = "baseURL")]
-    base_url: Option<String>,
-    #[serde(default)]
-    endpoint: Option<String>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default, rename = "apiKey")]
-    api_key: Option<String>,
-    #[serde(default = "super::timeout", rename = "timeoutMs")]
-    timeout_ms: u64,
-    #[serde(default = "super::response_budget", rename = "maxResponseBytes")]
-    max_response_bytes: usize,
 }
 
 /// Immutable credential-bearing routing data; never serialize or debug-print it.
@@ -122,94 +111,105 @@ impl std::fmt::Debug for ResolvedCatalog {
 
 pub(super) fn resolve(
     value: &mut serde_json::Value,
-    startup: &Path,
-) -> Result<Option<(PathBuf, ResolvedCatalog)>, ConfigError> {
-    let Some(provider_val) = value.get("provider") else {
+) -> Result<Option<ResolvedCatalog>, ConfigError> {
+    let Some(obj) = value.as_object_mut() else {
         return Ok(None);
     };
-    if provider_val.get("config_file").is_none() {
+    let has_single = obj.contains_key("provider");
+    let has_providers = obj.contains_key("providers");
+    let has_default = obj.contains_key("default_provider");
+    if !has_providers && !has_default {
         return Ok(None);
     }
-    let reference: Reference = serde_json::from_value(provider_val.clone()).map_err(|error| {
-        ConfigError::with_cause(
+    if has_single {
+        return Err(ConfigError::with_cause(
             "provider_catalog",
-            "invalid_reference",
-            &microcrab_protocol::diagnostic::json_reason(&error),
-        )
-    })?;
-    if reference.config_file.as_os_str().is_empty() {
-        return Err(ConfigError::new("provider_catalog", "invalid_reference"));
+            "conflicting_provider_configuration",
+            "configure either single `provider` or multi-provider `providers` + `default_provider`, not both",
+        ));
     }
-    let path = if reference.config_file.is_absolute() {
-        reference.config_file
-    } else {
-        startup.join(reference.config_file)
-    };
-    let path = path
-        .canonicalize()
-        .map_err(|error| ConfigError::io_source("provider_catalog", &error))?;
-    let text = read_private(&path, "provider_catalog")?;
-    let catalog: Catalog = toml::from_str(&text).map_err(|error: toml::de::Error| {
-        ConfigError::with_cause(
+    if obj
+        .get("available_models")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| !arr.is_empty())
+    {
+        return Err(ConfigError::with_cause(
+            "provider_catalog",
+            "conflicting_provider_configuration",
+            "available_models cannot be populated alongside `providers`; configure per-provider `models` instead",
+        ));
+    }
+    let default_val = obj.remove("default_provider");
+    let raw_providers = obj
+        .remove("providers")
+        .ok_or_else(|| ConfigError::new("provider_catalog", "missing_providers"))?;
+    let serde_json::Value::Object(provider_entries) = raw_providers else {
+        return Err(ConfigError::with_cause(
             "provider_catalog",
             "invalid_format",
-            &format!("{}; byte_range={:?}", error.message(), error.span()),
-        )
-    })?;
-    if catalog.provider.keys().any(|id| id.starts_with("user:")) {
+            "`providers` must be an object keyed by provider ID",
+        ));
+    };
+    let selected_default = match default_val {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => Some(name),
+        Some(_) => return Err(ConfigError::new("provider_catalog", "invalid_reference")),
+    };
+    if provider_entries.keys().any(|id| id.starts_with("user:")) {
         return Err(ConfigError::with_cause(
             "provider_catalog",
             "reserved_provider_namespace",
             "Shared startup Provider IDs must not start with user:; that namespace belongs to authenticated owner Providers",
         ));
     }
-    let name = match reference.name {
-        Some(name) if !name.is_empty() => name,
-        None if catalog.provider.len() == 1 => catalog
-            .provider
+    let name = match selected_default {
+        Some(name) => name,
+        None if provider_entries.len() == 1 => provider_entries
             .keys()
             .next()
             .cloned()
             .ok_or_else(|| ConfigError::new("provider_catalog", "empty"))?,
-        None if catalog.provider.is_empty() => {
+        None if provider_entries.is_empty() => {
             return Err(ConfigError::new("provider_catalog", "empty"));
         }
         None => return Err(ConfigError::new("provider_catalog", "selection_required")),
-        Some(_) => return Err(ConfigError::new("provider_catalog", "invalid_reference")),
     };
-    let selected = catalog
-        .provider
+    let selected = provider_entries
         .get(&name)
         .ok_or_else(|| ConfigError::new("provider_catalog", "provider_not_found"))?;
     if protocol(selected).is_none() {
         return Err(ConfigError::new("provider_catalog", "unsupported_protocol"));
     }
+
     let mut providers = BTreeMap::new();
     let mut routes = BTreeMap::new();
     let mut models = Vec::new();
     let mut warnings = Vec::new();
-    for (provider_id, raw_entry) in catalog.provider {
+
+    for (provider_id, raw_entry) in provider_entries {
         // Unknown future protocols remain unavailable; supported transports share this catalog.
         if protocol(&raw_entry).is_none() {
             continue;
         }
-        let entry: Entry = raw_entry.try_into().map_err(|error: toml::de::Error| {
+        let entry: Entry = serde_json::from_value(raw_entry).map_err(|error| {
             ConfigError::with_cause(
                 "provider_catalog",
                 "invalid_format",
-                &format!("{}; byte_range={:?}", error.message(), error.span()),
+                &microcrab_protocol::diagnostic::json_reason(&error),
             )
         })?;
         if provider_id.trim().is_empty() {
             return Err(ConfigError::new("provider_catalog", "invalid_provider"));
         }
-        let options = entry.options;
-        let resolved_endpoint = endpoint_for_protocol(
-            entry.protocol,
-            options.endpoint.clone(),
-            options.base_url.clone(),
-        )?;
-        let api_key = options
+        if entry.google_function_response_media && entry.protocol != Protocol::Google {
+            return Err(ConfigError::new(
+                "provider_catalog",
+                "google_media_requires_google_protocol",
+            ));
+        }
+        let resolved_endpoint =
+            endpoint_for_protocol(entry.protocol, entry.endpoint.clone(), entry.base_url.clone())?;
+        let api_key = entry
             .api_key
             .as_deref()
             .map(super::resolve_secret)
@@ -224,13 +224,14 @@ pub(super) fn resolve(
         let discovery_provider = Provider {
             protocol: entry.protocol,
             google_function_response_media: false,
-            auth: options.auth,
+            auth: entry.auth,
             endpoint: resolved_endpoint.clone(),
             // Discovery validates common transport options without inferring a model route.
             model: "discovery".into(),
             api_key: api_key.clone(),
-            timeout_ms: options.timeout_ms,
-            max_response_bytes: options.max_response_bytes,
+            timeout_ms: entry.timeout_ms,
+            max_response_bytes: entry.max_response_bytes,
+            headers: entry.headers.clone(),
         };
         discovery_provider
             .client_transport_config()
@@ -276,7 +277,7 @@ pub(super) fn resolve(
                 merged.insert(id, meta);
             }
         }
-        if let Some(model) = &options.model {
+        if let Some(model) = &entry.model {
             if model.trim().is_empty() {
                 return Err(ConfigError::new("provider_catalog", "missing_model"));
             }
@@ -285,7 +286,7 @@ pub(super) fn resolve(
                 merged.insert(
                     model.clone(),
                     ModelMeta {
-                        google_function_response_media: false,
+                        google_function_response_media: entry.google_function_response_media,
                         protocol: None,
                         endpoint: None,
                         auth: None,
@@ -298,10 +299,14 @@ pub(super) fn resolve(
             }
         }
         if order.is_empty() && !warnings.iter().any(|(id, _)| id == &provider_id) {
-            warnings.push((provider_id.clone(), ConfigError::with_cause(
-                "provider_catalog", "models_empty",
-                "gateway discovery and configured models provide no selectable model; provider remains unavailable until models are configured or discovered",
-            )));
+            warnings.push((
+                provider_id.clone(),
+                ConfigError::with_cause(
+                    "provider_catalog",
+                    "models_empty",
+                    "gateway discovery and configured models provide no selectable model; provider remains unavailable until models are configured or discovered",
+                ),
+            ));
         }
         let start = models.len();
         for id in order {
@@ -324,9 +329,11 @@ pub(super) fn resolve(
                 Some(endpoint) => endpoint,
                 None if effective_protocol == entry.protocol => resolved_endpoint.clone(),
                 None => {
-                    let base = options.base_url.clone().ok_or_else(|| {
-                        model_failure("model_endpoint_required",
-                            "a model using a different protocol from a fixed provider endpoint requires an explicit model endpoint")
+                    let base = entry.base_url.clone().ok_or_else(|| {
+                        model_failure(
+                            "model_endpoint_required",
+                            "a model using a different protocol from a fixed provider endpoint requires an explicit model endpoint",
+                        )
                     })?;
                     if (effective_protocol == Protocol::Google)
                         != (entry.protocol == Protocol::Google)
@@ -343,13 +350,14 @@ pub(super) fn resolve(
             let route = Provider {
                 protocol: effective_protocol,
                 google_function_response_media: meta.google_function_response_media,
-                auth: meta.auth.unwrap_or(options.auth),
+                auth: meta.auth.unwrap_or(entry.auth),
                 endpoint: effective_endpoint,
                 model: id.clone(),
-                // Explicit model endpoints deliberately inherit provider credentials.
+                // Explicit model endpoints deliberately inherit provider credentials and headers.
                 api_key: api_key.clone(),
-                timeout_ms: options.timeout_ms,
-                max_response_bytes: options.max_response_bytes,
+                timeout_ms: entry.timeout_ms,
+                max_response_bytes: entry.max_response_bytes,
+                headers: entry.headers.clone(),
             };
             route
                 .validate_media_capability()
@@ -398,7 +406,7 @@ pub(super) fn resolve(
                 context_window_tokens: meta.context_window_tokens,
             });
         }
-        let model = options.model.unwrap_or_else(|| {
+        let model = entry.model.unwrap_or_else(|| {
             models
                 .get(start)
                 .map(|choice| choice.id.clone())
@@ -417,11 +425,20 @@ pub(super) fn resolve(
         };
         providers.insert(provider_id, resolved);
     }
+
     let resolved = providers
         .get(&name)
         .ok_or_else(|| ConfigError::new("provider_catalog", "provider_not_found"))?;
-    value["provider"] = serde_json::json!({"protocol":resolved.protocol,"auth":resolved.auth,"endpoint":resolved.endpoint,"model":resolved.model,
-        "api_key":resolved.api_key,"timeout_ms":resolved.timeout_ms,"max_response_bytes":resolved.max_response_bytes});
+    value["provider"] = serde_json::json!({
+        "protocol": resolved.protocol,
+        "auth": resolved.auth,
+        "endpoint": resolved.endpoint,
+        "model": resolved.model,
+        "api_key": resolved.api_key,
+        "timeout_ms": resolved.timeout_ms,
+        "max_response_bytes": resolved.max_response_bytes,
+        "headers": resolved.headers,
+    });
     if resolved.google_function_response_media {
         value["provider"]["google_function_response_media"] = serde_json::json!(true);
     }
@@ -432,20 +449,21 @@ pub(super) fn resolve(
             &microcrab_protocol::diagnostic::json_reason(&error),
         )
     })?;
-    Ok(Some((
-        path,
-        ResolvedCatalog {
-            default_provider_id: name,
-            providers,
-            routes,
-            models,
-            warnings,
-        },
-    )))
+
+    Ok(Some(ResolvedCatalog {
+        default_provider_id: name,
+        providers,
+        routes,
+        models,
+        warnings,
+    }))
 }
 
-fn protocol(entry: &toml::Value) -> Option<Protocol> {
-    entry.get("protocol")?.as_str()?.parse().ok()
+fn protocol(entry: &serde_json::Value) -> Option<Protocol> {
+    match entry.get("protocol") {
+        None => Some(Protocol::OpenaiCompatible),
+        Some(value) => value.as_str()?.parse().ok(),
+    }
 }
 
 #[cfg(test)]
@@ -488,7 +506,7 @@ fn endpoint_for_protocol(
                 return Err(ConfigError::with_cause(
                     "provider_catalog",
                     "model_endpoint_required",
-                    "baseURL ends in another protocol family's endpoint; configure an explicit endpoint instead of inferring a version",
+                    "base_url ends in another protocol family's endpoint; configure an explicit endpoint instead of inferring a version",
                 ));
             }
             let suffix = match protocol {
@@ -522,22 +540,15 @@ mod namespace_tests {
     use super::*;
     #[test]
     fn startup_owner_namespace_is_rejected_before_protocol_or_discovery() {
-        let root = std::env::temp_dir().join(format!(
-            "microcrab-provider-namespace-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("providers.toml");
-        // Even an unsupported protocol cannot hide an identity reserved for user
-        // Providers. This must reject before constructing any discovery request.
-        std::fs::write(
-            &path,
-            "[provider.\"user:collision\"]\nprotocol='future-unsupported'\n",
-        )
-        .unwrap();
-        let mut configuration =
-            serde_json::json!({"provider":{"config_file":path,"name":"user:collision"}});
-        let error = match resolve(&mut configuration, &root) {
+        let mut configuration = serde_json::json!({
+            "default_provider": "user:collision",
+            "providers": {
+                "user:collision": {
+                    "protocol": "future-unsupported"
+                }
+            }
+        });
+        let error = match resolve(&mut configuration) {
             Ok(_) => panic!("reserved Provider namespace accepted"),
             Err(error) => error,
         };

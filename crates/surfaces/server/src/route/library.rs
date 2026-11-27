@@ -14,8 +14,9 @@ use axum::{
 };
 use base64::Engine as _;
 use futures_util::StreamExt;
-use microcrab_session::state::reference::{
-    CreateLibraryObject, LocalBlobOrigin, ShortcutTarget, UpdateLibraryObject, canonical_mime,
+use microcrab_session::state::reference::canonical_mime;
+use microcrab_storage::library::{
+    CreateLibraryObject, LocalBlobOrigin, ShortcutTarget, UpdateLibraryObject,
 };
 use serde::Deserialize;
 use std::sync::Arc;

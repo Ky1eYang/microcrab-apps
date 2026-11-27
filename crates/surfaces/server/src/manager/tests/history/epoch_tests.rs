@@ -277,34 +277,35 @@ async fn multi_round_contract(storage: &str) {
 async fn route_manager(storage: &str, model: Arc<dyn microcrab_session::Client>) -> Arc<Manager> {
     let (fixture, root) = manager(model.clone(), storage).await;
     fixture.close().await.unwrap();
-    let catalog = root.join("history-providers.toml");
-    std::fs::write(
-        &catalog,
-        r#"
-[provider.a]
-protocol = 'openai-compatible'
-[provider.a.options]
-endpoint = 'http://127.0.0.1:1/v1/chat/completions'
-model = 'model-a'
-[provider.a.models.model-a]
-[provider.b]
-protocol = 'openai-compatible'
-[provider.b.options]
-endpoint = 'http://127.0.0.1:1/v1/chat/completions'
-model = 'model-b'
-[provider.b.models.model-b]
-"#,
-    )
-    .unwrap();
     let path = root.join("history-server.json");
     std::fs::write(&path, serde_json::to_vec(&json!({
-        "data_dir":fixture.config.data_dir, "storage":storage,
-        "provider":{"config_file":catalog,"name":"a"}, "auto_rename":false,
-        "auth":{
-            "issuer":"http://127.0.0.1:9900","authorization_endpoint":"http://127.0.0.1:9900/authorize",
-            "token_endpoint":"http://127.0.0.1:9900/token","jwks_uri":"http://127.0.0.1:9900/jwks",
-            "client_id":"test","redirect_uri":"http://127.0.0.1:4096/api/auth/callback",
-            "allowed_origins":["http://127.0.0.1:4096"],"jwt_secret":"test-key-at-least-thirty-two-characters"
+        "data_dir": fixture.config.data_dir,
+        "storage": storage,
+        "default_provider": "a",
+        "providers": {
+            "a": {
+                "protocol": "openai-compatible",
+                "endpoint": "http://127.0.0.1:1/v1/chat/completions",
+                "model": "model-a",
+                "models": {"model-a": {}}
+            },
+            "b": {
+                "protocol": "openai-compatible",
+                "endpoint": "http://127.0.0.1:1/v1/chat/completions",
+                "model": "model-b",
+                "models": {"model-b": {}}
+            }
+        },
+        "auto_rename": false,
+        "auth": {
+            "issuer": "http://127.0.0.1:9900",
+            "authorization_endpoint": "http://127.0.0.1:9900/authorize",
+            "token_endpoint": "http://127.0.0.1:9900/token",
+            "jwks_uri": "http://127.0.0.1:9900/jwks",
+            "client_id": "test",
+            "redirect_uri": "http://127.0.0.1:4096/api/auth/callback",
+            "allowed_origins": ["http://127.0.0.1:4096"],
+            "jwt_secret": "test-key-at-least-thirty-two-characters"
         }
     })).unwrap()).unwrap();
     Manager::with_client(Config::read(path).unwrap(), model)

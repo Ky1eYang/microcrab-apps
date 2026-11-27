@@ -1403,7 +1403,7 @@ pub(super) async fn execute_with_sender(
         return super::auto_compaction::retry(manager, owner, record, command).await;
     }
     if command.method == SESSION_RETRY_AGENT_INIT {
-        return super::agent_init::retry(manager, owner, record, command).await;
+        return Box::pin(super::agent_init::retry(manager, owner, record, command)).await;
     }
     if command.method == "session.close" {
         let _: Empty = parse(command)?;

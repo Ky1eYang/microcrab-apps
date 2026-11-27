@@ -247,7 +247,7 @@ pub(super) async fn retry(
     if receipt(manager, owner, &record, &params, &digest).await? {
         return manager.inspect(&record).await;
     }
-    let managed = manager.activate(record, true, None, true).await?;
+    let managed = Box::pin(manager.activate(record, true, None, true)).await?;
     let _command = managed.commands.lock().await;
     let record = managed.record.lock().await.clone();
     if receipt(manager, owner, &record, &params, &digest).await? {
@@ -315,9 +315,7 @@ pub(super) async fn retry(
     let operation_owner = ReceiptOwner(managed.hub.clone());
     drop(_command);
     let result = async {
-        managed
-            .session
-            .retry_agent_init()
+        Box::pin(managed.session.retry_agent_init())
             .await
             .map_err(|error| failure(&managed.session).unwrap_or_else(|| safe(error)))?;
         if let Some(error) = failure(&managed.session) {

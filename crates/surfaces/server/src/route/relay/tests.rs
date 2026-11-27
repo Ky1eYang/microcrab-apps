@@ -242,7 +242,7 @@ async fn relay_serves_owner_providers_plus_server_and_isolates_owners_and_record
         .unwrap();
     assert_eq!(cross_owner.status(), StatusCode::NOT_FOUND);
 
-    // 3. Mixed session cookie + bearer key is rejected; Origin header is rejected.
+    // 3. Mixed session cookie + bearer key is rejected; cross-origin with valid key is allowed.
     let cookie_mix = app
         .clone()
         .oneshot(
@@ -250,12 +250,74 @@ async fn relay_serves_owner_providers_plus_server_and_isolates_owners_and_record
                 .uri("/v1/models")
                 .header(header::AUTHORIZATION, format!("Bearer {}", key_a.secret))
                 .header(header::COOKIE, "microcrab_session=anything")
+                .header(header::ORIGIN, "https://app.example.com")
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(cookie_mix.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        cookie_mix
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+
+    let preflight = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/v1/chat/completions")
+                .header(header::ORIGIN, "https://app.example.com")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization, content-type",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+    assert_eq!(
+        preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .and_then(|v| v.to_str().ok()),
+        Some("authorization, content-type")
+    );
+
+    let cors_models = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header(header::AUTHORIZATION, format!("Bearer {}", key_a.secret))
+                .header(header::ORIGIN, "https://app.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cors_models.status(), StatusCode::OK);
+    assert_eq!(
+        cors_models
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
 
     // 4. Account preference accepts Owner A's private `user:alpha/alpha-model` as default relay model.
     let pref_update = PreferencesUpdate::parse(

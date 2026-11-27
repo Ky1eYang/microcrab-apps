@@ -134,7 +134,47 @@ pub(super) fn router(state: Arc<Application>) -> Router {
             )
         })
         .with_state(state)
+        .layer(middleware::from_fn(cors))
         .layer(middleware::from_fn(super::error::no_store))
+}
+
+async fn cors(req: axum::extract::Request, next: middleware::Next) -> Response {
+    const ALLOW_METHODS: &str = "GET, POST, OPTIONS";
+    const DEFAULT_ALLOW_HEADERS: &str = "Authorization, Content-Type";
+
+    if req.method() == axum::http::Method::OPTIONS {
+        let allow_headers = req
+            .headers()
+            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| axum::http::HeaderValue::from_str(value).ok())
+            .unwrap_or_else(|| axum::http::HeaderValue::from_static(DEFAULT_ALLOW_HEADERS));
+        let mut response = StatusCode::NO_CONTENT.into_response();
+        let headers = response.headers_mut();
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            axum::http::HeaderValue::from_static("*"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            axum::http::HeaderValue::from_static(ALLOW_METHODS),
+        );
+        headers.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, allow_headers);
+        headers.insert(
+            header::ACCESS_CONTROL_MAX_AGE,
+            axum::http::HeaderValue::from_static("86400"),
+        );
+        return response;
+    }
+
+    let mut response = next.run(req).await;
+    response.headers_mut().insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    response
 }
 
 async fn missing() -> Failure {
@@ -158,13 +198,6 @@ async fn authenticate(state: &Application, headers: &HeaderMap) -> Result<Creden
         || crate::auth::has_session_cookie(headers).map_err(|_| Failure::key())?
     {
         return Err(Failure::key());
-    }
-    if headers.contains_key(header::ORIGIN) {
-        return Err(Failure(
-            StatusCode::FORBIDDEN,
-            "origin_not_allowed",
-            "Browser cross-origin relay is not supported",
-        ));
     }
     let manager = &state.manager;
     if !manager.config.relay.enabled || manager.relay_runtime.stop.is_cancelled() {

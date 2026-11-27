@@ -80,31 +80,6 @@ fn gateway_config(
     let endpoint = explicit
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{}/v1/{suffix}", gateway.base));
-    let catalog = root.join("providers.toml");
-    std::fs::write(
-        &catalog,
-        format!(
-            r#"
-[provider.mixed]
-protocol='openai-compatible'
-[provider.mixed.options]
-baseURL='{base}/v1'
-model='wire'
-apiKey='{key}'
-timeoutMs=1000
-[provider.mixed.models.native]
-id='wire'
-protocol='{protocol}'
-endpoint='{endpoint}'
-auth='{auth}'
-[provider.mixed.models.chat]
-id='chat'
-variants=['high']
-"#,
-            base = gateway.base
-        ),
-    )
-    .unwrap();
     let mut value: Value =
         serde_json::from_str(include_str!("../../../config.example.json")).unwrap();
     value["storage"] = "file".into();
@@ -113,7 +88,29 @@ variants=['high']
     value["auto_rename"] = false.into();
     value["model_metadata"]["enabled"] = false.into();
     value.as_object_mut().unwrap().remove("agent");
-    value["provider"] = json!({"config_file":catalog,"name":"mixed"});
+    value.as_object_mut().unwrap().remove("provider");
+    value["default_provider"] = json!("mixed");
+    value["providers"] = json!({
+        "mixed": {
+            "protocol": "openai-compatible",
+            "base_url": format!("{}/v1", gateway.base),
+            "model": "wire",
+            "api_key": key,
+            "timeout_ms": 1000,
+            "models": {
+                "native": {
+                    "id": "wire",
+                    "protocol": protocol,
+                    "endpoint": endpoint,
+                    "auth": auth
+                },
+                "chat": {
+                    "id": "chat",
+                    "variants": ["high"]
+                }
+            }
+        }
+    });
     let path = root.join("server.json");
     std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     let config = Config::read(path).unwrap();

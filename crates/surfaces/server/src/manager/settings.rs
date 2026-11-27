@@ -404,7 +404,7 @@ pub(super) async fn command(
         ensure_mutable(&managed)?;
         managed
             .session
-            .refresh_reference_library()
+            .refresh_references()
             .await
             .map_err(super::library::library_wire_error)?;
         return Ok(json!({

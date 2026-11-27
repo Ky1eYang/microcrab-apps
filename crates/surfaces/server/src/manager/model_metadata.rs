@@ -107,24 +107,29 @@ impl ModelMetadata {
                     .and_then(capacity)
             })
     }
+    pub(super) fn enrich_choice(
+        &self,
+        choice: crate::config::ModelChoice,
+        snapshot: &MetadataSnapshot,
+    ) -> Value {
+        let found = snapshot.find(&choice.provider_id, &choice.id);
+        let mut value = serde_json::to_value(&choice).expect("model choices are JSON-compatible");
+        if let Some(found) = found {
+            if choice.context_window_tokens.is_none() {
+                value["context_window_tokens"] = json!(capacity(&found));
+            }
+            value["metadata_match"] = json!(found.kind);
+            value["metadata"] = json!(found.metadata);
+        }
+        value
+    }
+    #[cfg(test)]
     pub(super) fn choices(&self, config: &Config) -> Vec<Value> {
         let snapshot = self.snapshot();
         config
             .model_choices()
             .into_iter()
-            .map(|choice| {
-                let found = snapshot.find(&choice.provider_id, &choice.id);
-                let mut value =
-                    serde_json::to_value(&choice).expect("model choices are JSON-compatible");
-                if let Some(found) = found {
-                    if choice.context_window_tokens.is_none() {
-                        value["context_window_tokens"] = json!(capacity(&found));
-                    }
-                    value["metadata_match"] = json!(found.kind);
-                    value["metadata"] = json!(found.metadata);
-                }
-                value
-            })
+            .map(|choice| self.enrich_choice(choice, &snapshot))
             .collect()
     }
     pub(super) fn enrich_statistics(

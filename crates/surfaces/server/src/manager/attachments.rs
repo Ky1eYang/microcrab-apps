@@ -235,12 +235,12 @@ impl Manager {
                 .create(
                     &owner,
                     limits,
-                    microcrab_session::state::reference::CreateLibraryObject::LocalBlob {
+                    microcrab_storage::library::CreateLibraryObject::LocalBlob {
                         id: None,
                         title: format!("attachment:{short_id}"),
                         media_type: mime,
                         data,
-                        origin: microcrab_session::state::reference::LocalBlobOrigin::Upload,
+                        origin: microcrab_storage::library::LocalBlobOrigin::Upload,
                         origin_execution_id: None,
                     },
                     Some(&session_id),
@@ -258,7 +258,7 @@ impl Manager {
         if let Some(managed) = super::settings::active(self, &record.id).await
             && managed.commands.try_lock().is_ok()
         {
-            let _ = managed.session.refresh_reference_library().await;
+            let _ = managed.session.refresh_references().await;
         }
         Ok(saved)
     }

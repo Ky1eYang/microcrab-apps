@@ -7,7 +7,7 @@
   // All relative paths below resolve from the server's startup working directory,
   // NOT from this file's directory.
   // Unknown fields are rejected (`deny_unknown_fields`). Only `auth.jwt_secret`,
-  // `auth.client_secret`, and resolved `provider.api_key` expand `env:VAR_NAME`.
+  // `auth.client_secret`, and resolved `provider.api_key` / `providers.<id>.api_key` expand `env:VAR_NAME`.
 
   // Socket address to bind (`host:port`). Default: "127.0.0.1:4096".
   "listen": "127.0.0.1:4096",
@@ -119,57 +119,64 @@
     "allow_http_loopback": true,
   },
 
-  // Inline default model provider (complete wire endpoint, not a gateway base URL).
-  // Alternative: replace the entire `provider` object with an external TOML catalog
-  // reference: `{"config_file": ".microcrab/providers.toml", "name": "provider_id"}`
-  // (`name` may be omitted when the catalog defines a single provider; never mix
-  // `config_file` with inline fields).
-  "provider": {
-    // Wire protocol: "openai-compatible" (default, /v1/chat/completions),
-    // "openai" (Responses API; aliases: "openai-response", "openai-responses"),
-    // "anthropic" (Messages API; alias: "claude"),
-    // "google" (Gemini REST; alias: "gemini").
-    "protocol": "openai-compatible",
-
-    // Credential header placement: "native" (default: Bearer for OpenAI protocols,
-    // x-api-key for Anthropic, x-goog-api-key for Google) or "bearer".
-    "auth": "native",
-
-    // Complete HTTPS endpoint (or loopback/private-IP HTTP for local gateways).
-    "endpoint": "https://api.openai.com/v1/chat/completions",
-
-    // Default provider-local model ID (non-empty).
-    "model": "gpt-4.1-mini",
-
-    // Literal key or "env:MICROCRAB_PROVIDER_API_KEY"; omit/null for keyless local servers.
-    "api_key": "YOUR_LITERAL_API_KEY",
-
-    // Resettable network inactivity timeout in ms (renewed per received chunk; > 0).
-    // Default: 60000.
-    "timeout_ms": 30000,
-
-    // Per-response safety ceiling in bytes (> 0; warns before cap). Default: 1073741824.
-    "max_response_bytes": 262144,
-
-    // Google-only opt-in for native `functionResponse.parts` media. Must be false
-    // for all non-Google protocols. Default: false.
-    "google_function_response_media": false,
-  },
-
-  // Optional display/capacity metadata for the inline `"configured"` provider.
-  // Does not add model routes or override `provider.protocol`. When `provider` uses
-  // `config_file`, this list is populated from the resolved TOML catalog instead.
-  "available_models": [
-    {
-      "id": "gpt-4.1-mini",
-      "name": "GPT-4.1 mini",
-      "provider_id": "configured",
+  // Multi-provider configuration directly in JSONC (mutually exclusive with single
+  // `provider`). When `providers` defines multiple entries, `default_provider` is
+  // required; a single-entry map may omit `default_provider`.
+  // Each entry accepts either `base_url` (auto-appends protocol suffix) or complete
+  // `endpoint`, plus optional custom `headers` and per-model overrides in `models`.
+  "default_provider": "openai",
+  "providers": {
+    "openai": {
+      // Wire protocol: "openai-compatible" (default, /v1/chat/completions),
+      // "openai" (Responses API; aliases: "openai-response", "openai-responses"),
+      // "anthropic" (Messages API; alias: "claude"),
+      // "google" (Gemini REST; alias: "gemini").
       "protocol": "openai-compatible",
-      // "variants": ["default"],
-      // Positive nonzero context window token count; omit or null if unknown.
-      // "context_window_tokens": 1047576,
-    },
-  ],
+
+      // Credential header placement: "native" (default: Bearer for OpenAI protocols,
+      // x-api-key for Anthropic, x-goog-api-key for Google) or "bearer".
+      "auth": "native",
+
+      // Gateway base URL (or use complete `endpoint` instead of `base_url`).
+      "base_url": "https://api.openai.com/v1",
+
+      // Default provider-local model ID (optional if `models` or discovery supplies one).
+      "model": "gpt-4.1-mini",
+
+      // Literal key or "env:MICROCRAB_PROVIDER_API_KEY"; omit/null for keyless local servers.
+      "api_key": "YOUR_LITERAL_API_KEY",
+
+      // Optional validated custom HTTP request headers (cannot override reserved
+      // auth/content-type/host headers). Example for client-whitelisted relays:
+      // "headers": {"User-Agent": "pi"},
+
+      // Resettable network inactivity timeout in ms (renewed per received chunk; > 0).
+      // Default: 60000.
+      "timeout_ms": 30000,
+
+      // Per-response safety ceiling in bytes (> 0; warns before cap). Default: 1073741824.
+      "max_response_bytes": 262144,
+
+      // Google-only opt-in for native `functionResponse.parts` media. Must be false
+      // for all non-Google protocols. Default: false.
+      "google_function_response_media": false,
+
+      // Optional per-model metadata/routing overrides merged after gateway /models discovery:
+      "models": {
+        "gpt-4.1-mini": {
+          "id": "gpt-4.1-mini",
+          "name": "GPT-4.1 mini"
+          // "variants": ["default"],
+          // Positive nonzero context window token count; omit or null if unknown.
+          // "context_window_tokens": 1047576
+        }
+      }
+    }
+  },
+  // Leave `available_models` empty/omitted when using `providers`; per-provider
+  // `models` + discovery populate it automatically. For a single inline `provider`
+  // configuration, omit `providers`/`default_provider` and set `provider` directly.
+  "available_models": [],
 
   // Automatic context compaction thresholds for new Sessions.
   // Pressure thresholds satisfy: 0 < turn_threshold < round_threshold < 1.

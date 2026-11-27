@@ -565,6 +565,12 @@ async fn prepare_route(
                 .as_ref()
                 .map(|key| format!("{:x}", sha2::Sha256::digest(key.as_bytes())))
         );
+        if !resolved.provider.headers.is_empty() {
+            route["headers_digest"] = serde_json::json!(format!(
+                "{:x}",
+                sha2::Sha256::digest(serde_json::to_vec(&resolved.provider.headers)?)
+            ));
+        }
     }
     let witness = format!("{:x}", sha2::Sha256::digest(serde_json::to_vec(&route)?));
     let client =

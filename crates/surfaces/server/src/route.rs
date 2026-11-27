@@ -21,6 +21,7 @@ pub(crate) mod relay;
 mod relay_keys;
 pub(crate) mod session;
 mod settings;
+mod skills;
 mod socket;
 pub(crate) mod system;
 #[cfg(all(test, feature = "storage-file"))]
@@ -64,6 +65,7 @@ pub(crate) fn router(state: Arc<Application>, frontend: &Path) -> Router {
             "/api/v1/users/{user_id}/preferences",
             get(preferences::read).put(preferences::update),
         )
+        .merge(skills::router())
         .route("/api/v1/ws", get(socket::global))
         .route("/api/v1/sessions/{session_id}/ws", get(socket::session))
         .route("/api/health", get(http::health))

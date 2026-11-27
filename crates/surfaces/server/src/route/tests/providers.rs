@@ -40,17 +40,32 @@ async fn provider_http_private_edits_are_owner_scoped_and_startup_is_read_only()
         .expect("startup provider");
     assert_eq!(startup["read_only"], true);
     let shared = format!("/api/v1/providers/{}", startup["id"].as_str().unwrap());
-    for (method, path) in [
-        ("PUT", shared.clone()),
-        ("DELETE", shared.clone()),
-        ("POST", format!("{shared}/discover")),
+    for (method, path, payload) in [
+        (
+            "PUT",
+            shared.clone(),
+            json!({"expected_revision":0,"provider":provider("Hijack")}),
+        ),
+        ("DELETE", shared.clone(), json!({"expected_revision":0})),
     ] {
-        let response = fixture
-            .request(method, &path, Some(json!({"expected_revision":0})))
-            .await;
+        let response = fixture.request(method, &path, Some(payload)).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body(response).await["error"]["code"], "read_only");
     }
+    // Admin owner can maintain per-owner model overrides on the shared provider
+    // without affecting other owners' view of that shared provider.
+    let admin_override = fixture
+        .request(
+            "PUT",
+            &shared,
+            Some(json!({
+                "expected_revision": 0,
+                "models": [{"id": "admin-personal-model", "name": "Personal Model"}]
+            })),
+        )
+        .await;
+    assert_eq!(admin_override.status(), StatusCode::OK);
+    assert_eq!(body(admin_override).await["revision"], 1);
     let response = fixture
         .request(
             "PUT",

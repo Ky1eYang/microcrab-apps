@@ -45,9 +45,18 @@ class RelayServer(Server):
 
     def start_native(self):
         if self.provider_config is not None:
-            self.configuration["provider"] = {"config_file": str(self.provider_config)}
-            if self.provider_name:
-                self.configuration["provider"]["name"] = self.provider_name
+            raw = json.loads(Path(self.provider_config).read_text(encoding="utf-8"))
+            self.configuration.pop("provider", None)
+            if "providers" in raw:
+                self.configuration["providers"] = raw["providers"]
+                if self.provider_name:
+                    self.configuration["default_provider"] = self.provider_name
+                elif "default_provider" in raw:
+                    self.configuration["default_provider"] = raw["default_provider"]
+            else:
+                self.configuration["providers"] = raw
+                if self.provider_name:
+                    self.configuration["default_provider"] = self.provider_name
         self.config_path.write_text(json.dumps(self.configuration), encoding="utf-8")
         super().start_native()
 

@@ -23,7 +23,8 @@ mod display;
 pub(crate) mod execution_history;
 pub(crate) mod external_inbox;
 pub(crate) mod external_speakers;
-mod fork;
+pub(crate) mod fork;
+pub(crate) mod git_skills;
 mod host_inspection;
 #[cfg(test)]
 #[path = "../tests/support/host_shell_fixture.rs"]
@@ -133,6 +134,7 @@ pub struct Manager {
     self_ref: std::sync::Weak<Manager>,
     client_override: Option<Arc<dyn microcrab_session::Client>>,
     pub(crate) personal_library: Arc<dyn microcrab_storage::library::PersonalLibrary>,
+    pub(crate) git_skills: git_skills::GitSkillsService,
     library_admission: Arc<Semaphore>,
     citation_admission: Arc<Semaphore>,
     external_reply_admission: Arc<Semaphore>,
@@ -741,6 +743,7 @@ impl Manager {
             self_ref: weak.clone(),
             client_override,
             personal_library,
+            git_skills: git_skills::GitSkillsService::new(),
             library_admission: Arc::new(Semaphore::new(4)),
             citation_admission: Arc::new(Semaphore::new(4)),
             external_reply_admission: Arc::new(Semaphore::new(32)),

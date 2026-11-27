@@ -207,8 +207,8 @@ async fn library_enforces_user_id_isolation_and_cross_session_content_delivery()
     assert_eq!(actual_mounts, expected_mounts);
 
     let inspected_b = fixture.inspect(&session_b).await.unwrap();
-    let refs_b = inspected_b["state"]["references"].as_array().unwrap();
-    assert!(refs_b.iter().any(|entry| entry["id"] == ref_id));
+    let media_b = inspected_b["state"]["media"].as_array().unwrap();
+    assert!(media_b.iter().any(|entry| entry["id"] == ref_id));
 
     // Composer attachment upload still returns attachment_id AND mounts reference_id into session_a.
     let attach_res = fixture

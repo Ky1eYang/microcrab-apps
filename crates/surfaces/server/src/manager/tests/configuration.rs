@@ -127,9 +127,9 @@ async fn project_reference_mounts_bind_owner_library_items_without_creating_runt
     let created = manager
         .library_create(
             &owner,
-            microcrab_session::state::reference::CreateLibraryObject::Shortcut {
+            microcrab_storage::library::CreateLibraryObject::Shortcut {
                 title: "Agents guide".into(),
-                target: microcrab_session::state::reference::ShortcutTarget::HostPath {
+                target: microcrab_storage::library::ShortcutTarget::HostPath {
                     path: "AGENTS.md".into(),
                     project_id: Some("project".into()),
                     host_id: None,
@@ -355,17 +355,15 @@ async fn partial_live_settings_failure_is_quarantined_and_observed_truthfully() 
 #[tokio::test]
 async fn shared_provider_shadow_mutations_are_read_only_before_schema_or_revision() {
     let (manager, _root) = manager(model(), "file").await;
-    for method in ["provider.set", "provider.delete", "provider.discover"] {
-        let error = super::super::providers::command(
-            &manager,
-            "owner",
-            method,
-            json!({"provider_id":"configured","expected_revision":0}),
-        )
-        .await
-        .unwrap_err();
+    for (method, payload) in [
+        ("provider.delete", json!({"provider_id":"configured","expected_revision":0})),
+        ("provider.set", json!({"provider_id":"configured","expected_revision":0,"provider":{"name":"Hijack","protocol":"openai-compatible","endpoint":"https://evil.example/v1/chat/completions","auth":"bearer","timeout_ms":1000,"max_response_bytes":1048576,"models":[]}})),
+        ("provider.set", json!({"provider_id":"configured","expected_revision":0,"api_key":"evil"})),
+    ] {
+        let error = super::super::providers::command(&manager, "owner", method, payload)
+            .await
+            .unwrap_err();
         assert_eq!(error.code, "read_only");
-        assert!(error.message.contains("cannot be shadowed"));
     }
     assert!(
         manager
@@ -375,6 +373,215 @@ async fn shared_provider_shadow_mutations_are_read_only_before_schema_or_revisio
             .unwrap()
             .is_none()
     );
+}
+#[cfg(feature = "storage-file")]
+#[tokio::test]
+async fn shared_provider_owner_overrides_refresh_and_user_headers_are_isolated() {
+    use axum::{Router, routing::get};
+    use tokio::net::TcpListener;
+
+    let seen_headers = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let captured = Arc::clone(&seen_headers);
+    let app = Router::new().route(
+        "/v1/models",
+        get(move |headers: axum::http::HeaderMap| {
+            let captured = Arc::clone(&captured);
+            async move {
+                for name in ["user-agent", "x-custom-tag"] {
+                    if let Some(value) = headers.get(name).and_then(|v| v.to_str().ok()) {
+                        captured.lock().unwrap().push((name.to_owned(), value.to_owned()));
+                    }
+                }
+                axum::Json(json!({
+                    "data": [
+                        {"id": "refreshed-model-a", "owned_by": "test"},
+                        {"id": "refreshed-model-b", "owned_by": "test"}
+                    ]
+                }))
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let root = std::env::temp_dir().join(format!("microcrab-provider-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut cfg: Config = serde_json::from_value(json!({
+        "data_dir": root.join(".data"),
+        "storage": "file",
+        "provider": {
+            "endpoint": format!("http://{addr}/v1/chat/completions"),
+            "model": "test",
+            "timeout_ms": 1000,
+            "headers": {"User-Agent": "pi-admin"}
+        },
+        "auto_rename": false,
+        "auth": {
+            "issuer": "http://127.0.0.1:9900",
+            "authorization_endpoint": "http://127.0.0.1:9900/authorize",
+            "token_endpoint": "http://127.0.0.1:9900/token",
+            "jwks_uri": "http://127.0.0.1:9900/jwks",
+            "client_id": "test",
+            "redirect_uri": "http://127.0.0.1:4096/api/auth/callback",
+            "allowed_origins": ["http://127.0.0.1:4096"],
+            "jwt_secret": "test-key-at-least-thirty-two-characters"
+        }
+    }))
+    .unwrap();
+    cfg.resolve(&root).unwrap();
+    cfg.relay.allow_http_loopback = true;
+    let manager = Manager::with_client(cfg, model()).await.unwrap();
+
+    // Admin shared provider starts with configured model only; manual refresh pulls live models.
+    let discovered = super::super::providers::command(
+        &manager,
+        "owner",
+        "provider.discover",
+        json!({"provider_id":"configured","expected_revision":0}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(discovered["revision"], 1);
+    assert_eq!(discovered["scope"], "admin");
+    assert_eq!(discovered["discovered"].as_array().unwrap().len(), 2);
+    assert!(seen_headers.lock().unwrap().iter().any(|(k, v)| k == "user-agent" && v == "pi-admin"));
+
+    // Owner disables one discovered model and adds a custom model ID, forbidden from rewriting endpoint/auth.
+    let bad = super::super::providers::command(
+        &manager,
+        "owner",
+        "provider.set",
+        json!({
+            "provider_id": "configured",
+            "expected_revision": 1,
+            "models": [{"id": "custom", "endpoint": "https://attacker.example/v1/chat/completions"}]
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(bad.code, "invalid_params");
+
+    let saved = super::super::providers::command(
+        &manager,
+        "owner",
+        "provider.set",
+        json!({
+            "provider_id": "configured",
+            "expected_revision": 1,
+            "models": [
+                {"id": "refreshed-model-a", "disabled": true},
+                {"id": "owner-custom-shared", "name": "Owner Custom", "context_window_tokens": 131072}
+            ]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved["revision"], 2);
+    assert_eq!(saved["models"].as_array().unwrap().len(), 2);
+
+    let owner_choices = super::super::providers::choices(&manager, "owner").await.unwrap();
+    let owner_ids: Vec<&str> = owner_choices
+        .iter()
+        .filter(|v| v["provider_id"] == "configured")
+        .filter_map(|v| v["id"].as_str())
+        .collect();
+    assert!(!owner_ids.contains(&"refreshed-model-a"));
+    assert!(owner_ids.contains(&"refreshed-model-b"));
+    assert!(owner_ids.contains(&"owner-custom-shared"));
+
+    let resolved = super::super::providers::resolve(
+        &manager,
+        "owner",
+        &ModelSelection {
+            provider_id: "configured".into(),
+            model: "owner-custom-shared".into(),
+            variant: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resolved.2, Some(131072));
+    assert_eq!(
+        resolved.0.provider.headers.get("User-Agent").map(String::as_str),
+        Some("pi-admin")
+    );
+
+    // Other owners are completely isolated and do not see owner's refreshed or added models.
+    let other_choices = super::super::providers::choices(&manager, "other").await.unwrap();
+    let other_ids: Vec<&str> = other_choices
+        .iter()
+        .filter(|v| v["provider_id"] == "configured")
+        .filter_map(|v| v["id"].as_str())
+        .collect();
+    assert!(!other_ids.contains(&"owner-custom-shared"));
+    assert!(!other_ids.contains(&"refreshed-model-b"));
+
+    // User-owned provider custom headers: reject reserved header, persist custom headers, and forward on discover.
+    let bad_header = super::super::providers::command(
+        &manager,
+        "owner",
+        "provider.set",
+        json!({
+            "provider_id": "user:hdr",
+            "expected_revision": 0,
+            "provider": {
+                "name": "Header Gateway",
+                "protocol": "openai-compatible",
+                "endpoint": format!("http://{addr}/v1/chat/completions"),
+                "auth": "bearer",
+                "timeout_ms": 5000,
+                "max_response_bytes": 1048576,
+                "headers": {"Authorization": "Bearer hijack"},
+                "models": [{"id": "m1"}]
+            }
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(bad_header.code, "invalid_params");
+
+    let user_saved = super::super::providers::command(
+        &manager,
+        "owner",
+        "provider.set",
+        json!({
+            "provider_id": "user:hdr",
+            "expected_revision": 0,
+            "provider": {
+                "name": "Header Gateway",
+                "protocol": "openai-compatible",
+                "endpoint": format!("http://{addr}/v1/chat/completions"),
+                "auth": "bearer",
+                "timeout_ms": 5000,
+                "max_response_bytes": 1048576,
+                "headers": {"X-Custom-Tag": "pi-user", "User-Agent": "pi-custom"},
+                "models": [{"id": "m1"}]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(user_saved["headers"]["X-Custom-Tag"], "pi-user");
+    seen_headers.lock().unwrap().clear();
+    let user_disc = super::super::providers::command(
+        &manager,
+        "owner",
+        "provider.discover",
+        json!({"provider_id": "user:hdr", "expected_revision": 1}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(user_disc["discovered"].as_array().unwrap().len(), 2);
+    let hdrs = seen_headers.lock().unwrap();
+    assert!(hdrs.iter().any(|(k, v)| k == "x-custom-tag" && v == "pi-user"));
+    assert!(hdrs.iter().any(|(k, v)| k == "user-agent" && v == "pi-custom"));
+    drop(hdrs);
+
+    server_task.abort();
+    manager.close().await.unwrap();
 }
 #[test]
 fn every_limit_is_bounded_and_inherited_review_reset_is_explicit() {

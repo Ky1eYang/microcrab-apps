@@ -79,11 +79,9 @@ pub struct PersonalLibraryConfig {
 impl Default for PersonalLibraryConfig {
     fn default() -> Self {
         Self {
-            max_user_bytes: microcrab_session::state::reference::library::DEFAULT_MAX_USER_BYTES,
-            max_user_entries:
-                microcrab_session::state::reference::library::DEFAULT_MAX_USER_ENTRIES,
-            max_object_bytes:
-                microcrab_session::state::reference::library::DEFAULT_MAX_OBJECT_BYTES,
+            max_user_bytes: microcrab_storage::library::DEFAULT_MAX_USER_BYTES,
+            max_user_entries: microcrab_storage::library::DEFAULT_MAX_USER_ENTRIES,
+            max_object_bytes: microcrab_storage::library::DEFAULT_MAX_OBJECT_BYTES,
         }
     }
 }
@@ -261,6 +259,9 @@ pub struct Provider {
     /// Safety ceiling for one provider response; reception warns before it.
     #[serde(default = "response_budget")]
     pub max_response_bytes: usize,
+    /// Optional validated custom HTTP request headers applied before protocol/auth headers.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
     /// Exact configured Google route/model API capability; never inferred by discovery.
     #[serde(default)]
     pub google_function_response_media: bool,
@@ -295,6 +296,7 @@ impl Provider {
             api_key: self.api_key.clone(),
             timeout_ms: self.timeout_ms,
             max_response_bytes: self.max_response_bytes,
+            headers: self.headers.clone(),
         }
     }
 
@@ -387,6 +389,16 @@ impl Config {
                     .collect()
             })
             .unwrap_or_else(|| vec![("configured".into(), self.provider.clone())])
+    }
+    pub(crate) fn shared_provider_route(&self, provider_id: &str, model: &str) -> Option<Provider> {
+        if let Some(catalog) = &self.provider_catalog {
+            return catalog
+                .routes
+                .get(&(provider_id.to_owned(), model.to_owned()))
+                .cloned()
+                .or_else(|| catalog.providers.get(provider_id).cloned());
+        }
+        (provider_id == "configured").then(|| self.provider.clone())
     }
     pub(crate) fn discover_provider(
         provider: Provider,
@@ -494,7 +506,7 @@ impl Config {
             .map_err(|error| ConfigError::io_source("configuration", &error))?;
         let text = provider::read_private(&path, "configuration")?;
         let mut value = jsonc::parse(&text)?;
-        let catalog = provider::resolve(&mut value, startup)?;
+        let catalog = provider::resolve(&mut value)?;
         let mut config: Self = serde_json::from_value(value).map_err(|error| {
             ConfigError::with_cause(
                 "configuration",
@@ -503,8 +515,7 @@ impl Config {
             )
         })?;
         config.private_paths.push(path);
-        if let Some((path, catalog)) = catalog {
-            config.private_paths.push(path);
+        if let Some(catalog) = catalog {
             config.provider_catalog = Some(std::sync::Arc::new(catalog));
         }
         config.auth.jwt_secret = resolve_secret(&config.auth.jwt_secret)?;

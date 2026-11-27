@@ -111,6 +111,15 @@ async fn grpc_private_files_require_negotiation_exact_binding_and_live_lease() {
         assert_eq!(chunk.eof, sequence == 2);
     }
     assert!(stream.message().await.unwrap().is_none());
+    let rel_req = request(&first, "a", Path::new("binary"));
+    let rel_id = rel_req.get_ref().operation_id.clone();
+    let mut rel_stream = files.read(rel_req).await.unwrap().into_inner();
+    let Some(Body::Transfer(rel_decl)) = rel_stream.message().await.unwrap().unwrap().body else {
+        panic!("relative path typed declaration required")
+    };
+    assert_eq!(rel_decl.operation_id, rel_id);
+    assert_eq!(rel_decl.sha256[..], Sha256::digest(&data)[..]);
+    while rel_stream.message().await.unwrap().is_some() {}
     let mut too_small = request(&first, "a", &file);
     too_small.get_mut().max_bytes = 1;
     let mut bounded = files.read(too_small).await.unwrap().into_inner();
@@ -120,7 +129,7 @@ async fn grpc_private_files_require_negotiation_exact_binding_and_live_lease() {
     );
     assert_eq!(
         files
-            .read(request(&first, "a", &a.join("../b/binary")))
+            .read(request(&first, "a", Path::new("../b/binary")))
             .await
             .unwrap_err()
             .code(),
@@ -128,7 +137,11 @@ async fn grpc_private_files_require_negotiation_exact_binding_and_live_lease() {
     );
     let protected = a.join(".microcrab/host-bridge/identity.json");
     std::fs::write(b.join("binary"), b"outside").unwrap();
-    let mut denied = vec![protected, b.join("binary")];
+    let mut denied = vec![
+        protected,
+        std::path::PathBuf::from(".microcrab/host-bridge/identity.json"),
+        b.join("binary"),
+    ];
     #[cfg(unix)]
     {
         let link = a.join("link");

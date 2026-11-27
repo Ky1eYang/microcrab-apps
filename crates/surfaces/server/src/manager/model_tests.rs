@@ -70,42 +70,40 @@ where
     }
 }
 fn config(root: &std::path::Path, a: &ProviderMock, b: &ProviderMock) -> Config {
-    let catalog = root.join("providers.toml");
-    std::fs::write(
-        &catalog,
-        format!(
-            r#"
-[provider.a]
-protocol = 'openai-compatible'
-[provider.a.options]
-endpoint = '{}'
-model = 'model-a'
-apiKey = 'test-a'
-[provider.a.models.model-a]
-variants = ['low', 'high']
-[provider.b]
-protocol = 'openai-compatible'
-[provider.b.options]
-endpoint = '{}'
-model = 'model-b'
-apiKey = 'test-b'
-[provider.b.models.model-b]
-variants = ['low', 'high']
-"#,
-            a.endpoint, b.endpoint
-        ),
-    )
-    .unwrap();
     let path = root.join("server.json");
     std::fs::write(&path, serde_json::to_vec(&json!({
-        "data_dir":root.join(".data"),
-        "provider":{"config_file":catalog,"name":"a"},
-        "auto_rename":false,
-        "auth":{
-            "issuer":"http://127.0.0.1:9900","authorization_endpoint":"http://127.0.0.1:9900/authorize",
-            "token_endpoint":"http://127.0.0.1:9900/token","jwks_uri":"http://127.0.0.1:9900/jwks",
-            "client_id":"test","redirect_uri":"http://127.0.0.1:4096/api/auth/callback",
-            "allowed_origins":["http://127.0.0.1:4096"],"jwt_secret":"test-key-at-least-thirty-two-characters"
+        "data_dir": root.join(".data"),
+        "default_provider": "a",
+        "providers": {
+            "a": {
+                "protocol": "openai-compatible",
+                "endpoint": a.endpoint,
+                "model": "model-a",
+                "api_key": "test-a",
+                "models": {
+                    "model-a": {"variants": ["low", "high"]}
+                }
+            },
+            "b": {
+                "protocol": "openai-compatible",
+                "endpoint": b.endpoint,
+                "model": "model-b",
+                "api_key": "test-b",
+                "models": {
+                    "model-b": {"variants": ["low", "high"]}
+                }
+            }
+        },
+        "auto_rename": false,
+        "auth": {
+            "issuer": "http://127.0.0.1:9900",
+            "authorization_endpoint": "http://127.0.0.1:9900/authorize",
+            "token_endpoint": "http://127.0.0.1:9900/token",
+            "jwks_uri": "http://127.0.0.1:9900/jwks",
+            "client_id": "test",
+            "redirect_uri": "http://127.0.0.1:4096/api/auth/callback",
+            "allowed_origins": ["http://127.0.0.1:4096"],
+            "jwt_secret": "test-key-at-least-thirty-two-characters"
         }
     })).unwrap()).unwrap();
     let config = Config::read(path).unwrap();
@@ -298,7 +296,6 @@ async fn actual_provider_switch_preserves_context_and_restores_selected_wire_mod
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn google_selection_streams_native_wire_and_restores_selected_protocol() {
     use axum::extract::OriginalUri;
-    use std::io::Write;
 
     let root = tempfile::tempdir().unwrap();
     let chat = provider(10).await;
@@ -370,18 +367,20 @@ async fn google_selection_streams_native_wire_and_restores_selected_protocol() {
     // Keep the startup default on chat and configure Google IDs explicitly so
     // this integration case never performs discovery or external requests.
     let _ = config(root.path(), &chat, &chat);
-    let mut catalog = std::fs::OpenOptions::new()
-        .append(true)
-        .open(root.path().join("providers.toml"))
-        .unwrap();
-    write!(
-        catalog,
-        "\n[provider.google]\nprotocol='google'\n[provider.google.options]\nbaseURL='{}'\nmodel='gemini-default'\napiKey='synthetic-google-key'\n[provider.google.models.gemini-selected]\nname='Selected Gemini'\n",
-        google.endpoint
-    )
-    .unwrap();
-    drop(catalog);
-    let config = Config::read(root.path().join("server.json")).unwrap();
+    let server_path = root.path().join("server.json");
+    let mut server_json: Value =
+        serde_json::from_slice(&std::fs::read(&server_path).unwrap()).unwrap();
+    server_json["providers"]["google"] = json!({
+        "protocol": "google",
+        "base_url": google.endpoint,
+        "model": "gemini-default",
+        "api_key": "synthetic-google-key",
+        "models": {
+            "gemini-selected": {"name": "Selected Gemini"}
+        }
+    });
+    std::fs::write(&server_path, serde_json::to_vec(&server_json).unwrap()).unwrap();
+    let config = Config::read(&server_path).unwrap();
     assert_eq!(
         config.provider.protocol,
         microcrab_transport::Protocol::OpenaiCompatible

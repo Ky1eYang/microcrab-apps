@@ -157,13 +157,16 @@ impl PrivateFiles for Lane {
             return Err(Status::invalid_argument("unsupported private file path"));
         }
         let path = PathBuf::from(request.path);
-        if !path.is_absolute()
-            || path
-                .components()
-                .any(|component| component == std::path::Component::ParentDir)
-        {
+        if path.components().any(|component| {
+            component == std::path::Component::ParentDir
+                || (!path.is_absolute()
+                    && matches!(
+                        component,
+                        std::path::Component::Prefix(_) | std::path::Component::RootDir
+                    ))
+        }) {
             return Err(Status::invalid_argument(
-                "private file path must be absolute without traversal",
+                "private file path must not contain traversal or unrooted prefixes",
             ));
         }
         let read_permit = self

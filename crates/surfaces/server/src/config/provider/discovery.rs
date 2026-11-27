@@ -298,6 +298,13 @@ async fn fetch(provider: Provider) -> Result<BTreeMap<String, ModelMeta>, Config
         .timeout(std::time::Duration::from_millis(provider.timeout_ms))
         .build()
         .map_err(request_error)?;
+    let custom_headers = microcrab_transport::parse_custom_headers(&provider.headers).map_err(|failure| {
+        ConfigError::with_cause(
+            "provider_catalog",
+            "invalid_options",
+            &microcrab_protocol::diagnostic::describe(&failure, 2048),
+        )
+    })?;
     let mut models = BTreeMap::new();
     let mut token: Option<String> = None;
     let mut seen = BTreeSet::new();
@@ -320,7 +327,7 @@ async fn fetch(provider: Provider) -> Result<BTreeMap<String, ModelMeta>, Config
             Protocol::OpenaiCompatible | Protocol::OpenaiResponses => {}
         }
         let request = provider.auth.apply(
-            client.get(url),
+            microcrab_transport::apply_custom_headers(client.get(url), &custom_headers),
             provider.protocol,
             provider.api_key.as_deref(),
         );
@@ -425,6 +432,7 @@ mod tests {
             endpoint: base.clone(),
             model: "discovery".into(),
             api_key: Some("synthetic-private-key".into()),
+            headers: BTreeMap::new(),
             timeout_ms: 2000,
             max_response_bytes: 16384,
         };
@@ -485,6 +493,7 @@ mod tests {
                 endpoint,
                 model: "discovery".into(),
                 api_key: Some("synthetic-private-key".into()),
+                headers: BTreeMap::new(),
                 timeout_ms: 2000,
                 max_response_bytes: if scenario == "oversize" { 128 } else { 16384 },
             };
@@ -524,6 +533,7 @@ mod tests {
             endpoint,
             model: "discovery".into(),
             api_key: None,
+            headers: BTreeMap::new(),
             timeout_ms: 250,
             max_response_bytes: 16384,
         };
@@ -544,9 +554,40 @@ mod tests {
             // This routing identity must never be appended to the discovery URL.
             model: "private/model:encoded%2Fidentity".into(),
             api_key: Some("synthetic-private-key".into()),
+            headers: BTreeMap::new(),
             timeout_ms: 2000,
             max_response_bytes: 16384,
         }
+    }
+
+    #[tokio::test]
+    async fn discovery_sends_configured_custom_headers() {
+        use axum::{Json, Router, http::HeaderMap, routing::get};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/v1/models",
+            get(|headers: HeaderMap| async move {
+                assert_eq!(headers["user-agent"], "pi");
+                assert_eq!(headers["x-client-tag"], "microcrab-test");
+                Json(json!({"data":[{"id":"gpt-5.4"}]}))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut route = provider(Protocol::OpenaiCompatible, endpoint);
+        route.headers = BTreeMap::from([
+            ("User-Agent".into(), "pi".into()),
+            ("X-Client-Tag".into(), "microcrab-test".into()),
+        ]);
+        let models = tokio::task::spawn_blocking(move || discover(route))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(models.contains_key("gpt-5.4"));
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

@@ -67,47 +67,54 @@
     "allow_http_loopback": false, // HTTPS required except explicit loopback dev
   },
 
-  // Inline provider: a complete wire endpoint, not a gateway base URL.
+  // Multi-provider startup configuration (replaces external providers.toml).
+  // Use either top-level `default_provider` + `providers`, OR a single inline
+  // `provider` object, never both. When `providers` has a single entry,
+  // `default_provider` may be omitted.
   // Protocols: openai-compatible (Chat Completions), openai (Responses),
   // anthropic (Messages), google (Gemini REST). Select protocol explicitly.
-  // Examples: https://api.openai.com/v1/responses,
-  // https://api.anthropic.com/v1/messages,
-  // https://generativelanguage.googleapis.com/v1beta
-  "provider": {
-    "protocol": "openai-compatible",
-    // native: Bearer for Chat/Responses, x-api-key for Messages, x-goog-api-key
-    // for Google. bearer explicitly selects Bearer for compatible gateways.
-    "auth": "native",
-    "endpoint": "https://api.openai.com/v1/chat/completions",
-    "model": "REPLACE_WITH_PROVIDER_MODEL_ID",
-    // Private literal or "env:MICROCRAB_PROVIDER_API_KEY"; omit for a local
-    // compatible service that needs no key. Missing env references are errors.
-    "api_key": "REPLACE_WITH_PRIVATE_PROVIDER_API_KEY",
-    // Network inactivity window renewed by received chunks, NOT a turn deadline.
-    "timeout_ms": 60000,
-    // Response safety ceiling in bytes, NOT a generation/token budget (1 GiB).
-    "max_response_bytes": 1073741824,
-    // Default false. Set true only for this exact Google model/route after
-    // verifying native functionResponse.parts support; other protocols reject true.
-    "google_function_response_media": false,
+  // Each entry accepts either `base_url` (auto-appends protocol path) or
+  // complete `endpoint`.
+  "default_provider": "openai",
+  "providers": {
+    "openai": {
+      "protocol": "openai-compatible",
+      // native: Bearer for Chat/Responses, x-api-key for Messages, x-goog-api-key
+      // for Google. bearer explicitly selects Bearer for compatible gateways.
+      "auth": "native",
+      "base_url": "https://api.openai.com/v1",
+      "model": "REPLACE_WITH_PROVIDER_MODEL_ID",
+      // Private literal or "env:MICROCRAB_PROVIDER_API_KEY"; omit for a local
+      // compatible service that needs no key. Missing env references are errors.
+      "api_key": "REPLACE_WITH_PRIVATE_PROVIDER_API_KEY",
+      // Optional custom HTTP headers (cannot override auth/content-type/host).
+      // Example for gateways requiring a client identifier:
+      // "headers": { "User-Agent": "pi" },
+      // Network inactivity window renewed by received chunks, NOT a turn deadline.
+      "timeout_ms": 60000,
+      // Response safety ceiling in bytes, NOT a generation/token budget (1 GiB).
+      "max_response_bytes": 1073741824,
+      // Default false. Set true only for an exact Google model/route after
+      // verifying native functionResponse.parts support; other protocols reject true.
+      "google_function_response_media": false,
+      // Optional per-model overrides and metadata (merged with gateway /models
+      // discovery at startup; never infers protocols).
+      // "models": {
+      //   "verified": {
+      //     "id": "EXACT_VERIFIED_MODEL_ID",
+      //     "variants": ["low", "high"],
+      //     "context_window_tokens": 131072
+      //   }
+      // }
+    }
   },
-  // Advanced existing alternative: replace the ENTIRE provider object with
-  // {"config_file":"/private/providers.toml","name":"provider_id"}.
-  // That optional catalog is TOML; the Server startup configuration stays JSONC.
-  // A single catalog entry can omit name. Do not mix reference and inline fields.
-  // Google catalog opt-in belongs to an exact configured model, for example:
-  // [provider.google.models.verified]
-  // id = "EXACT_VERIFIED_GOOGLE_MODEL_ID"
-  // google_function_response_media = true
+  // For a single-provider minimal config, you may use `"provider": { ... }`
+  // together with `"available_models": []` instead of `providers` / `default_provider`.
+  // Google native media opt-in belongs on the exact configured model/entry:
+  // "models": { "verified": { "id": "EXACT_VERIFIED_GOOGLE_MODEL_ID", "google_function_response_media": true } }
   // Omission and discovery always keep this capability false. Owner Provider UI
   // does not expose it; configured native Data is used, with no public URL upload.
-
-  // Optional display/capacity metadata for the inline model. provider_id must be
-  // "configured" and id must match provider.model. This does not add model routes.
-  // Only set a positive context_window_tokens value from verified model metadata.
   "available_models": [],
-  // Example entry: {"id":"MODEL_ID","name":"Display name",
-  // "provider_id":"configured","context_window_tokens":131072}
 
   // Build Agent components in microcrab-core and deploy separately. The mode/name
   // must be declared by the actual component; no WASM bytes ship with this repo.

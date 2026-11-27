@@ -1,26 +1,28 @@
-//! Server-owned Personal Content Library adapter and Session mount synchronization.
-//!
-//! `PersonalLibrary` stores owner-isolated blobs and shortcuts in persistent
-//! Server storage (`FilePersonalLibrary` / `SqlitePersonalLibrary`).
-//! `SessionLibraryAdapter` exposes the session's currently mounted slice to Core.
+//! Server-owned Personal Content Library `Reference` implementations (`references` & `media`)
+//! and Session mount synchronization.
 use super::{Manager, safe, settings::active, unavailable};
 use crate::auth::Principal;
 use async_trait::async_trait;
-use microcrab_host_api::Host;
-use microcrab_protocol::application::WireError;
-use microcrab_session::{
-    Error,
-    ReferenceLibrary,
-    admission::image::{image_type, validate_image},
-    budget::LimitKind,
-    state::reference::{
-        CreateLibraryObject, LibraryObjectSummary, LibraryQuota, LibrarySource,
-        MarkdownReferences, Reference, ReferenceContent, ReferencePayload, ReferenceProjection,
-        ReferenceSource, ShortcutTarget, UpdateLibraryObject, content_from_bytes,
-        resolve_shortcut_content, valid_library_id,
+use microcrab_host_api::{
+    Host, HostSkillsReference,
+    markdown::{
+        DocumentRevision, compact_markdown_node, is_markdown_path, markdown_metadata_json,
+        parse_markdown,
     },
 };
-use microcrab_storage::library::{LibraryLimits, LibraryObjectRecord, PersonalLibrary};
+use microcrab_protocol::{ReferenceLimitDetails, application::WireError};
+use microcrab_session::{
+    Error, Reference, ReferenceCapabilities, ReferenceContent, ReferenceEntry, ReferenceError,
+    ReferenceNodeKind, ReferencePatch, ReferencePayload, ReferenceProjection, ReferenceQuota,
+    ReferenceWrite,
+    admission::image::{MAX_IMAGE_BYTES, image_type, validate_image},
+    budget::{LimitKind, check as check_budget},
+    state::reference::{content_from_bytes, valid_library_id},
+};
+use microcrab_storage::library::{
+    CreateLibraryObject, LibraryLimits, LibraryObjectRecord, LibraryObjectSummary, LibrarySource,
+    LocalBlobOrigin, PersonalLibrary, ShortcutTarget, UpdateLibraryObject,
+};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -37,13 +39,255 @@ pub(crate) struct ResolvedLibraryContent {
     pub(crate) inline_safe: bool,
 }
 
+fn ref_failed(error: impl std::fmt::Display) -> Error {
+    Error::reference_with_private("reference operation failed", error.to_string())
+}
+
+fn session_err_to_ref(error: Error) -> ReferenceError {
+    match error {
+        Error::Cancelled => ReferenceError::cancelled(),
+        Error::Denied(r) => ReferenceError::denied(r.to_string()),
+        Error::Config(r) => ReferenceError::config(r.to_string()),
+        Error::Protocol(r) => ReferenceError::conflict(r.to_string()),
+        Error::Limit(limit) => {
+            let mut err = ReferenceError::limit(limit.safe_message());
+            err.limit_details = Some(ReferenceLimitDetails {
+                kind: limit.kind.as_str(),
+                required_bytes: limit.required_bytes.unwrap_or(0) as u64,
+                budget_bytes: limit.budget_bytes.unwrap_or(0) as u64,
+                required_count: limit.required_count.unwrap_or(0) as u64,
+                budget_count: limit.budget_count.unwrap_or(0) as u64,
+            });
+            err
+        }
+        other => ReferenceError::failed(other.to_string()),
+    }
+}
+
+fn is_image_summary(summary: &LibraryObjectSummary) -> bool {
+    matches!(&summary.source, LibrarySource::LocalBlob { .. })
+        && image_type(&summary.media_type).is_some()
+}
+
+fn summary_to_entry(summary: &LibraryObjectSummary) -> ReferenceEntry {
+    let location = match &summary.source {
+        LibrarySource::Shortcut { target } => Some(target.location()),
+        LibrarySource::LocalBlob { .. } => None,
+    };
+    ReferenceEntry {
+        id: summary.id.clone(),
+        node_kind: ReferenceNodeKind::File,
+        parent_id: None,
+        title: summary.title.clone(),
+        location,
+        description: None,
+        media_type: Some(summary.media_type.clone()),
+        revision: summary.revision.clone(),
+        writable: !summary.read_only,
+        metadata: None,
+    }
+}
+
 #[derive(Default)]
-struct CollectionCache {
-    by_ref: BTreeMap<String, Arc<MarkdownReferences>>,
+struct ShortcutCollectionCache {
+    host_skills: BTreeMap<String, Arc<HostSkillsReference>>,
+    dir_urls: BTreeMap<String, Arc<DirectoryUrlMarkdownCollection>>,
     section_owner: HashMap<String, String>,
 }
 
-pub(crate) struct SessionLibraryAdapter {
+struct DirectoryUrlMarkdownCollection {
+    subjects: Option<Vec<Value>>,
+    bodies: BTreeMap<String, String>,
+    section_ids: Vec<String>,
+}
+
+impl DirectoryUrlMarkdownCollection {
+    async fn load(kind: &str, url: &str) -> Result<Self, Error> {
+        let base = reqwest::Url::parse(url).map_err(ref_failed)?;
+        if base.scheme() != "https" || !base.path().ends_with('/') {
+            return Err(Error::reference(
+                "directory_url must be HTTPS and end with /",
+            ));
+        }
+        let client = microcrab_transport::http::client_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .map_err(ref_failed)?;
+        let html = fetch_https_text(&client, &base, 1024 * 1024).await?;
+        let links = extract_directory_links(&base, &html)?;
+        let mut bodies = BTreeMap::new();
+        let mut subjects = Vec::new();
+        let mut section_ids = Vec::new();
+        for link in links.into_iter().take(64) {
+            let md_text = fetch_https_text(&client, &link, 1024 * 1024).await?;
+            let location = link.to_string();
+            let ident = format!("{}:{}:{}", kind.len(), kind, location);
+            let doc = parse_markdown(&ident, &md_text).map_err(ref_failed)?;
+            let mut row = compact_markdown_node(&doc.root);
+            if let Some(map) = row.as_object_mut() {
+                let rev = DocumentRevision::from_bytes(md_text.as_bytes());
+                map.insert("path".into(), json!(location));
+                map.insert("revision".into(), json!(rev.label));
+                if let Ok(Some(meta)) = markdown_metadata_json(&doc.metadata) {
+                    map.insert("metadata".into(), meta);
+                }
+            }
+            subjects.push(row);
+            for (sid, body) in doc.bodies {
+                section_ids.push(sid.clone());
+                bodies.insert(sid, body);
+            }
+        }
+        Ok(Self {
+            subjects: (!subjects.is_empty()).then_some(subjects),
+            bodies,
+            section_ids,
+        })
+    }
+}
+
+async fn fetch_https_text(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    limit: usize,
+) -> Result<String, Error> {
+    let mut resp = client
+        .get(url.clone())
+        .send()
+        .await
+        .map_err(ref_failed)?
+        .error_for_status()
+        .map_err(ref_failed)?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(ref_failed)? {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(Error::reference("directory URL document exceeds size budget"));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    String::from_utf8(bytes).map_err(ref_failed)
+}
+
+fn extract_directory_links(base: &reqwest::Url, html: &str) -> Result<Vec<reqwest::Url>, Error> {
+    let mut links = Vec::new();
+    let mut rest = html;
+    while let Some(idx) = rest.find("href=") {
+        rest = &rest[idx + 5..];
+        let quote = rest.as_bytes().first().copied();
+        let Some(q) = quote.filter(|b| matches!(b, b'"' | b'\'')) else {
+            continue;
+        };
+        let after = &rest[1..];
+        let Some(end) = after.find(q as char) else {
+            break;
+        };
+        let raw = &after[..end];
+        rest = &after[end + 1..];
+        if raw.is_empty() || raw.starts_with('#') || raw.starts_with('?') {
+            continue;
+        }
+        if let Ok(joined) = base.join(raw)
+            && joined.origin() == base.origin()
+            && is_markdown_path(joined.path())
+            && !links.contains(&joined)
+        {
+            links.push(joined);
+        }
+    }
+    Ok(links)
+}
+
+pub(crate) async fn resolve_shortcut_content(
+    id: &str,
+    target: &ShortcutTarget,
+    host: Option<&dyn Host>,
+    max_bytes: usize,
+    cancel: &CancellationToken,
+) -> Result<ReferenceContent, Error> {
+    match target {
+        ShortcutTarget::HostPath { path, .. } => {
+            let host = host.ok_or_else(|| {
+                Error::tool("shortcut host_path requires a connected bound Host")
+            })?;
+            let path_buf = PathBuf::from(path);
+            if host.supports_private_file_read() {
+                let op = microcrab_host_api::OpContext {
+                    cancel: cancel.clone(),
+                    principal: "library".into(),
+                    trace_id: id.into(),
+                    deadline: None,
+                };
+                let buffer = host
+                    .read_private_file(
+                        path_buf,
+                        microcrab_host_api::PrivateFileBuffer::new(max_bytes, ()),
+                        &op,
+                    )
+                    .await
+                    .map_err(Error::from_host_error)?;
+                let data = buffer.into_bytes();
+                content_from_bytes(id, Some(path), data)
+            } else {
+                let output = host
+                    .read_text(
+                        microcrab_host_api::ReadRequest {
+                            path: path_buf,
+                            offset_line: 1,
+                            max_lines: usize::MAX,
+                            max_bytes,
+                        },
+                        cancel.clone(),
+                    )
+                    .await
+                    .map_err(Error::from_host_error)?;
+                if output.truncated {
+                    return Err(check_budget(
+                        LimitKind::ReferenceBytes,
+                        max_bytes.saturating_add(1),
+                        max_bytes,
+                    )
+                    .unwrap_err());
+                }
+                Ok(ReferenceContent {
+                    id: id.into(),
+                    media_type: microcrab_session::state::reference::detect_mime_from_bytes(
+                        Some(path),
+                        output.content.as_bytes(),
+                    ),
+                    payload: ReferencePayload::Text(output.content),
+                })
+            }
+        }
+        ShortcutTarget::PublicHttps { url } => {
+            let parsed = microcrab_transport::public_https::PublicHttpsUrl::parse(url)
+                .map_err(|error| Error::tool_dynamic(error.to_string()))?;
+            let target = parsed.admit(cancel).await.map_err(|error| {
+                if cancel.is_cancelled() {
+                    Error::Cancelled
+                } else {
+                    Error::tool_dynamic(error.to_string())
+                }
+            })?;
+            let max_fetch = max_bytes.min(MAX_IMAGE_BYTES.max(8 * 1024 * 1024));
+            let fetched = target.fetch(max_fetch, cancel).await.map_err(|error| {
+                if cancel.is_cancelled() {
+                    Error::Cancelled
+                } else {
+                    Error::tool_dynamic(error.to_string())
+                }
+            })?;
+            content_from_bytes(id, Some(&fetched.mime_type), fetched.bytes)
+        }
+        ShortcutTarget::HostGlob { .. } | ShortcutTarget::DirectoryUrl { .. } => Err(
+            Error::reference("collection shortcuts expose Markdown section IDs; expand those section IDs directly"),
+        ),
+    }
+}
+
+/// Shared session-scoped backing over persistent `PersonalLibrary`, consumed by
+/// both `PersonalLibraryReference` (`references`) and `MediaReference` (`media`).
+pub(crate) struct SessionLibraryBacking {
     manager: Weak<Manager>,
     owner: String,
     session_id: String,
@@ -51,10 +295,11 @@ pub(crate) struct SessionLibraryAdapter {
     host: Arc<dyn Host>,
     store: Arc<dyn PersonalLibrary>,
     limits: LibraryLimits,
-    collections: RwLock<CollectionCache>,
+    mounted_snapshot: RwLock<Vec<LibraryObjectSummary>>,
+    collections: RwLock<ShortcutCollectionCache>,
 }
 
-impl SessionLibraryAdapter {
+impl SessionLibraryBacking {
     pub(crate) fn new(
         manager: Weak<Manager>,
         owner: String,
@@ -72,7 +317,8 @@ impl SessionLibraryAdapter {
             host,
             store,
             limits,
-            collections: RwLock::new(CollectionCache::default()),
+            mounted_snapshot: RwLock::new(Vec::new()),
+            collections: RwLock::new(ShortcutCollectionCache::default()),
         }
     }
 
@@ -92,272 +338,220 @@ impl SessionLibraryAdapter {
         Ok(())
     }
 
-    fn shortcut_to_markdown_source(target: &ShortcutTarget) -> Option<ReferenceSource> {
-        match target {
-            ShortcutTarget::HostGlob { root, pattern, .. } => Some(ReferenceSource::HostGlob {
-                root: PathBuf::from(root),
-                pattern: pattern.clone(),
-            }),
-            ShortcutTarget::DirectoryUrl { url } => {
-                Some(ReferenceSource::DirectoryUrl { url: url.clone() })
-            }
-            ShortcutTarget::HostPath { path, .. } => {
-                let lower = path.to_ascii_lowercase();
-                if lower.ends_with(".md") || lower.ends_with(".markdown") {
-                    Some(ReferenceSource::HostPath {
-                        path: PathBuf::from(path),
-                    })
-                } else {
-                    None
-                }
-            }
-            ShortcutTarget::PublicHttps { .. } => None,
-        }
-    }
-
-    async fn load_collection(
-        &self,
-        summary: &LibraryObjectSummary,
-        source: ReferenceSource,
-    ) -> Result<(Option<Vec<Value>>, String, Arc<MarkdownReferences>), Error> {
-        let md = Arc::new(MarkdownReferences::new(
-            summary.id.clone(),
-            vec![source],
-            Some(self.host.clone()),
-        ));
-        md.load().await?;
-        let subjects = md
-            .change()?
-            .and_then(|value| value.as_array().cloned());
-        let list = md.list()?;
-        let revision = format!("{}x{}", summary.revision.split('_').next().unwrap_or("1"), list.len());
-        Ok((subjects, revision, md))
-    }
-
-    async fn ensure_collection_loaded(&self) -> Result<(), Error> {
+    async fn sync_mounted_snapshot(&self) -> Result<(), Error> {
         let mounted = self
             .store
             .list_session_mounts(&self.owner, &self.session_id)
             .await?;
-        for summary in mounted {
-            let LibrarySource::Shortcut { target } = &summary.source else {
-                continue;
-            };
-            let Some(source) = Self::shortcut_to_markdown_source(target) else {
-                continue;
-            };
-            if self.verify_shortcut_scope(target).is_err() {
-                continue;
+        *self
+            .mounted_snapshot
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = mounted;
+        Ok(())
+    }
+
+    async fn load_shortcut_collection(
+        &self,
+        summary: &LibraryObjectSummary,
+        target: &ShortcutTarget,
+        cancel: &CancellationToken,
+    ) -> Result<Option<(Option<Vec<Value>>, String, Vec<String>)>, Error> {
+        match target {
+            ShortcutTarget::HostGlob { root, .. } => {
+                let skills = Arc::new(HostSkillsReference::from_host(
+                    summary.id.clone(),
+                    self.host.clone(),
+                    vec![PathBuf::from(root)],
+                ));
+                skills
+                    .load(cancel.clone())
+                    .await
+                    .map_err(ref_failed)?;
+                let subjects = skills
+                    .projections()
+                    .ok()
+                    .and_then(|p| p.exact)
+                    .and_then(|v| v.as_array().cloned());
+                let ids: Vec<String> = skills
+                    .list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|e| e.id)
+                    .collect();
+                let rev = format!(
+                    "{}x{}",
+                    summary.revision.split('_').next().unwrap_or("1"),
+                    ids.len()
+                );
+                let mut cache = self.collections.write().unwrap_or_else(|e| e.into_inner());
+                for id in &ids {
+                    cache.section_owner.insert(id.clone(), summary.id.clone());
+                }
+                cache.host_skills.insert(summary.id.clone(), skills);
+                Ok(Some((subjects, rev, ids)))
             }
-            let already = self
+            ShortcutTarget::DirectoryUrl { url } => {
+                let coll = Arc::new(DirectoryUrlMarkdownCollection::load(&summary.id, url).await?);
+                let subjects = coll.subjects.clone();
+                let ids = coll.section_ids.clone();
+                let rev = format!(
+                    "{}x{}",
+                    summary.revision.split('_').next().unwrap_or("1"),
+                    ids.len()
+                );
+                let mut cache = self.collections.write().unwrap_or_else(|e| e.into_inner());
+                for id in &ids {
+                    cache.section_owner.insert(id.clone(), summary.id.clone());
+                }
+                cache.dir_urls.insert(summary.id.clone(), coll);
+                Ok(Some((subjects, rev, ids)))
+            }
+            ShortcutTarget::HostPath { .. } | ShortcutTarget::PublicHttps { .. } => Ok(None),
+        }
+    }
+
+    async fn refresh_all(&self, cancel: &CancellationToken) -> Result<(), Error> {
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        if let Some(project_id) = &self.project_id {
+            self.store
+                .mount_project_to_session(&self.owner, project_id, &self.session_id)
+                .await?;
+        }
+        let mounted = self
+            .store
+            .list_session_mounts(&self.owner, &self.session_id)
+            .await?;
+        *self
+            .collections
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = ShortcutCollectionCache::default();
+        for summary in &mounted {
+            if let LibrarySource::Shortcut { target } = &summary.source
+                && self.verify_shortcut_scope(target).is_ok()
+                && let Ok(Some((subjects, rev, _))) =
+                    self.load_shortcut_collection(summary, target, cancel).await
+            {
+                let _ = self
+                    .store
+                    .update_shortcut_metadata(
+                        &self.owner,
+                        &summary.id,
+                        summary.byte_length,
+                        rev,
+                        subjects,
+                    )
+                    .await;
+            }
+        }
+        self.sync_mounted_snapshot().await?;
+        Ok(())
+    }
+
+    fn snapshot_filtered(&self, want_images: bool) -> Vec<LibraryObjectSummary> {
+        self.mounted_snapshot
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|s| is_image_summary(s) == want_images)
+            .cloned()
+            .collect()
+    }
+
+    fn projections_filtered(&self, want_images: bool) -> ReferenceProjection {
+        let items = self.snapshot_filtered(want_images);
+        if items.is_empty() {
+            return ReferenceProjection::empty();
+        }
+        ReferenceProjection {
+            exact: Some(Value::Array(
+                items.iter().map(|s| s.projection_value(false)).collect(),
+            )),
+            short_model: Some(Value::Array(
+                items.iter().map(|s| s.projection_value(true)).collect(),
+            )),
+        }
+    }
+
+    async fn owns_filtered(
+        &self,
+        id: &str,
+        want_images: bool,
+        cancel: &CancellationToken,
+    ) -> Result<bool, ReferenceError> {
+        if cancel.is_cancelled() {
+            return Err(ReferenceError::cancelled());
+        }
+        if !valid_library_id(id) {
+            if want_images {
+                return Ok(false);
+            }
+            return Ok(self
                 .collections
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
-                .by_ref
-                .contains_key(&summary.id);
-            if already {
-                continue;
-            }
-            if let Ok((_subjects, _rev, md)) = self.load_collection(&summary, source).await {
-                if let Ok(list) = md.list() {
-                    let mut cache = self.collections.write().unwrap_or_else(|e| e.into_inner());
-                    for item in list {
-                        cache.section_owner.insert(item.id, summary.id.clone());
-                    }
-                    cache.by_ref.insert(summary.id.clone(), md);
-                }
-            }
+                .section_owner
+                .contains_key(id));
         }
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl ReferenceLibrary for SessionLibraryAdapter {
-    async fn quota(&self) -> Result<LibraryQuota, Error> {
-        self.store.quota(&self.owner, self.limits).await
-    }
-
-    async fn add(
-        &self,
-        request: CreateLibraryObject,
-        cancel: CancellationToken,
-    ) -> Result<LibraryObjectSummary, Error> {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let normalized_request = match request {
-            CreateLibraryObject::LocalBlob {
-                id,
-                title,
-                media_type,
-                data,
-                origin,
-                origin_execution_id,
-            } => CreateLibraryObject::LocalBlob {
-                id,
-                title,
-                media_type,
-                data,
-                origin,
-                origin_execution_id,
-            },
-            CreateLibraryObject::Shortcut { title, target } => {
-                let scoped = match target {
-                    ShortcutTarget::HostPath {
-                        path,
-                        project_id,
-                        host_id,
-                        workspace_id,
-                    } => ShortcutTarget::HostPath {
-                        path,
-                        project_id: project_id.or_else(|| self.project_id.clone()),
-                        host_id,
-                        workspace_id,
-                    },
-                    ShortcutTarget::HostGlob {
-                        root,
-                        pattern,
-                        project_id,
-                        host_id,
-                        workspace_id,
-                    } => ShortcutTarget::HostGlob {
-                        root,
-                        pattern,
-                        project_id: project_id.or_else(|| self.project_id.clone()),
-                        host_id,
-                        workspace_id,
-                    },
-                    other => other,
-                };
-                self.verify_shortcut_scope(&scoped)?;
-                CreateLibraryObject::Shortcut {
-                    title,
-                    target: scoped,
-                }
-            }
-        };
-        let created = self
+        let Some(record) = self
             .store
-            .create(
-                &self.owner,
-                self.limits,
-                normalized_request,
-                Some(&self.session_id),
-                None,
-            )
-            .await?;
-        let mut summary = created.summary;
-        if let LibrarySource::Shortcut { target } = &summary.source
-            && let Some(source) = Self::shortcut_to_markdown_source(target)
-        {
-            if let Ok((subjects, rev, md)) = self.load_collection(&summary, source).await {
-                if let Some(subjects_val) = subjects.clone() {
-                    let _ = self
-                        .store
-                        .update_shortcut_metadata(
-                            &self.owner,
-                            &summary.id,
-                            summary.byte_length,
-                            rev.clone(),
-                            Some(subjects_val.clone()),
-                        )
-                        .await;
-                    summary.subjects = Some(subjects_val);
-                    summary.revision = rev;
-                }
-                if let Ok(list) = md.list() {
-                    let mut cache = self.collections.write().unwrap_or_else(|e| e.into_inner());
-                    for item in list {
-                        cache.section_owner.insert(item.id, summary.id.clone());
-                    }
-                    cache.by_ref.insert(summary.id.clone(), md);
-                }
-            }
-        }
-        Ok(summary)
-    }
-
-    async fn update(
-        &self,
-        id: &str,
-        update: UpdateLibraryObject,
-        cancel: CancellationToken,
-    ) -> Result<LibraryObjectSummary, Error> {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let Some(existing) = self.store.get(&self.owner, id).await? else {
-            return Err(Error::reference("requested reference was not found"));
-        };
-        if !existing.mounted_sessions.contains(&self.session_id) {
-            return Err(Error::reference("reference is not mounted in this Session"));
-        }
-        if let Some(target) = &update.target {
-            self.verify_shortcut_scope(target)?;
-        }
-        let updated = self
-            .store
-            .update(&self.owner, self.limits, id, update)
-            .await?;
-        Ok(updated.summary)
-    }
-
-    async fn remove_mount(&self, id: &str, cancel: CancellationToken) -> Result<bool, Error> {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        let removed = self
-            .store
-            .unmount_session(&self.owner, id, &self.session_id)
-            .await?;
-        if removed {
-            let mut cache = self.collections.write().unwrap_or_else(|e| e.into_inner());
-            cache.by_ref.remove(id);
-            cache.section_owner.retain(|_, owner_id| owner_id != id);
-        }
-        Ok(removed)
-    }
-
-    async fn read(
-        &self,
-        id: &str,
-        cancel: CancellationToken,
-    ) -> Result<Option<ReferenceContent>, Error> {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        if !valid_library_id(id) {
-            let existing_md = {
-                let cache = self.collections.read().unwrap_or_else(|e| e.into_inner());
-                cache
-                    .section_owner
-                    .get(id)
-                    .and_then(|owner| cache.by_ref.get(owner))
-                    .cloned()
-            };
-            if let Some(md) = existing_md {
-                return md.read(id);
-            }
-            self.ensure_collection_loaded().await?;
-            let retry_md = {
-                let cache = self.collections.read().unwrap_or_else(|e| e.into_inner());
-                cache
-                    .section_owner
-                    .get(id)
-                    .and_then(|owner| cache.by_ref.get(owner))
-                    .cloned()
-            };
-            return match retry_md {
-                Some(md) => md.read(id),
-                None => Ok(None),
-            };
-        }
-
-        let Some(record) = self.store.get(&self.owner, id).await? else {
-            return Ok(None);
+            .get(&self.owner, id)
+            .await
+            .map_err(session_err_to_ref)?
+        else {
+            return Ok(false);
         };
         if !record.mounted_sessions.contains(&self.session_id) {
+            return Ok(false);
+        }
+        Ok(is_image_summary(&record.summary) == want_images)
+    }
+
+    async fn expand_filtered(
+        &self,
+        id: &str,
+        want_images: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ReferenceContent>, ReferenceError> {
+        if cancel.is_cancelled() {
+            return Err(ReferenceError::cancelled());
+        }
+        if !valid_library_id(id) {
+            if want_images {
+                return Ok(None);
+            }
+            let (hs, du) = {
+                let cache = self.collections.read().unwrap_or_else(|e| e.into_inner());
+                let owner = cache.section_owner.get(id).cloned();
+                (
+                    owner.as_ref().and_then(|o| cache.host_skills.get(o).cloned()),
+                    owner.as_ref().and_then(|o| cache.dir_urls.get(o).cloned()),
+                )
+            };
+            if let Some(skills) = hs {
+                return skills.expand(id, cancel.clone()).await;
+            }
+            if let Some(coll) = du {
+                return Ok(coll
+                    .bodies
+                    .get(id)
+                    .map(|b| ReferenceContent::text_with_mime(id, "text/markdown", b.clone())));
+            }
+            return Ok(None);
+        }
+
+        let Some(record) = self
+            .store
+            .get(&self.owner, id)
+            .await
+            .map_err(session_err_to_ref)?
+        else {
+            return Ok(None);
+        };
+        if !record.mounted_sessions.contains(&self.session_id)
+            || is_image_summary(&record.summary) != want_images
+        {
             return Ok(None);
         }
         match &record.summary.source {
@@ -365,12 +559,16 @@ impl ReferenceLibrary for SessionLibraryAdapter {
                 let data = self
                     .store
                     .read_blob(&self.owner, id)
-                    .await?
+                    .await
+                    .map_err(session_err_to_ref)?
                     .unwrap_or_default();
-                content_from_bytes(id, Some(&record.summary.media_type), data).map(Some)
+                content_from_bytes(id, Some(&record.summary.media_type), data)
+                    .map(Some)
+                    .map_err(session_err_to_ref)
             }
             LibrarySource::Shortcut { target } => {
-                self.verify_shortcut_scope(target)?;
+                self.verify_shortcut_scope(target)
+                    .map_err(session_err_to_ref)?;
                 let host = if let Some(manager) = self.manager.upgrade()
                     && let Some(project) = match target {
                         ShortcutTarget::HostPath { project_id, .. }
@@ -390,85 +588,438 @@ impl ReferenceLibrary for SessionLibraryAdapter {
                     target,
                     Some(host.as_ref()),
                     self.limits.max_object_bytes,
-                    &cancel,
+                    cancel,
                 )
                 .await
                 .map(Some)
+                .map_err(session_err_to_ref)
             }
         }
     }
 
-    async fn projections(&self, cancel: CancellationToken) -> Result<ReferenceProjection, Error> {
-        if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
+    fn write_to_create_request(&self, input: ReferenceWrite) -> Result<CreateLibraryObject, Error> {
+        let title = input.title.unwrap_or_default();
+        if let Some(hint) = input.locator_hint.as_deref() {
+            if let Some(exec_id) = hint.strip_prefix("job_redirect:") {
+                let data = match input.payload {
+                    ReferencePayload::Text(t) => t.into_bytes(),
+                    ReferencePayload::Binary { data, .. } => data,
+                };
+                return Ok(CreateLibraryObject::LocalBlob {
+                    id: None,
+                    title,
+                    media_type: input.media_type,
+                    data,
+                    origin: LocalBlobOrigin::JobRedirect,
+                    origin_execution_id: Some(exec_id.to_owned()),
+                });
+            }
+            if let Some(exec_id) = hint.strip_prefix("tool_capture:") {
+                let data = match input.payload {
+                    ReferencePayload::Text(t) => t.into_bytes(),
+                    ReferencePayload::Binary { data, .. } => data,
+                };
+                return Ok(CreateLibraryObject::LocalBlob {
+                    id: None,
+                    title,
+                    media_type: input.media_type,
+                    data,
+                    origin: LocalBlobOrigin::ToolCapture,
+                    origin_execution_id: Some(exec_id.to_owned()),
+                });
+            }
+            if hint.starts_with("https://") {
+                let target = ShortcutTarget::PublicHttps {
+                    url: hint.to_owned(),
+                };
+                return Ok(CreateLibraryObject::Shortcut { title, target });
+            }
+            if let Some(path) = hint.strip_prefix("host:") {
+                let target = ShortcutTarget::HostPath {
+                    path: path.to_owned(),
+                    project_id: self.project_id.clone(),
+                    host_id: None,
+                    workspace_id: None,
+                };
+                self.verify_shortcut_scope(&target)?;
+                return Ok(CreateLibraryObject::Shortcut { title, target });
+            }
         }
-        let mounted = self
-            .store
-            .list_session_mounts(&self.owner, &self.session_id)
-            .await?;
-        if mounted.is_empty() {
-            return Ok(ReferenceProjection {
-                exact: None,
-                short_model: None,
-            });
-        }
-        Ok(ReferenceProjection {
-            exact: Some(Value::Array(
-                mounted.iter().map(|s| s.projection_value(false)).collect(),
-            )),
-            short_model: Some(Value::Array(
-                mounted.iter().map(|s| s.projection_value(true)).collect(),
-            )),
+
+        let data = match input.payload {
+            ReferencePayload::Text(t) => t.into_bytes(),
+            ReferencePayload::Binary { data, .. } => data,
+        };
+        Ok(CreateLibraryObject::LocalBlob {
+            id: None,
+            title: if title.is_empty() {
+                format!("literal ({})", input.media_type)
+            } else {
+                title
+            },
+            media_type: input.media_type,
+            data,
+            origin: LocalBlobOrigin::AgentLiteral,
+            origin_execution_id: None,
         })
     }
 
-    async fn refresh(&self, cancel: CancellationToken) -> Result<(), Error> {
+    async fn add_item(
+        &self,
+        input: ReferenceWrite,
+        cancel: &CancellationToken,
+    ) -> Result<ReferenceEntry, ReferenceError> {
         if cancel.is_cancelled() {
-            return Err(Error::Cancelled);
+            return Err(ReferenceError::cancelled());
         }
-        if let Some(project_id) = &self.project_id {
-            self.store
-                .mount_project_to_session(&self.owner, project_id, &self.session_id)
-                .await?;
-        }
-        let mounted = self
+        let req = self.write_to_create_request(input).map_err(session_err_to_ref)?;
+        let created = self
             .store
-            .list_session_mounts(&self.owner, &self.session_id)
-            .await?;
-        let mut next_cache = CollectionCache::default();
-        for summary in mounted {
-            let LibrarySource::Shortcut { target } = &summary.source else {
-                continue;
-            };
-            let Some(source) = Self::shortcut_to_markdown_source(target) else {
-                continue;
-            };
-            if self.verify_shortcut_scope(target).is_err() {
-                continue;
-            }
-            if let Ok((subjects, revision, md)) = self.load_collection(&summary, source).await {
-                let _ = self
-                    .store
-                    .update_shortcut_metadata(
-                        &self.owner,
-                        &summary.id,
-                        summary.byte_length,
-                        revision,
-                        subjects,
-                    )
-                    .await;
-                if let Ok(list) = md.list() {
-                    for item in list {
-                        next_cache
-                            .section_owner
-                            .insert(item.id, summary.id.clone());
-                    }
-                }
-                next_cache.by_ref.insert(summary.id, md);
-            }
+            .create(
+                &self.owner,
+                self.limits,
+                req,
+                Some(&self.session_id),
+                None,
+            )
+            .await
+            .map_err(session_err_to_ref)?;
+        let mut summary = created.summary;
+        if let LibrarySource::Shortcut { target } = &summary.source
+            && let Ok(Some((subjects, rev, _))) =
+                self.load_shortcut_collection(&summary, target, cancel).await
+        {
+            let _ = self
+                .store
+                .update_shortcut_metadata(
+                    &self.owner,
+                    &summary.id,
+                    summary.byte_length,
+                    rev.clone(),
+                    subjects.clone(),
+                )
+                .await;
+            summary.subjects = subjects;
+            summary.revision = rev;
         }
-        *self.collections.write().unwrap_or_else(|e| e.into_inner()) = next_cache;
+        let _ = self.sync_mounted_snapshot().await;
+        Ok(summary_to_entry(&summary))
+    }
+
+    async fn update_item(
+        &self,
+        id: &str,
+        want_images: bool,
+        patch: ReferencePatch,
+        cancel: &CancellationToken,
+    ) -> Result<ReferenceEntry, ReferenceError> {
+        if cancel.is_cancelled() {
+            return Err(ReferenceError::cancelled());
+        }
+        let Some(existing) = self
+            .store
+            .get(&self.owner, id)
+            .await
+            .map_err(session_err_to_ref)?
+        else {
+            return Err(ReferenceError::not_found("requested reference was not found"));
+        };
+        if !existing.mounted_sessions.contains(&self.session_id)
+            || is_image_summary(&existing.summary) != want_images
+        {
+            return Err(ReferenceError::not_found(
+                "reference is not mounted under this kind in this Session",
+            ));
+        }
+        let data = patch.payload.map(|p| match p {
+            ReferencePayload::Text(t) => t.into_bytes(),
+            ReferencePayload::Binary { data, .. } => data,
+        });
+        let target = if let Some(hint) = patch.locator_hint.as_deref() {
+            if hint.starts_with("https://") {
+                Some(ShortcutTarget::PublicHttps {
+                    url: hint.to_owned(),
+                })
+            } else if let Some(path) = hint.strip_prefix("host:") {
+                let t = ShortcutTarget::HostPath {
+                    path: path.to_owned(),
+                    project_id: self.project_id.clone(),
+                    host_id: None,
+                    workspace_id: None,
+                };
+                self.verify_shortcut_scope(&t).map_err(session_err_to_ref)?;
+                Some(t)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let updated = self
+            .store
+            .update(
+                &self.owner,
+                self.limits,
+                id,
+                UpdateLibraryObject {
+                    expected_revision: patch.expected_revision,
+                    title: patch.title,
+                    media_type: patch.media_type,
+                    data,
+                    target,
+                },
+            )
+            .await
+            .map_err(session_err_to_ref)?;
+        let _ = self.sync_mounted_snapshot().await;
+        Ok(summary_to_entry(&updated.summary))
+    }
+
+    async fn remove_item(
+        &self,
+        id: &str,
+        want_images: bool,
+        cancel: &CancellationToken,
+    ) -> Result<bool, ReferenceError> {
+        if cancel.is_cancelled() {
+            return Err(ReferenceError::cancelled());
+        }
+        let Some(existing) = self
+            .store
+            .get(&self.owner, id)
+            .await
+            .map_err(session_err_to_ref)?
+        else {
+            return Ok(false);
+        };
+        if is_image_summary(&existing.summary) != want_images {
+            return Ok(false);
+        }
+        let removed = self
+            .store
+            .unmount_session(&self.owner, id, &self.session_id)
+            .await
+            .map_err(session_err_to_ref)?;
+        if removed {
+            {
+                let mut cache = self.collections.write().unwrap_or_else(|e| e.into_inner());
+                cache.host_skills.remove(id);
+                cache.dir_urls.remove(id);
+                cache.section_owner.retain(|_, owner_id| owner_id != id);
+            }
+            let _ = self.sync_mounted_snapshot().await;
+        }
+        Ok(removed)
+    }
+
+    async fn quota(&self, cancel: &CancellationToken) -> Result<Option<ReferenceQuota>, ReferenceError> {
+        if cancel.is_cancelled() {
+            return Err(ReferenceError::cancelled());
+        }
+        self.store
+            .quota(&self.owner, self.limits)
+            .await
+            .map(Some)
+            .map_err(session_err_to_ref)
+    }
+}
+
+/// Server-owned Personal Content Library `Reference` (`kind = "references"`):
+/// non-image blobs, external shortcuts, and default writable Session reference store.
+pub(crate) struct PersonalLibraryReference {
+    backing: Arc<SessionLibraryBacking>,
+}
+
+impl PersonalLibraryReference {
+    pub(crate) fn new(backing: Arc<SessionLibraryBacking>) -> Self {
+        Self { backing }
+    }
+}
+
+#[async_trait]
+impl Reference for PersonalLibraryReference {
+    fn kind(&self) -> &str {
+        "references"
+    }
+
+    fn capabilities(&self) -> ReferenceCapabilities {
+        ReferenceCapabilities::read_write()
+    }
+
+    async fn load(&self, cancel: CancellationToken) -> Result<(), ReferenceError> {
+        self.backing
+            .refresh_all(&cancel)
+            .await
+            .map_err(session_err_to_ref)
+    }
+
+    fn list(&self) -> Result<Vec<ReferenceEntry>, ReferenceError> {
+        Ok(self
+            .backing
+            .snapshot_filtered(false)
+            .iter()
+            .map(summary_to_entry)
+            .collect())
+    }
+
+    fn projections(&self) -> Result<ReferenceProjection, ReferenceError> {
+        Ok(self.backing.projections_filtered(false))
+    }
+
+    async fn owns(&self, id: &str, cancel: CancellationToken) -> Result<bool, ReferenceError> {
+        self.backing.owns_filtered(id, false, &cancel).await
+    }
+
+    async fn expand(
+        &self,
+        id: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<ReferenceContent>, ReferenceError> {
+        self.backing.expand_filtered(id, false, &cancel).await
+    }
+
+    async fn refresh(&self, cancel: CancellationToken) -> Result<(), ReferenceError> {
+        self.backing
+            .refresh_all(&cancel)
+            .await
+            .map_err(session_err_to_ref)
+    }
+
+    async fn add(
+        &self,
+        input: ReferenceWrite,
+        cancel: CancellationToken,
+    ) -> Result<ReferenceEntry, ReferenceError> {
+        self.backing.add_item(input, &cancel).await
+    }
+
+    async fn update(
+        &self,
+        id: &str,
+        patch: ReferencePatch,
+        cancel: CancellationToken,
+    ) -> Result<ReferenceEntry, ReferenceError> {
+        self.backing.update_item(id, false, patch, &cancel).await
+    }
+
+    async fn remove(&self, id: &str, cancel: CancellationToken) -> Result<bool, ReferenceError> {
+        self.backing.remove_item(id, false, &cancel).await
+    }
+
+    async fn quota(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<Option<ReferenceQuota>, ReferenceError> {
+        self.backing.quota(&cancel).await
+    }
+}
+
+/// Server-owned image media `Reference` (`kind = "media"`).
+pub(crate) struct MediaReference {
+    backing: Arc<SessionLibraryBacking>,
+}
+
+impl MediaReference {
+    pub(crate) fn new(backing: Arc<SessionLibraryBacking>) -> Self {
+        Self { backing }
+    }
+}
+
+#[async_trait]
+impl Reference for MediaReference {
+    fn kind(&self) -> &str {
+        "media"
+    }
+
+    fn capabilities(&self) -> ReferenceCapabilities {
+        ReferenceCapabilities::read_write()
+    }
+
+    async fn load(&self, cancel: CancellationToken) -> Result<(), ReferenceError> {
+        self.backing
+            .sync_mounted_snapshot()
+            .await
+            .map_err(session_err_to_ref)?;
+        if cancel.is_cancelled() {
+            return Err(ReferenceError::cancelled());
+        }
         Ok(())
+    }
+
+    fn list(&self) -> Result<Vec<ReferenceEntry>, ReferenceError> {
+        Ok(self
+            .backing
+            .snapshot_filtered(true)
+            .iter()
+            .map(summary_to_entry)
+            .collect())
+    }
+
+    fn projections(&self) -> Result<ReferenceProjection, ReferenceError> {
+        Ok(self.backing.projections_filtered(true))
+    }
+
+    async fn owns(&self, id: &str, cancel: CancellationToken) -> Result<bool, ReferenceError> {
+        self.backing.owns_filtered(id, true, &cancel).await
+    }
+
+    async fn expand(
+        &self,
+        id: &str,
+        cancel: CancellationToken,
+    ) -> Result<Option<ReferenceContent>, ReferenceError> {
+        self.backing.expand_filtered(id, true, &cancel).await
+    }
+
+    async fn refresh(&self, cancel: CancellationToken) -> Result<(), ReferenceError> {
+        self.backing
+            .sync_mounted_snapshot()
+            .await
+            .map_err(session_err_to_ref)?;
+        if cancel.is_cancelled() {
+            return Err(ReferenceError::cancelled());
+        }
+        Ok(())
+    }
+
+    async fn add(
+        &self,
+        input: ReferenceWrite,
+        cancel: CancellationToken,
+    ) -> Result<ReferenceEntry, ReferenceError> {
+        if image_type(&input.media_type).is_none() {
+            return Err(ReferenceError::config(
+                "media reference kind currently accepts image/* payloads only",
+            ));
+        }
+        self.backing.add_item(input, &cancel).await
+    }
+
+    async fn update(
+        &self,
+        id: &str,
+        patch: ReferencePatch,
+        cancel: CancellationToken,
+    ) -> Result<ReferenceEntry, ReferenceError> {
+        if let Some(mime) = patch.media_type.as_deref()
+            && image_type(mime).is_none()
+        {
+            return Err(ReferenceError::config(
+                "media reference kind currently accepts image/* payloads only",
+            ));
+        }
+        self.backing.update_item(id, true, patch, &cancel).await
+    }
+
+    async fn remove(&self, id: &str, cancel: CancellationToken) -> Result<bool, ReferenceError> {
+        self.backing.remove_item(id, true, &cancel).await
+    }
+
+    async fn quota(
+        &self,
+        cancel: CancellationToken,
+    ) -> Result<Option<ReferenceQuota>, ReferenceError> {
+        self.backing.quota(&cancel).await
     }
 }
 
@@ -621,7 +1172,7 @@ impl Manager {
     async fn try_refresh_session(&self, session_id: &str) {
         if let Some(managed) = active(self, session_id).await {
             if managed.commands.try_lock().is_ok() {
-                let _ = managed.session.refresh_reference_library().await;
+                let _ = managed.session.refresh_references().await;
             }
         }
     }

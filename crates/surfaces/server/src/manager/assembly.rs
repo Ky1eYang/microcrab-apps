@@ -898,8 +898,21 @@ pub(super) async fn create_from(
         None if recover.is_none() => record.mode.as_deref(),
         None => None,
     };
+    let fresh_session = fork_source.is_none() && recover.is_none();
+    if fresh_session
+        && let Some(project_id) = record.project_id.as_deref()
+    {
+        manager
+            .personal_library
+            .mount_project_to_session(&record.owner, project_id, &record.id)
+            .await?;
+    }
+    let assembled_refs = assemble_session_references(manager, &record, host.clone()).await?;
+    let builder = builder
+        .references(assembled_refs)
+        .default_writable_reference("references");
+
     let initialized = async {
-        let fresh_session = fork_source.is_none() && recover.is_none();
         let preparation = match (fork_source, recover) {
             (Some(source), _) => {
                 microcrab_app_bootstrap::session::Preparation::Fork(&source.session)
@@ -910,25 +923,6 @@ pub(super) async fn create_from(
             (None, None) => microcrab_app_bootstrap::session::Preparation::Create,
         };
         let session = microcrab_app_bootstrap::session::prepare(builder, preparation).await?;
-        if fresh_session
-            && let Some(project_id) = record.project_id.as_deref()
-        {
-            manager
-                .personal_library
-                .mount_project_to_session(&record.owner, project_id, &record.id)
-                .await?;
-        }
-        let library = Arc::new(super::library::SessionLibraryAdapter::new(
-            manager.self_ref.clone(),
-            record.owner.clone(),
-            record.id.clone(),
-            record.project_id.clone(),
-            host.clone(),
-            manager.personal_library.clone(),
-            manager.config.personal_library.limits(),
-        ));
-        session.state_handle().install_reference_library(library);
-        let _ = session.refresh_reference_library().await;
         // A fork retains its historical mode, even if the source's live/manual
         // selection or the copied creator configuration has since changed.
         // Restore already applies the exact saved policy in Core.
@@ -1447,4 +1441,97 @@ impl ChildAuditorFactory for AuditFactory {
             )
         })
     }
+}
+
+async fn assemble_session_references(
+    manager: &Manager,
+    record: &microcrab_storage::directory::SessionRecord,
+    host: Arc<dyn Host>,
+) -> Result<Vec<microcrab_session::DynReference>, Error> {
+    use microcrab_host_api::{
+        CompositeReference, DynReference, GlobRequest, HostMarkdownReference, HostSkillsReference,
+    };
+    use super::library::{MediaReference, PersonalLibraryReference, SessionLibraryBacking};
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let backing = Arc::new(SessionLibraryBacking::new(
+        manager.self_ref.clone(),
+        record.owner.clone(),
+        record.id.clone(),
+        record.project_id.clone(),
+        host.clone(),
+        manager.personal_library.clone(),
+        manager.config.personal_library.limits(),
+    ));
+    let personal_ref = DynReference::new(PersonalLibraryReference::new(backing.clone()))?;
+    let media_ref = DynReference::new(MediaReference::new(backing))?;
+
+    let caps = host.tool_capabilities();
+    let has_fs = caps.iter().any(|c| c == "read") && caps.iter().any(|c| c == "glob");
+
+    let mut reference_members = vec![personal_ref];
+    let mut skill_members = vec![DynReference::new(manager.build_git_skills_reference(
+        &record.owner,
+        manager
+            .git_skill_repos_for_owner(&record.owner)
+            .await
+            .unwrap_or_default(),
+    ))?];
+
+    if record.project_id.is_some() && has_fs {
+        if let Ok(found_agents) = host
+            .glob(
+                GlobRequest {
+                    root: PathBuf::from("."),
+                    pattern: "AGENTS.md".into(),
+                    include_hidden: false,
+                    include_ignored: false,
+                    include_directories: false,
+                    max_results: 4,
+                },
+                cancel.clone(),
+            )
+            .await
+            && !found_agents.entries.is_empty()
+        {
+            reference_members.push(DynReference::new(HostMarkdownReference::from_host(
+                "host_markdown",
+                host.clone(),
+                vec![PathBuf::from("AGENTS.md")],
+            ))?);
+        }
+        if let Ok(found_skills) = host
+            .glob(
+                GlobRequest {
+                    root: PathBuf::from("."),
+                    pattern: "**/SKILL.md".into(),
+                    include_hidden: false,
+                    include_ignored: false,
+                    include_directories: false,
+                    max_results: 64,
+                },
+                cancel,
+            )
+            .await
+            && !found_skills.entries.is_empty()
+        {
+            skill_members.push(DynReference::new(HostSkillsReference::from_host(
+                "host_skills",
+                host,
+                vec![PathBuf::from(".")],
+            ))?);
+        }
+    }
+
+    let references_kind = if reference_members.len() == 1 {
+        reference_members.pop().expect("one member")
+    } else {
+        DynReference::new(CompositeReference::new("references", reference_members))?
+    };
+    let skills_kind = if skill_members.len() == 1 {
+        skill_members.pop().expect("one member")
+    } else {
+        DynReference::new(CompositeReference::new("skills", skill_members))?
+    };
+
+    Ok(vec![references_kind, skills_kind, media_ref])
 }
